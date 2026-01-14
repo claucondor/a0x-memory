@@ -47,9 +47,9 @@ class Settings:
 
     # OpenRouter Configuration
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    llm_model: str = "openai/gpt-4.1-mini"
-    embedding_model: str = "qwen/qwen3-embedding-4b"
-    embedding_dimension: int = 2560  # Custom embedding dimension
+    llm_model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "xai/grok-4.1-fast"))
+    embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "qwen/qwen3-embedding-8b"))
+    embedding_dimension: int = field(default_factory=lambda: int(os.getenv("EMBEDDING_DIMENSION", "1024")))
 
     # Memory Building Configuration
     window_size: int = 20
