@@ -381,10 +381,55 @@ async def server_info():
         "transport": "Streamable HTTP",
         "llm_model": settings.llm_model,
         "embedding_model": settings.embedding_model,
+        "embedding_dimension": settings.embedding_dimension,
         "window_size": settings.window_size,
         "active_sessions": len(_sessions),
         "total_users": user_store.count_users(),
     }
+
+
+@app.delete("/api/memory/reset")
+async def reset_memory(authorization: str = Header(None)):
+    """
+    Delete all memory for the authenticated user.
+    This completely removes the user's table and recreates it fresh.
+    """
+    user, api_key = await verify_bearer_token(authorization)
+
+    try:
+        success = await vector_store.delete_table(user.table_name)
+        return {
+            "success": True,
+            "message": "All memories deleted and table reset",
+            "user_id": user.user_id,
+            "table_name": user.table_name,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "user_id": user.user_id,
+        }
+
+
+@app.get("/api/memory/stats")
+async def memory_stats(authorization: str = Header(None)):
+    """Get memory statistics for the authenticated user."""
+    user, api_key = await verify_bearer_token(authorization)
+
+    try:
+        stats = await vector_store.get_table_stats(user.table_name)
+        return {
+            "success": True,
+            "user_id": user.user_id,
+            **stats,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "user_id": user.user_id,
+        }
 
 
 # === MCP Protocol Endpoints (Streamable HTTP - 2025-03-26 spec) ===

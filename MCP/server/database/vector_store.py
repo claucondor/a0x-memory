@@ -14,7 +14,7 @@ from ..auth.models import MemoryEntry
 
 
 # LanceDB schema for memory entries
-def get_memory_schema(embedding_dimension: int = 2560) -> pa.Schema:
+def get_memory_schema(embedding_dimension: int = 4096) -> pa.Schema:
     """Get PyArrow schema for memory entries"""
     return pa.schema([
         pa.field("entry_id", pa.string()),
@@ -39,7 +39,7 @@ class MultiTenantVectorStore:
     def __init__(
         self,
         db_path: str = "./data/lancedb",
-        embedding_dimension: int = 2560,
+        embedding_dimension: int = 4096,
     ):
         self.db_path = db_path
         self.embedding_dimension = embedding_dimension

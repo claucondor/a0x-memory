@@ -38,7 +38,7 @@ class Settings:
     ))
     lancedb_path: str = field(default_factory=lambda: os.getenv(
         "LANCEDB_PATH",
-        "./data/lancedb"
+        "gs://a0x-memory/lancedb"
     ))
     user_db_path: str = field(default_factory=lambda: os.getenv(
         "USER_DB_PATH",
@@ -47,9 +47,9 @@ class Settings:
 
     # OpenRouter Configuration
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    llm_model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "xai/grok-4.1-fast"))
+    llm_model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "meta-llama/llama-3.1-8b-instruct"))
     embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "qwen/qwen3-embedding-8b"))
-    embedding_dimension: int = field(default_factory=lambda: int(os.getenv("EMBEDDING_DIMENSION", "1024")))
+    embedding_dimension: int = field(default_factory=lambda: int(os.getenv("EMBEDDING_DIMENSION", "4096")))
 
     # Memory Building Configuration
     window_size: int = 20

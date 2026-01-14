@@ -26,3 +26,4 @@ pydantic>=2.5.0
 # Development (optional)
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
+google-cloud-storage>=2.14.0

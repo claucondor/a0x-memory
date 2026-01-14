@@ -77,6 +77,7 @@ class OpenRouterClient:
             "model": self.llm_model,
             "messages": messages,
             "temperature": temperature,
+            "usage": {"include": True},
         }
 
         if max_tokens:
@@ -91,6 +92,13 @@ class OpenRouterClient:
         response = await client.post("/chat/completions", json=payload)
         response.raise_for_status()
         data = response.json()
+
+        usage = data.get("usage", {})
+        if usage:
+            cost = usage.get("cost", 0)
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            print(f"[OpenRouter LLM] Model: {self.llm_model} | Tokens: {prompt_tokens}+{completion_tokens}={prompt_tokens+completion_tokens} | Cost: ${cost:.6f}")
 
         return data["choices"][0]["message"]["content"]
 
@@ -141,6 +149,11 @@ class OpenRouterClient:
         response = await client.post("/embeddings", json=payload)
         response.raise_for_status()
         data = response.json()
+
+        usage = data.get("usage", {})
+        if usage:
+            total_tokens = usage.get("total_tokens", 0)
+            print(f"[OpenRouter Embed] Model: {self.embedding_model} | Texts: {len(texts)} | Tokens: {total_tokens}")
 
         # Sort by index to ensure correct order
         embeddings_data = sorted(data["data"], key=lambda x: x["index"])
