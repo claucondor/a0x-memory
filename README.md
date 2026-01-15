@@ -1,29 +1,40 @@
-# SimpleMem: Efficient Lifelong Memory for LLM Agents
+# a0x-memory
 
-<div align="center">
+Fork of [SimpleMem](https://github.com/aiming-lab/SimpleMem) optimized for production deployment on Cloud Run.
 
-<p align="center">
-  <img src="fig/Fig_icon.png" width="70%">
-</p>
-
-
-[![Project Page](https://img.shields.io/badge/🎬_INTERACTIVE_DEMO-Visit_Our_Website-FF6B6B?style=for-the-badge&labelColor=FF6B6B&color=4ECDC4&logoColor=white)](https://aiming-lab.github.io/SimpleMem-Page)
-
-[![Paper](https://img.shields.io/badge/📄_Paper-arXiv-b31b1b?style=flat-square)](https://arxiv.org/abs/2601.02553)
-[![GitHub](https://img.shields.io/badge/GitHub-SimpleMem-181717?logo=github&style=flat-square)](https://github.com/aiming-lab/SimpleMem)
+[![Original Paper](https://img.shields.io/badge/📄_Paper-arXiv-b31b1b?style=flat-square)](https://arxiv.org/abs/2601.02553)
+[![Original Repo](https://img.shields.io/badge/GitHub-SimpleMem-181717?logo=github&style=flat-square)](https://github.com/aiming-lab/SimpleMem)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
-</div>
+---
+
+## Changes from Original
+
+This fork includes the following optimizations:
+
+**Hybrid Search with RRF + MMR**
+- Enabled `_keyword_search` and `_structured_search` (were defined but unused)
+- Added RRF (Reciprocal Rank Fusion) to combine semantic, keyword, and structured results
+- Added MMR (Maximal Marginal Relevance) for result diversity
+- Zero cost, minimal latency (~10-50ms)
+
+**Cloud Run Optimizations**
+- API embeddings via OpenRouter (no local model, no cold start)
+- LRU cache for memory instances (prevents OOM)
+- BTREE index on embedding cache for faster lookups
+- Async handling to avoid blocking event loop
+- Removed CUDA dependencies (CPU-only, -500MB image)
+
+**Cost Optimization**
+- Default LLM: `llama-3.1-8b-instruct` via OpenRouter
+- Default embeddings: `qwen3-embedding-8b` via OpenRouter API
+- ~14x cheaper than GPT-4, ~5x faster
 
 ---
 
-## 🔥 News
+## Original SimpleMem Documentation
 
-- **[01/14/2026]** **SimpleMem MCP Server is now LIVE and Open Source!** 🎉 Experience SimpleMem as a cloud-hosted memory service at [mcp.simplemem.cloud](https://mcp.simplemem.cloud). Easily integrate with your favorite chat platforms (LM Studio, Cherry Studio) and AI agents (Cursor, Claude Desktop) using the **Streamable HTTP** MCP protocol. The MCP implementation features production-ready optimizations including multi-tenant user isolation, faster response times, and enhanced security. [View MCP Documentation →](MCP/README.md)
-- **[01/08/2026]** We've set up a Discord server and WeChat group to make it easier to collaborate and exchange ideas on this project. Welcome to join the Group to share your thoughts, ask questions, or contribute your ideas! 🔥 Join our [Discord](https://discord.gg/86gKQ8AW) and [WeChat Group](fig/wechat_logo.jpg) Now!
-- **[01/05/2026]** SimpleMem paper was released on [arXiv](https://arxiv.org/abs/2601.02553)!
-
----
+Below is the original SimpleMem documentation for reference.
 
 ## 📑 Table of Contents
 
