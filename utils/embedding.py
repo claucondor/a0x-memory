@@ -59,7 +59,12 @@ class EmbeddingCache:
 
             if self.table_name not in self.db.table_names():
                 self.table = self.db.create_table(self.table_name, schema=schema)
-                print(f"Created embedding cache table: {self.table_name}")
+                # Create scalar index on text_hash for O(1) lookups instead of full scan
+                try:
+                    self.table.create_scalar_index("text_hash", index_type="BTREE")
+                    print(f"Created embedding cache table with BTREE index: {self.table_name}")
+                except Exception as idx_err:
+                    print(f"Created embedding cache table (index skipped): {self.table_name}")
             else:
                 self.table = self.db.open_table(self.table_name)
                 print(f"Opened embedding cache: {self.table.count_rows()} cached entries")

@@ -6,6 +6,9 @@ Endpoints designed to be compatible with Zep-like memory operations.
 """
 import os
 import uuid
+import asyncio
+import threading
+from collections import OrderedDict
 from typing import Dict, List, Optional, Any
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -115,37 +118,99 @@ class HealthResponse(BaseModel):
 # In-Memory Storage for Memory Instances
 # ============================================================================
 
-# Global storage for memory instances (in production, use Redis or persistent storage)
-memory_instances: Dict[str, SimpleMemSystem] = {}
-memory_metadata: Dict[str, Dict[str, Any]] = {}
+# LRU Cache to prevent memory leaks in long-running instances
+# Configurable via MEMORY_CACHE_MAX_SIZE (default: 100 instances)
+MEMORY_CACHE_MAX_SIZE = int(os.environ.get("MEMORY_CACHE_MAX_SIZE", "100"))
+
+
+class LRUCache:
+    """Thread-safe LRU cache for memory instances"""
+
+    def __init__(self, maxsize: int):
+        self.maxsize = maxsize
+        self.cache: OrderedDict = OrderedDict()
+        self.lock = threading.Lock()
+
+    def get(self, key: str):
+        with self.lock:
+            if key in self.cache:
+                # Move to end (most recently used)
+                self.cache.move_to_end(key)
+                return self.cache[key]
+            return None
+
+    def set(self, key: str, value):
+        with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+            self.cache[key] = value
+            # Evict oldest if over limit
+            while len(self.cache) > self.maxsize:
+                evicted_key, evicted_value = self.cache.popitem(last=False)
+                print(f"[SimpleMem API] Evicted memory instance: {evicted_key} (cache full)")
+
+    def __contains__(self, key: str) -> bool:
+        with self.lock:
+            return key in self.cache
+
+    def __len__(self) -> int:
+        with self.lock:
+            return len(self.cache)
+
+    def keys(self):
+        with self.lock:
+            return list(self.cache.keys())
+
+    def __getitem__(self, key: str):
+        """Support dict-like access: cache[key]"""
+        result = self.get(key)
+        if result is None and key not in self:
+            raise KeyError(key)
+        return result
+
+    def __setitem__(self, key: str, value):
+        """Support dict-like assignment: cache[key] = value"""
+        self.set(key, value)
+
+
+# Global storage with LRU eviction (prevents unbounded memory growth)
+memory_instances: LRUCache = LRUCache(maxsize=MEMORY_CACHE_MAX_SIZE)
+memory_metadata: Dict[str, Dict[str, Any]] = {}  # Metadata is small, no need for LRU
 
 
 def get_or_create_memory(memory_id: str, config: Optional[MemoryInstanceConfig] = None) -> SimpleMemSystem:
     """Get existing memory instance or create new one"""
-    if memory_id not in memory_instances:
-        # Create new instance with isolated database
-        db_path = f"./data/lancedb_{memory_id}"
-        table_name = f"memory_{memory_id.replace('-', '_')}"
+    # Try to get from cache first
+    instance = memory_instances.get(memory_id)
+    if instance is not None:
+        return instance
 
-        clear_db = config.clear_db if config else False
+    # Create new instance with isolated database
+    db_path = f"./data/lancedb_{memory_id}"
+    table_name = f"memory_{memory_id.replace('-', '_')}"
 
-        memory_instances[memory_id] = SimpleMemSystem(
-            db_path=db_path,
-            table_name=table_name,
-            clear_db=clear_db
-        )
+    clear_db = config.clear_db if config else False
 
-        memory_metadata[memory_id] = {
-            "created_at": datetime.utcnow().isoformat(),
-            "user_id": config.user_id if config else None,
-            "thread_id": config.thread_id if config else None,
-            "metadata": config.metadata if config else {},
-            "dialogue_count": 0
-        }
+    instance = SimpleMemSystem(
+        db_path=db_path,
+        table_name=table_name,
+        clear_db=clear_db
+    )
 
-        print(f"[SimpleMem API] Created new memory instance: {memory_id}")
+    # Store in LRU cache (may evict oldest if full)
+    memory_instances.set(memory_id, instance)
 
-    return memory_instances[memory_id]
+    memory_metadata[memory_id] = {
+        "created_at": datetime.utcnow().isoformat(),
+        "user_id": config.user_id if config else None,
+        "thread_id": config.thread_id if config else None,
+        "metadata": config.metadata if config else {},
+        "dialogue_count": 0
+    }
+
+    print(f"[SimpleMem API] Created new memory instance: {memory_id} (cache: {len(memory_instances)}/{MEMORY_CACHE_MAX_SIZE})")
+
+    return instance
 
 
 # ============================================================================
@@ -420,14 +485,20 @@ async def ask_memory(memory_id: str, request: AskRequest):
         )
 
     # Use hybrid retriever to get contexts
-    contexts = system.hybrid_retriever.retrieve(
+    # Run in thread pool to avoid blocking event loop during LLM retries
+    # Note: enable_planning is configured at HybridRetriever init (from config.py)
+    contexts = await asyncio.to_thread(
+        system.hybrid_retriever.retrieve,
         request.question,
-        enable_planning=request.enable_planning,
         enable_reflection=request.enable_reflection
     )
 
-    # Generate answer
-    answer = system.answer_generator.generate_answer(request.question, contexts)
+    # Generate answer (also in thread pool for same reason)
+    answer = await asyncio.to_thread(
+        system.answer_generator.generate_answer,
+        request.question,
+        contexts
+    )
 
     return AskResponse(
         answer=answer,
@@ -440,10 +511,12 @@ async def ask_memory(memory_id: str, request: AskRequest):
 async def search_memory(
     memory_id: str,
     query: str,
-    limit: Optional[int] = 10
+    limit: Optional[int] = 10,
+    enable_reflection: bool = True
 ):
     """
-    Search memory entries (simpler than ask, just retrieval without generation).
+    Search memory entries with intelligent retrieval.
+    Uses LLM-powered planning and reflection for better results.
     Equivalent to Zep searchUserGraph.
     """
     if memory_id not in memory_instances:
@@ -451,11 +524,12 @@ async def search_memory(
 
     system = memory_instances[memory_id]
 
-    # Use hybrid retriever for search only
-    contexts = system.hybrid_retriever.retrieve(
+    # Use hybrid retriever with LLM-powered planning (in thread pool to avoid blocking)
+    # Note: enable_planning is configured at HybridRetriever init (from config.py)
+    contexts = await asyncio.to_thread(
+        system.hybrid_retriever.retrieve,
         query,
-        enable_planning=False,
-        enable_reflection=False
+        enable_reflection=enable_reflection
     )
 
     # Limit results
