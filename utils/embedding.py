@@ -1,6 +1,6 @@
 """
-Embedding utilities - Generate vector embeddings using SentenceTransformers
-Supports Qwen3 Embedding models through SentenceTransformers interface
+Embedding utilities - Generate vector embeddings
+Supports both API (OpenRouter) and local (SentenceTransformers) providers
 Includes embedding cache for Cloud Run stateless deployments
 """
 from typing import List, Optional, Dict, Any
@@ -21,11 +21,13 @@ class EmbeddingCache:
         self,
         db_path: str = None,
         table_name: str = "embedding_cache",
-        storage_options: Optional[Dict[str, Any]] = None
+        storage_options: Optional[Dict[str, Any]] = None,
+        embedding_dimension: int = None
     ):
         self.db_path = db_path or config.LANCEDB_PATH
         self.table_name = table_name
         self.storage_options = storage_options
+        self.embedding_dimension = embedding_dimension or getattr(config, 'EMBEDDING_DIMENSION', 4096)
         self.table = None
         self._enabled = getattr(config, 'ENABLE_EMBEDDING_CACHE', True)
 
@@ -49,7 +51,7 @@ class EmbeddingCache:
             schema = pa.schema([
                 pa.field("text_hash", pa.string()),
                 pa.field("text_preview", pa.string()),
-                pa.field("embedding", pa.list_(pa.float32())),
+                pa.field("embedding", pa.list_(pa.float32(), self.embedding_dimension)),
                 pa.field("is_query", pa.bool_()),
                 pa.field("created_at", pa.string()),
                 pa.field("hit_count", pa.int32())
@@ -135,116 +137,194 @@ class EmbeddingCache:
             return {"enabled": False}
 
 
+class APIEmbeddingProvider:
+    """
+    Embedding provider using OpenRouter API.
+    No cold start, better quality models.
+    """
+
+    def __init__(
+        self,
+        api_key: str = None,
+        base_url: str = "https://openrouter.ai/api/v1",
+        model: str = None
+    ):
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY") or config.OPENAI_API_KEY
+        self.base_url = base_url
+        self.model = model or getattr(config, 'EMBEDDING_MODEL', 'qwen/qwen3-embedding-8b')
+        self.dimension = getattr(config, 'EMBEDDING_DIMENSION', 4096)
+
+        from openai import OpenAI
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url
+        )
+        print(f"API Embedding provider initialized: {self.model} ({self.dimension}D)")
+
+    def encode(self, texts: List[str]) -> np.ndarray:
+        """Encode texts using OpenRouter API."""
+        if isinstance(texts, str):
+            texts = [texts]
+
+        try:
+            response = self.client.embeddings.create(
+                model=self.model,
+                input=texts
+            )
+
+            embeddings = [item.embedding for item in response.data]
+            return np.array(embeddings, dtype=np.float32)
+
+        except Exception as e:
+            print(f"API embedding error: {e}")
+            raise
+
+
+class LocalEmbeddingProvider:
+    """
+    Embedding provider using local SentenceTransformers.
+    Free but has cold start penalty.
+    """
+
+    def __init__(self, model_name: str = None, use_optimization: bool = True):
+        self.model_name = model_name or config.EMBEDDING_MODEL
+        self.use_optimization = use_optimization
+        self.model = None
+        self.dimension = None
+        self.model_type = None
+        self.supports_query_prompt = False
+
+        self._init_model()
+
+    def _init_model(self):
+        """Initialize the local model."""
+        print(f"Loading local embedding model: {self.model_name}")
+
+        if self.model_name.lower().startswith("qwen"):
+            self._init_qwen3_model()
+        else:
+            self._init_standard_model()
+
+    def _init_qwen3_model(self):
+        """Initialize Qwen3 model using SentenceTransformers"""
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            qwen3_models = {
+                "qwen3-0.6b": "Qwen/Qwen3-Embedding-0.6B",
+                "qwen3-4b": "Qwen/Qwen3-Embedding-4B",
+                "qwen3-8b": "Qwen/Qwen3-Embedding-8B"
+            }
+
+            model_path = qwen3_models.get(self.model_name.lower(), self.model_name)
+
+            if self.use_optimization:
+                try:
+                    self.model = SentenceTransformer(
+                        model_path,
+                        model_kwargs={"attn_implementation": "flash_attention_2", "device_map": "auto"},
+                        tokenizer_kwargs={"padding_side": "left"},
+                        trust_remote_code=True
+                    )
+                except Exception:
+                    self.model = SentenceTransformer(model_path, trust_remote_code=True)
+            else:
+                self.model = SentenceTransformer(model_path, trust_remote_code=True)
+
+            self.dimension = self.model.get_sentence_embedding_dimension()
+            self.model_type = "qwen3"
+            self.supports_query_prompt = hasattr(self.model, 'prompts') and 'query' in getattr(self.model, 'prompts', {})
+
+            print(f"Local model loaded: {self.dimension}D")
+
+        except Exception as e:
+            print(f"Failed to load Qwen3: {e}, falling back...")
+            self._init_standard_model()
+
+    def _init_standard_model(self):
+        """Initialize standard SentenceTransformer model"""
+        from sentence_transformers import SentenceTransformer
+
+        fallback = "sentence-transformers/all-MiniLM-L6-v2"
+        model_name = self.model_name if not self.model_name.lower().startswith("qwen") else fallback
+
+        self.model = SentenceTransformer(model_name)
+        self.dimension = self.model.get_sentence_embedding_dimension()
+        self.model_type = "sentence_transformer"
+        self.supports_query_prompt = False
+
+        print(f"SentenceTransformer loaded: {self.dimension}D")
+
+    def encode(self, texts: List[str], is_query: bool = False) -> np.ndarray:
+        """Encode texts using local model."""
+        if isinstance(texts, str):
+            texts = [texts]
+
+        if self.supports_query_prompt and is_query:
+            embeddings = self.model.encode(
+                texts,
+                prompt_name="query",
+                show_progress_bar=False,
+                normalize_embeddings=True
+            )
+        else:
+            embeddings = self.model.encode(
+                texts,
+                show_progress_bar=False,
+                normalize_embeddings=True
+            )
+
+        return np.array(embeddings, dtype=np.float32)
+
+
 class EmbeddingModel:
     """
-    Embedding model using SentenceTransformers (supports Qwen3 and other models)
-    Includes embedding cache for repeated queries/documents
+    Unified embedding model with caching support.
+    Supports both API (OpenRouter) and local (SentenceTransformers) providers.
+
+    Config options:
+        EMBEDDING_PROVIDER = "api" | "local"
+        EMBEDDING_MODEL = "qwen/qwen3-embedding-8b" (API) or "Qwen/Qwen3-Embedding-0.6B" (local)
+        EMBEDDING_DIMENSION = 4096 (API) or 1024 (local)
     """
 
     def __init__(
         self,
         model_name: str = None,
-        use_optimization: bool = True,
+        provider: str = None,
         cache_db_path: str = None,
         storage_options: Optional[Dict[str, Any]] = None
     ):
+        # Determine provider
+        self.provider_type = provider or getattr(config, 'EMBEDDING_PROVIDER', 'api')
         self.model_name = model_name or config.EMBEDDING_MODEL
-        self.use_optimization = use_optimization
 
+        # Initialize provider
+        if self.provider_type == "api":
+            self.provider = APIEmbeddingProvider(model=self.model_name)
+            self.dimension = self.provider.dimension
+        else:
+            self.provider = LocalEmbeddingProvider(model_name=self.model_name)
+            self.dimension = self.provider.dimension
+
+        # Initialize cache
         enable_cache = getattr(config, 'ENABLE_EMBEDDING_CACHE', True)
         if enable_cache:
             self.cache = EmbeddingCache(
                 db_path=cache_db_path,
-                storage_options=storage_options
+                storage_options=storage_options,
+                embedding_dimension=self.dimension
             )
         else:
             self.cache = None
 
-        print(f"Loading embedding model: {self.model_name}")
-        
-        # Check if it's a Qwen3 model (through SentenceTransformers)
-        if self.model_name.startswith("qwen3"):
-            self._init_qwen3_sentence_transformer()
-        else:
-            self._init_standard_sentence_transformer()
-
-    def _init_qwen3_sentence_transformer(self):
-        """Initialize Qwen3 model using SentenceTransformers"""
-        try:
-            from sentence_transformers import SentenceTransformer
-            
-            # Map model names to actual model paths
-            qwen3_models = {
-                "qwen3-0.6b": "Qwen/Qwen3-Embedding-0.6B",
-                "qwen3-4b": "Qwen/Qwen3-Embedding-4B", 
-                "qwen3-8b": "Qwen/Qwen3-Embedding-8B"
-            }
-            
-            model_path = qwen3_models.get(self.model_name, self.model_name)
-            print(f"Loading Qwen3 model via SentenceTransformers: {model_path}")
-            
-            # Initialize with optimization settings
-            if self.use_optimization:
-                try:
-                    # Try to use flash_attention_2 and left padding for better performance
-                    self.model = SentenceTransformer(
-                        model_path,
-                        model_kwargs={
-                            "attn_implementation": "flash_attention_2", 
-                            "device_map": "auto"
-                        },
-                        tokenizer_kwargs={"padding_side": "left"},
-                        trust_remote_code=True
-                    )
-                    print("Qwen3 loaded with flash_attention_2 optimization")
-                except Exception as e:
-                    print(f"Flash attention failed ({e}), using standard loading...")
-                    self.model = SentenceTransformer(model_path, trust_remote_code=True)
-            else:
-                self.model = SentenceTransformer(model_path, trust_remote_code=True)
-            
-            self.dimension = self.model.get_sentence_embedding_dimension()
-            self.model_type = "qwen3_sentence_transformer"
-            
-            # Check if Qwen3 supports query prompts
-            self.supports_query_prompt = hasattr(self.model, 'prompts') and 'query' in getattr(self.model, 'prompts', {})
-            
-            print(f"Qwen3 model loaded successfully with dimension: {self.dimension}")
-            if self.supports_query_prompt:
-                print("Query prompt support detected")
-                
-        except Exception as e:
-            print(f"Failed to load Qwen3 model: {e}")
-            print("Falling back to default SentenceTransformers model...")
-            self._fallback_to_sentence_transformer()
-
-    def _init_standard_sentence_transformer(self):
-        """Initialize standard SentenceTransformer model"""
-        try:
-            from sentence_transformers import SentenceTransformer
-            self.model = SentenceTransformer(self.model_name)
-            self.dimension = self.model.get_sentence_embedding_dimension()
-            self.model_type = "sentence_transformer"
-            self.supports_query_prompt = False
-            print(f"SentenceTransformer model loaded with dimension: {self.dimension}")
-        except Exception as e:
-            print(f"Failed to load SentenceTransformer model: {e}")
-            raise
-
-    def _fallback_to_sentence_transformer(self):
-        """Fallback to default SentenceTransformer model"""
-        fallback_model = "sentence-transformers/all-MiniLM-L6-v2"
-        print(f"Using fallback model: {fallback_model}")
-        self.model_name = fallback_model
-        self._init_standard_sentence_transformer()
-
     def encode(self, texts: List[str], is_query: bool = False) -> np.ndarray:
         """
-        Encode list of texts to vectors with caching support
+        Encode texts to vectors with caching support.
 
         Args:
-        - texts: List of texts to encode
-        - is_query: Whether these are query texts (for Qwen3 prompt optimization)
+            texts: List of texts to encode
+            is_query: Whether these are query texts (for prompt optimization)
         """
         if isinstance(texts, str):
             texts = [texts]
@@ -273,56 +353,23 @@ class EmbeddingModel:
         return np.array(results)
 
     def _compute_embeddings(self, texts: List[str], is_query: bool) -> np.ndarray:
-        """Compute embeddings without cache."""
-        if self.model_type == "qwen3_sentence_transformer" and self.supports_query_prompt and is_query:
-            return self._encode_with_query_prompt(texts)
+        """Compute embeddings using the configured provider."""
+        if self.provider_type == "api":
+            return self.provider.encode(texts)
         else:
-            return self._encode_standard(texts)
+            return self.provider.encode(texts, is_query=is_query)
 
     def encode_single(self, text: str, is_query: bool = False) -> np.ndarray:
-        """
-        Encode single text
-        
-        Args:
-        - text: Text to encode
-        - is_query: Whether this is a query text (for Qwen3 prompt optimization)
-        """
+        """Encode single text."""
         return self.encode([text], is_query=is_query)[0]
-    
+
     def encode_query(self, queries: List[str]) -> np.ndarray:
-        """
-        Encode queries with optimal settings for Qwen3
-        """
+        """Encode queries with optimal settings."""
         return self.encode(queries, is_query=True)
-    
+
     def encode_documents(self, documents: List[str]) -> np.ndarray:
-        """
-        Encode documents (no query prompt)
-        """
+        """Encode documents."""
         return self.encode(documents, is_query=False)
-    
-    def _encode_with_query_prompt(self, texts: List[str]) -> np.ndarray:
-        """Encode texts using Qwen3 query prompt"""
-        try:
-            embeddings = self.model.encode(
-                texts, 
-                prompt_name="query",  # Use Qwen3's query prompt
-                show_progress_bar=False,
-                normalize_embeddings=True
-            )
-            return embeddings
-        except Exception as e:
-            print(f"Query prompt encoding failed: {e}, falling back to standard encoding")
-            return self._encode_standard(texts)
-    
-    def _encode_standard(self, texts: List[str]) -> np.ndarray:
-        """Encode texts using standard method"""
-        embeddings = self.model.encode(
-            texts,
-            show_progress_bar=False,
-            normalize_embeddings=True
-        )
-        return embeddings
 
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get embedding cache statistics."""

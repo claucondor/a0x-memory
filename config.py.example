@@ -25,13 +25,15 @@ OPENAI_API_KEY = "your-api-key-here"
 OPENAI_BASE_URL = None
 
 # LLM Model name
-# Examples: "gpt-4.1-mini", "gpt-4.1", "qwen3-max", "qwen-plus-2025-07-28"
-LLM_MODEL = "gpt-4.1-mini"
+# Llama 3.1 8B: 5.7x faster, 14x cheaper than gpt-4.1-mini with same quality
+# Examples: "meta-llama/llama-3.1-8b-instruct", "gpt-4.1-mini", "gpt-4.1"
+LLM_MODEL = "meta-llama/llama-3.1-8b-instruct"
 
-# Embedding model (local, no API needed)
-EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
-EMBEDDING_DIMENSION = 1024  # For Qwen3: up to 1024, supports 32-1024
-EMBEDDING_CONTEXT_LENGTH = 32768  # Qwen3 supports 32k context
+# Embedding Configuration
+# Provider: "api" (OpenRouter, no cold start) or "local" (SentenceTransformers)
+EMBEDDING_PROVIDER = "api"
+EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"  # OpenRouter: $0.02/1M tokens
+EMBEDDING_DIMENSION = 4096  # qwen3-embedding-8b = 4096D
 
 
 # ============================================================================
@@ -95,11 +97,11 @@ MEMORY_TABLE_NAME = "memory_entries"
 
 # Memory Building Parallel Processing
 ENABLE_PARALLEL_PROCESSING = True
-MAX_PARALLEL_WORKERS = 16  # Number of parallel workers for memory building
+MAX_PARALLEL_WORKERS = 4  # Optimized for Cloud Run (2-4 vCPUs)
 
-# Retrieval Parallel Processing  
+# Retrieval Parallel Processing
 ENABLE_PARALLEL_RETRIEVAL = True
-MAX_RETRIEVAL_WORKERS = 8  # Number of parallel workers for retrieval queries
+MAX_RETRIEVAL_WORKERS = 4  # Optimized for Cloud Run (2-4 vCPUs)
 
 # Planning and Reflection Configuration
 ENABLE_PLANNING = True
