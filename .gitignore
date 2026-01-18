@@ -81,8 +81,11 @@ test_llm_check/
 tests/test_lancedb/
 embedding_cache/
 
-# Session files
+# Session files and personal docs
 CLAUDE_*.md
+CLAUDE.md
+ROADMAP.md
+docs/
 
 # Jupyter Notebook
 .ipynb_checkpoints
