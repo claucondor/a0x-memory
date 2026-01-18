@@ -1,14 +1,24 @@
 # a0x-memory
 
-Fork of [SimpleMem](https://github.com/aiming-lab/SimpleMem) optimized for production deployment on Cloud Run.
+Long-term memory system for [a0x](https://a0x.co) agents.
 
-[![Original Paper](https://img.shields.io/badge/📄_Paper-arXiv-b31b1b?style=flat-square)](https://arxiv.org/abs/2601.02553)
-[![Original Repo](https://img.shields.io/badge/GitHub-SimpleMem-181717?logo=github&style=flat-square)](https://github.com/aiming-lab/SimpleMem)
-[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+[![a0x](https://img.shields.io/badge/a0x-agents-blue?style=flat-square)](https://a0x.co)
+[![Twitter](https://img.shields.io/badge/Twitter-@a0xbot-1DA1F2?style=flat-square&logo=twitter)](https://x.com/a0xbot)
+[![Telegram](https://img.shields.io/badge/Telegram-a0x__co-2CA5E0?style=flat-square&logo=telegram)](https://t.me/a0x_co)
+
+Fork of [SimpleMem](https://github.com/aiming-lab/SimpleMem) • [Paper](https://arxiv.org/abs/2601.02553)
 
 ---
 
-## Changes from Original
+## What is a0x?
+
+[a0x](https://a0x.co) is a platform for deploying autonomous AI agents that operate across Twitter, Farcaster, and Telegram. Each agent maintains its own personality, can deploy tokens, and interacts with users 24/7.
+
+This memory system gives agents the ability to remember conversations across sessions - who they talked to, what was discussed, commitments made, and context that makes interactions feel continuous rather than stateless.
+
+---
+
+## Fork Changes
 
 This fork includes the following optimizations:
 
