@@ -1,13 +1,15 @@
 """
-Vector Store - Structured Multi-View Indexing Implementation (Section 3.2)
+Vector Store - Multi-tenant storage with Structured Multi-View Indexing
 
-Paper Reference: Section 3.2 - Structured Indexing
-Implements the three structured indexing dimensions:
-- Semantic Layer: Dense vectors v_k ∈ ℝ^d (embedding-based similarity)
+Supports multi-tenant isolation via agent_id and user_id filtering.
+Single shared database, queries filtered by tenant context.
+
+Indexing dimensions:
+- Semantic Layer: Dense vectors (embedding similarity)
 - Lexical Layer: Full-text search with Tantivy FTS
-- Symbolic Layer: Metadata R_k = {(key, val)} (structured filtering via SQL)
+- Symbolic Layer: SQL-based metadata filtering
 """
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import lancedb
 import pyarrow as pa
 from models.memory_entry import MemoryEntry
@@ -32,13 +34,19 @@ class VectorStore:
         db_path: str = None,
         embedding_model: EmbeddingModel = None,
         table_name: str = None,
-        storage_options: Optional[Dict[str, Any]] = None
+        storage_options: Optional[Dict[str, Any]] = None,
+        agent_id: Optional[str] = None,
+        user_id: Optional[str] = None
     ):
         self.db_path = db_path or config.LANCEDB_PATH
         self.embedding_model = embedding_model or EmbeddingModel()
         self.table_name = table_name or config.MEMORY_TABLE_NAME
         self.table = None
         self._fts_initialized = False
+
+        # Multi-tenant context (None = no filtering, backwards compatible)
+        self.agent_id = agent_id
+        self.user_id = user_id
 
         # Detect if using cloud storage (GCS, S3, Azure)
         self._is_cloud_storage = self.db_path.startswith(("gs://", "s3://", "az://"))
@@ -53,8 +61,10 @@ class VectorStore:
         self._init_table()
 
     def _init_table(self):
-        """Initialize table schema and FTS index."""
+        """Initialize table schema with multi-tenant support."""
         schema = pa.schema([
+            pa.field("agent_id", pa.string()),  # Multi-tenant: agent identifier
+            pa.field("user_id", pa.string()),   # Multi-tenant: user identifier
             pa.field("entry_id", pa.string()),
             pa.field("lossless_restatement", pa.string()),
             pa.field("keywords", pa.list_(pa.string())),
@@ -72,6 +82,15 @@ class VectorStore:
         else:
             self.table = self.db.open_table(self.table_name)
             print(f"Opened existing table: {self.table_name}")
+
+    def _get_tenant_filter(self) -> Optional[str]:
+        """Build SQL filter clause for multi-tenant isolation."""
+        conditions = []
+        if self.agent_id:
+            conditions.append(f"agent_id = '{self.agent_id}'")
+        if self.user_id:
+            conditions.append(f"user_id = '{self.user_id}'")
+        return " AND ".join(conditions) if conditions else None
 
     def _init_fts_index(self):
         """Initialize Full-Text Search index on lossless_restatement column."""
@@ -120,10 +139,14 @@ class VectorStore:
                 continue
         return entries
 
-    def add_entries(self, entries: List[MemoryEntry]):
-        """Batch add memory entries."""
+    def add_entries(self, entries: List[MemoryEntry], agent_id: str = None, user_id: str = None):
+        """Batch add memory entries with optional tenant override."""
         if not entries:
             return
+
+        # Use instance tenant or override
+        _agent_id = agent_id or self.agent_id or ""
+        _user_id = user_id or self.user_id or ""
 
         restatements = [entry.lossless_restatement for entry in entries]
         vectors = self.embedding_model.encode_documents(restatements)
@@ -131,6 +154,8 @@ class VectorStore:
         data = []
         for entry, vector in zip(entries, vectors):
             data.append({
+                "agent_id": _agent_id,
+                "user_id": _user_id,
                 "entry_id": entry.entry_id,
                 "lossless_restatement": entry.lossless_restatement,
                 "keywords": entry.keywords,
@@ -143,25 +168,27 @@ class VectorStore:
             })
 
         self.table.add(data)
-        print(f"Added {len(entries)} memory entries")
+        print(f"Added {len(entries)} entries (agent={_agent_id or 'none'}, user={_user_id or 'none'})")
 
         # Initialize FTS index after first data insertion
         if not self._fts_initialized:
             self._init_fts_index()
 
     def semantic_search(self, query: str, top_k: int = 5) -> List[MemoryEntry]:
-        """
-        Semantic Layer Search - Dense vector similarity.
-
-        Paper Reference: Section 3.1
-        Retrieves based on v_k = E_dense(S_k) where S_k is the lossless restatement.
-        """
+        """Semantic search with multi-tenant filtering."""
         try:
             if self.table.count_rows() == 0:
                 return []
 
             query_vector = self.embedding_model.encode_single(query, is_query=True)
-            results = self.table.search(query_vector.tolist()).limit(top_k).to_list()
+            search = self.table.search(query_vector.tolist())
+
+            # Apply tenant filter
+            tenant_filter = self._get_tenant_filter()
+            if tenant_filter:
+                search = search.where(tenant_filter, prefilter=True)
+
+            results = search.limit(top_k).to_list()
             return self._results_to_entries(results)
 
         except Exception as e:
@@ -169,19 +196,20 @@ class VectorStore:
             return []
 
     def keyword_search(self, keywords: List[str], top_k: int = 3) -> List[MemoryEntry]:
-        """
-        Lexical Layer Search - Full-text search via Tantivy FTS.
-
-        Paper Reference: Section 3.1
-        Retrieves based on BM25 text matching using LanceDB native FTS.
-        """
+        """Keyword search (BM25 FTS) with multi-tenant filtering."""
         try:
             if not keywords or self.table.count_rows() == 0:
                 return []
 
-            # LanceDB auto-detects string input as FTS query when FTS index exists
             query = " ".join(keywords)
-            results = self.table.search(query).limit(top_k).to_list()
+            search = self.table.search(query)
+
+            # Apply tenant filter
+            tenant_filter = self._get_tenant_filter()
+            if tenant_filter:
+                search = search.where(tenant_filter, prefilter=True)
+
+            results = search.limit(top_k).to_list()
             return self._results_to_entries(results)
 
         except Exception as e:
@@ -196,13 +224,7 @@ class VectorStore:
         entities: Optional[List[str]] = None,
         top_k: Optional[int] = None
     ) -> List[MemoryEntry]:
-        """
-        Symbolic Layer Search - SQL-based metadata filtering.
-
-        Paper Reference: Section 3.1
-        Retrieves based on R_k = {(key, val)} for structured constraints.
-        Uses DataFusion SQL expressions with array_has_any for list columns.
-        """
+        """Structured metadata search with multi-tenant filtering."""
         try:
             if self.table.count_rows() == 0:
                 return []
@@ -211,6 +233,11 @@ class VectorStore:
                 return []
 
             conditions = []
+
+            # Add tenant filter first
+            tenant_filter = self._get_tenant_filter()
+            if tenant_filter:
+                conditions.append(tenant_filter)
 
             if persons:
                 values = ", ".join([f"'{p}'" for p in persons])
@@ -242,9 +269,21 @@ class VectorStore:
             return []
 
     def get_all_entries(self) -> List[MemoryEntry]:
-        """Get all memory entries."""
-        results = self.table.to_arrow().to_pylist()
+        """Get all memory entries for current tenant."""
+        tenant_filter = self._get_tenant_filter()
+        if tenant_filter:
+            results = self.table.search().where(tenant_filter, prefilter=True).to_list()
+        else:
+            results = self.table.to_arrow().to_pylist()
         return self._results_to_entries(results)
+
+    def count_entries(self) -> int:
+        """Count entries for current tenant."""
+        tenant_filter = self._get_tenant_filter()
+        if tenant_filter:
+            results = self.table.search().where(tenant_filter, prefilter=True).to_list()
+            return len(results)
+        return self.table.count_rows()
 
     def optimize(self):
         """Optimize table after bulk insertions for better query performance."""
@@ -252,28 +291,34 @@ class VectorStore:
         print("Table optimized")
 
     def clear(self):
-        """Clear all data and reinitialize table."""
-        self.db.drop_table(self.table_name)
-        self._fts_initialized = False
-        self._init_table()
-        print("Database cleared")
+        """Clear entries for current tenant (or all if no tenant set)."""
+        tenant_filter = self._get_tenant_filter()
+        if tenant_filter:
+            # Delete only tenant's entries
+            self.table.delete(tenant_filter)
+            print(f"Cleared entries for agent={self.agent_id}, user={self.user_id}")
+        else:
+            # No tenant = drop and recreate table
+            self.db.drop_table(self.table_name)
+            self._fts_initialized = False
+            self._init_table()
+            print("Database cleared")
 
-    def keyword_search_with_scores(self, keywords: List[str], top_k: int = 3) -> List[tuple]:
-        """
-        Keyword search using BM25 FTS that returns (MemoryEntry, score) tuples.
-
-        Uses LanceDB native Full-Text Search with BM25 ranking.
-        Scores are normalized to [0, 1] range.
-
-        Returns:
-            List of (MemoryEntry, float) tuples sorted by score (highest first)
-        """
+    def keyword_search_with_scores(self, keywords: List[str], top_k: int = 3) -> List[Tuple[MemoryEntry, float]]:
+        """Keyword search with scores and multi-tenant filtering."""
         try:
             if not keywords or self.table.count_rows() == 0:
                 return []
 
             query = " ".join(keywords)
-            results = self.table.search(query).limit(top_k).to_list()
+            search = self.table.search(query)
+
+            # Apply tenant filter
+            tenant_filter = self._get_tenant_filter()
+            if tenant_filter:
+                search = search.where(tenant_filter, prefilter=True)
+
+            results = search.limit(top_k).to_list()
 
             if not results:
                 return []

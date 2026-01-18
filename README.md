@@ -40,6 +40,38 @@ This fork includes the following optimizations:
 - Default embeddings: `qwen3-embedding-8b` via OpenRouter API
 - ~14x cheaper than GPT-4, ~5x faster
 
+**Multi-tenant Storage**
+
+Single shared LanceDB with tenant isolation via `agent_id` + `user_id` filtering. Designed for platforms with thousands of users and multiple agents.
+
+```python
+# Multi-tenant usage
+system = SimpleMemSystem(
+    agent_id="agent_001",
+    user_id="user_123"
+)
+
+# API format: "agent_id:user_id"
+POST /memories/agent_001:user_123/dialogues
+```
+
+Benchmark results (local, 1024D embeddings):
+
+| Operation | Performance |
+|-----------|-------------|
+| Single insert | 250 entries/sec |
+| Batch insert (100) | 10,400 entries/sec |
+| Query (no filter) | 131ms |
+| Query (agent filter) | 29ms |
+| Query (agent+user filter) | 17ms |
+| 50K entries insert | 2,291 entries/sec |
+
+Key findings:
+- Batch inserts are 40x faster than single inserts
+- Filtered queries are 8x faster than unfiltered (prefilter optimization)
+- LanceDB handles concurrent writes without locks
+- Single table scales better than separate tables per tenant
+
 ---
 
 ## 🔥 News

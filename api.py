@@ -1,8 +1,8 @@
 """
-SimpleMem HTTP API
-FastAPI server exposing SimpleMem as a REST API for integration with TypeScript services.
+SimpleMem HTTP API - Multi-tenant memory service
 
-Endpoints designed to be compatible with Zep-like memory operations.
+Single shared LanceDB, tenant isolation via agent_id + user_id filtering.
+Compatible with Zep-like memory operations.
 """
 import os
 import uuid
@@ -19,6 +19,8 @@ from pydantic import BaseModel, Field
 
 from main import SimpleMemSystem
 from models.memory_entry import MemoryEntry
+from database.vector_store import VectorStore
+from utils.embedding import EmbeddingModel
 
 
 # ============================================================================
@@ -115,102 +117,75 @@ class HealthResponse(BaseModel):
 
 
 # ============================================================================
-# In-Memory Storage for Memory Instances
+# Multi-tenant Storage (Single Shared DB)
 # ============================================================================
 
-# LRU Cache to prevent memory leaks in long-running instances
-# Configurable via MEMORY_CACHE_MAX_SIZE (default: 100 instances)
-MEMORY_CACHE_MAX_SIZE = int(os.environ.get("MEMORY_CACHE_MAX_SIZE", "100"))
+# Shared components (initialized on startup)
+shared_embedding_model: Optional[EmbeddingModel] = None
+shared_db_path = os.environ.get("LANCEDB_PATH", "./data/lancedb_shared")
+shared_table_name = os.environ.get("MEMORY_TABLE_NAME", "memories")
+
+# Tenant metadata (lightweight, no LRU needed)
+tenant_metadata: Dict[str, Dict[str, Any]] = {}
 
 
-class LRUCache:
-    """Thread-safe LRU cache for memory instances"""
-
-    def __init__(self, maxsize: int):
-        self.maxsize = maxsize
-        self.cache: OrderedDict = OrderedDict()
-        self.lock = threading.Lock()
-
-    def get(self, key: str):
-        with self.lock:
-            if key in self.cache:
-                # Move to end (most recently used)
-                self.cache.move_to_end(key)
-                return self.cache[key]
-            return None
-
-    def set(self, key: str, value):
-        with self.lock:
-            if key in self.cache:
-                self.cache.move_to_end(key)
-            self.cache[key] = value
-            # Evict oldest if over limit
-            while len(self.cache) > self.maxsize:
-                evicted_key, evicted_value = self.cache.popitem(last=False)
-                print(f"[SimpleMem API] Evicted memory instance: {evicted_key} (cache full)")
-
-    def __contains__(self, key: str) -> bool:
-        with self.lock:
-            return key in self.cache
-
-    def __len__(self) -> int:
-        with self.lock:
-            return len(self.cache)
-
-    def keys(self):
-        with self.lock:
-            return list(self.cache.keys())
-
-    def __getitem__(self, key: str):
-        """Support dict-like access: cache[key]"""
-        result = self.get(key)
-        if result is None and key not in self:
-            raise KeyError(key)
-        return result
-
-    def __setitem__(self, key: str, value):
-        """Support dict-like assignment: cache[key] = value"""
-        self.set(key, value)
+def get_shared_embedding_model() -> EmbeddingModel:
+    """Get or create shared embedding model."""
+    global shared_embedding_model
+    if shared_embedding_model is None:
+        shared_embedding_model = EmbeddingModel()
+    return shared_embedding_model
 
 
-# Global storage with LRU eviction (prevents unbounded memory growth)
-memory_instances: LRUCache = LRUCache(maxsize=MEMORY_CACHE_MAX_SIZE)
-memory_metadata: Dict[str, Dict[str, Any]] = {}  # Metadata is small, no need for LRU
+def parse_memory_id(memory_id: str) -> tuple:
+    """Parse memory_id into (agent_id, user_id).
+
+    Formats supported:
+    - "agent_001:user_123" -> ("agent_001", "user_123")
+    - "user_123" -> (None, "user_123")
+    - "uuid-format" -> (None, "uuid-format")
+    """
+    if ":" in memory_id:
+        parts = memory_id.split(":", 1)
+        return (parts[0], parts[1])
+    return (None, memory_id)
 
 
-def get_or_create_memory(memory_id: str, config: Optional[MemoryInstanceConfig] = None) -> SimpleMemSystem:
-    """Get existing memory instance or create new one"""
-    # Try to get from cache first
-    instance = memory_instances.get(memory_id)
-    if instance is not None:
-        return instance
+def get_memory_system(memory_id: str, config: Optional[MemoryInstanceConfig] = None) -> SimpleMemSystem:
+    """Get SimpleMem instance for tenant (creates lightweight tenant-scoped system)."""
+    agent_id, user_id = parse_memory_id(memory_id)
 
-    # Create new instance with isolated database
-    db_path = f"./data/lancedb_{memory_id}"
-    table_name = f"memory_{memory_id.replace('-', '_')}"
+    # Override with config if provided
+    if config:
+        if config.metadata and config.metadata.get("agent_id"):
+            agent_id = config.metadata["agent_id"]
+        if config.user_id:
+            user_id = config.user_id
 
     clear_db = config.clear_db if config else False
 
-    instance = SimpleMemSystem(
-        db_path=db_path,
-        table_name=table_name,
-        clear_db=clear_db
+    # Create tenant-scoped system (shares DB, filters by tenant)
+    system = SimpleMemSystem(
+        db_path=shared_db_path,
+        table_name=shared_table_name,
+        clear_db=clear_db,
+        agent_id=agent_id,
+        user_id=user_id
     )
 
-    # Store in LRU cache (may evict oldest if full)
-    memory_instances.set(memory_id, instance)
+    # Track metadata
+    if memory_id not in tenant_metadata:
+        tenant_metadata[memory_id] = {
+            "created_at": datetime.utcnow().isoformat(),
+            "agent_id": agent_id,
+            "user_id": user_id,
+            "thread_id": config.thread_id if config else None,
+            "metadata": config.metadata if config else {},
+            "dialogue_count": 0
+        }
+        print(f"[SimpleMem API] New tenant: {memory_id} (agent={agent_id}, user={user_id})")
 
-    memory_metadata[memory_id] = {
-        "created_at": datetime.utcnow().isoformat(),
-        "user_id": config.user_id if config else None,
-        "thread_id": config.thread_id if config else None,
-        "metadata": config.metadata if config else {},
-        "dialogue_count": 0
-    }
-
-    print(f"[SimpleMem API] Created new memory instance: {memory_id} (cache: {len(memory_instances)}/{MEMORY_CACHE_MAX_SIZE})")
-
-    return instance
+    return system
 
 
 # ============================================================================
@@ -222,18 +197,22 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     # Startup
     print("=" * 60)
-    print("SimpleMem API Starting...")
+    print("SimpleMem API Starting (Multi-tenant Mode)")
+    print(f"Shared DB: {shared_db_path}")
+    print(f"Table: {shared_table_name}")
     print("=" * 60)
 
     # Create data directory
     os.makedirs("./data", exist_ok=True)
 
+    # Pre-initialize shared embedding model
+    get_shared_embedding_model()
+
     yield
 
     # Shutdown
     print("SimpleMem API Shutting down...")
-    memory_instances.clear()
-    memory_metadata.clear()
+    tenant_metadata.clear()
 
 
 app = FastAPI(
@@ -262,8 +241,8 @@ async def health_check():
     """Health check endpoint"""
     return HealthResponse(
         status="healthy",
-        version="1.0.0",
-        memory_instances=len(memory_instances),
+        version="2.0.0",  # Multi-tenant version
+        memory_instances=len(tenant_metadata),
         timestamp=datetime.utcnow().isoformat()
     )
 
@@ -287,8 +266,8 @@ async def root():
 @app.post("/memories", response_model=MemoryInstanceResponse)
 async def create_memory_instance(config: Optional[MemoryInstanceConfig] = None):
     """
-    Create a new memory instance (equivalent to Zep thread creation).
-    Each memory instance has isolated storage.
+    Create/register a tenant context (equivalent to Zep thread creation).
+    Uses single shared DB with tenant filtering.
     """
     if config and config.memory_id:
         memory_id = config.memory_id
@@ -297,33 +276,29 @@ async def create_memory_instance(config: Optional[MemoryInstanceConfig] = None):
     else:
         memory_id = str(uuid.uuid4())
 
-    # Get or create the memory instance
-    get_or_create_memory(memory_id, config)
-
-    meta = memory_metadata.get(memory_id, {})
+    # Register tenant (creates metadata entry)
+    system = get_memory_system(memory_id, config)
+    meta = tenant_metadata.get(memory_id, {})
 
     return MemoryInstanceResponse(
         memory_id=memory_id,
         user_id=meta.get("user_id"),
         thread_id=meta.get("thread_id") or memory_id,
         created_at=meta.get("created_at", datetime.utcnow().isoformat()),
-        memory_count=0
+        memory_count=system.vector_store.count_entries()
     )
 
 
 @app.get("/memories/{memory_id}", response_model=MemoryResponse)
 async def get_memory(memory_id: str, last_n: Optional[int] = None):
     """
-    Get memory contents (equivalent to Zep getMemory).
-    Returns all memory entries and summary.
+    Get memory contents for tenant (equivalent to Zep getMemory).
+    Returns all memory entries filtered by tenant.
     """
-    if memory_id not in memory_instances:
-        raise HTTPException(status_code=404, detail=f"Memory instance {memory_id} not found")
+    system = get_memory_system(memory_id)
+    meta = tenant_metadata.get(memory_id, {})
 
-    system = memory_instances[memory_id]
-    meta = memory_metadata.get(memory_id, {})
-
-    # Get all memory entries
+    # Get all memory entries (filtered by tenant)
     entries = system.get_all_memories()
 
     # Build response
@@ -347,13 +322,12 @@ async def get_memory(memory_id: str, last_n: Optional[int] = None):
     # Build context summary
     context = None
     if entries:
-        # Simple context: last few memories
         recent = entries[-5:] if last_n is None else entries[-last_n:]
         context = "\n".join([e.lossless_restatement for e in recent])
 
     return MemoryResponse(
         memory_id=memory_id,
-        messages=[],  # We don't store raw messages, only processed memories
+        messages=[],
         summary=context,
         context=context,
         facts=facts,
@@ -364,19 +338,16 @@ async def get_memory(memory_id: str, last_n: Optional[int] = None):
 
 @app.delete("/memories/{memory_id}")
 async def delete_memory(memory_id: str):
-    """Delete a memory instance"""
-    if memory_id not in memory_instances:
-        raise HTTPException(status_code=404, detail=f"Memory instance {memory_id} not found")
+    """Delete tenant's memory entries (not the whole DB)."""
+    system = get_memory_system(memory_id)
 
-    # Clean up
-    system = memory_instances.pop(memory_id)
-    memory_metadata.pop(memory_id, None)
-
-    # Clear the vector store
+    # Clear only this tenant's entries
     try:
         system.vector_store.clear()
+        tenant_metadata.pop(memory_id, None)
     except Exception as e:
-        print(f"[SimpleMem API] Warning: Could not clear vector store: {e}")
+        print(f"[SimpleMem API] Warning: Could not clear tenant data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
     return {"success": True, "memory_id": memory_id}
 
@@ -392,10 +363,9 @@ async def add_dialogues(
     background_tasks: BackgroundTasks
 ):
     """
-    Add dialogues to memory (triggers memory building in background).
-    Equivalent to Zep addMessages.
+    Add dialogues to tenant's memory (triggers memory building in background).
     """
-    system = get_or_create_memory(memory_id)
+    system = get_memory_system(memory_id)
 
     # Add each dialogue
     for dialogue in request.dialogues:
@@ -407,9 +377,9 @@ async def add_dialogues(
         )
 
     # Update dialogue count
-    if memory_id in memory_metadata:
-        memory_metadata[memory_id]["dialogue_count"] = (
-            memory_metadata[memory_id].get("dialogue_count", 0) + len(request.dialogues)
+    if memory_id in tenant_metadata:
+        tenant_metadata[memory_id]["dialogue_count"] = (
+            tenant_metadata[memory_id].get("dialogue_count", 0) + len(request.dialogues)
         )
 
     # Finalize in background (process buffer)
@@ -429,10 +399,9 @@ async def add_messages(
     background_tasks: BackgroundTasks
 ):
     """
-    Add messages to memory (Zep-compatible format).
-    Converts role-based messages to speaker-based dialogues.
+    Add messages to tenant's memory (Zep-compatible format).
     """
-    system = get_or_create_memory(memory_id)
+    system = get_memory_system(memory_id)
 
     # Convert messages to dialogues
     for msg in request.messages:
@@ -444,9 +413,9 @@ async def add_messages(
         )
 
     # Update count
-    if memory_id in memory_metadata:
-        memory_metadata[memory_id]["dialogue_count"] = (
-            memory_metadata[memory_id].get("dialogue_count", 0) + len(request.messages)
+    if memory_id in tenant_metadata:
+        tenant_metadata[memory_id]["dialogue_count"] = (
+            tenant_metadata[memory_id].get("dialogue_count", 0) + len(request.messages)
         )
 
     # Finalize in background
@@ -466,34 +435,27 @@ async def add_messages(
 @app.post("/memories/{memory_id}/ask", response_model=AskResponse)
 async def ask_memory(memory_id: str, request: AskRequest):
     """
-    Ask a question against the memory (equivalent to Zep graph search).
-    Uses SimpleMem's hybrid retrieval and answer generation.
+    Ask a question against tenant's memory.
+    Uses hybrid retrieval and answer generation.
     """
-    if memory_id not in memory_instances:
-        raise HTTPException(status_code=404, detail=f"Memory instance {memory_id} not found")
+    system = get_memory_system(memory_id)
+    memory_count = system.vector_store.count_entries()
 
-    system = memory_instances[memory_id]
-
-    # Get memory count
-    entries = system.get_all_memories()
-
-    if not entries:
+    if memory_count == 0:
         return AskResponse(
             answer="No memories available to answer this question.",
             contexts=[],
             memory_count=0
         )
 
-    # Use hybrid retriever to get contexts
-    # Run in thread pool to avoid blocking event loop during LLM retries
-    # Note: enable_planning is configured at HybridRetriever init (from config.py)
+    # Use hybrid retriever (filtered by tenant)
     contexts = await asyncio.to_thread(
         system.hybrid_retriever.retrieve,
         request.question,
         enable_reflection=request.enable_reflection
     )
 
-    # Generate answer (also in thread pool for same reason)
+    # Generate answer
     answer = await asyncio.to_thread(
         system.answer_generator.generate_answer,
         request.question,
@@ -503,7 +465,7 @@ async def ask_memory(memory_id: str, request: AskRequest):
     return AskResponse(
         answer=answer,
         contexts=contexts if contexts else [],
-        memory_count=len(entries)
+        memory_count=memory_count
     )
 
 
@@ -515,17 +477,11 @@ async def search_memory(
     enable_reflection: bool = True
 ):
     """
-    Search memory entries with intelligent retrieval.
-    Uses LLM-powered planning and reflection for better results.
-    Equivalent to Zep searchUserGraph.
+    Search tenant's memory with hybrid retrieval.
     """
-    if memory_id not in memory_instances:
-        raise HTTPException(status_code=404, detail=f"Memory instance {memory_id} not found")
+    system = get_memory_system(memory_id)
 
-    system = memory_instances[memory_id]
-
-    # Use hybrid retriever with LLM-powered planning (in thread pool to avoid blocking)
-    # Note: enable_planning is configured at HybridRetriever init (from config.py)
+    # Use hybrid retriever (filtered by tenant)
     contexts = await asyncio.to_thread(
         system.hybrid_retriever.retrieve,
         query,
@@ -549,11 +505,8 @@ async def search_memory(
 
 @app.get("/memories/{memory_id}/entries", response_model=List[MemoryEntryResponse])
 async def list_memory_entries(memory_id: str):
-    """List all memory entries (for debugging)"""
-    if memory_id not in memory_instances:
-        raise HTTPException(status_code=404, detail=f"Memory instance {memory_id} not found")
-
-    system = memory_instances[memory_id]
+    """List all memory entries for tenant (for debugging)"""
+    system = get_memory_system(memory_id)
     entries = system.get_all_memories()
 
     return [
@@ -571,21 +524,29 @@ async def list_memory_entries(memory_id: str):
     ]
 
 
-@app.get("/instances")
-async def list_instances():
-    """List all memory instances (for debugging)"""
+@app.get("/tenants")
+async def list_tenants():
+    """List all registered tenants (for debugging)"""
     return {
-        "instances": list(memory_instances.keys()),
-        "count": len(memory_instances),
+        "tenants": list(tenant_metadata.keys()),
+        "count": len(tenant_metadata),
         "metadata": {
             k: {
                 "created_at": v.get("created_at"),
+                "agent_id": v.get("agent_id"),
                 "user_id": v.get("user_id"),
                 "dialogue_count": v.get("dialogue_count", 0)
             }
-            for k, v in memory_metadata.items()
+            for k, v in tenant_metadata.items()
         }
     }
+
+
+# Backwards compatibility alias
+@app.get("/instances")
+async def list_instances():
+    """Alias for /tenants (backwards compatibility)"""
+    return await list_tenants()
 
 
 # ============================================================================

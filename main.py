@@ -38,7 +38,9 @@ class SimpleMemSystem:
         enable_parallel_processing: Optional[bool] = None,
         max_parallel_workers: Optional[int] = None,
         enable_parallel_retrieval: Optional[bool] = None,
-        max_retrieval_workers: Optional[int] = None
+        max_retrieval_workers: Optional[int] = None,
+        agent_id: Optional[str] = None,
+        user_id: Optional[str] = None
     ):
         """
         Initialize system
@@ -59,9 +61,17 @@ class SimpleMemSystem:
         - max_parallel_workers: Maximum number of parallel workers for memory building (None=use config default)
         - enable_parallel_retrieval: Enable parallel processing for retrieval queries (None=use config default)
         - max_retrieval_workers: Maximum number of parallel workers for retrieval (None=use config default)
+        - agent_id: Agent identifier for multi-tenant isolation (None=no filtering)
+        - user_id: User identifier for multi-tenant isolation (None=no filtering)
         """
+        # Store tenant context
+        self.agent_id = agent_id
+        self.user_id = user_id
+
         print("=" * 60)
         print("Initializing SimpleMem System")
+        if agent_id or user_id:
+            print(f"Tenant: agent={agent_id or 'any'}, user={user_id or 'any'}")
         print("=" * 60)
 
         # Initialize core components
@@ -76,7 +86,9 @@ class SimpleMemSystem:
         self.vector_store = VectorStore(
             db_path=db_path,
             embedding_model=self.embedding_model,
-            table_name=table_name
+            table_name=table_name,
+            agent_id=agent_id,
+            user_id=user_id
         )
 
         if clear_db:
