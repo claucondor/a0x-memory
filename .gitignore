@@ -67,14 +67,22 @@ config.py
 *.sqlite
 *.sqlite3
 lancedb_data/
+*.lance/
+data/
 
 # Log files
 *.log
 
-# Test results
+# Test results and data
 locomo10_test_results.json
 test_results/
 *.json
+test_llm_check/
+tests/test_lancedb/
+embedding_cache/
+
+# Session files
+CLAUDE_*.md
 
 # Jupyter Notebook
 .ipynb_checkpoints
