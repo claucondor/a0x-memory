@@ -12,11 +12,11 @@ Fork of [SimpleMem](https://github.com/aiming-lab/SimpleMem) optimized for produ
 
 This fork includes the following optimizations:
 
-**Hybrid Search with RRF + MMR**
-- Enabled `_keyword_search` and `_structured_search` (were defined but unused)
-- Added RRF (Reciprocal Rank Fusion) to combine semantic, keyword, and structured results
-- Added MMR (Maximal Marginal Relevance) for result diversity
-- Zero cost, minimal latency (~10-50ms)
+**Adaptive Keyword Boost**
+- LLM detects when queries need exact lexical matching (function names, error codes, etc.)
+- Convex Combination fusion: `S = α·S_sem + (1-α)·S_kw` with α=0.7
+- Conversational queries → semantic only (no penalty)
+- Technical queries → +8.5% F1 improvement on TechQA
 
 **Cloud Run Optimizations**
 - API embeddings via OpenRouter (no local model, no cold start)
@@ -29,6 +29,14 @@ This fork includes the following optimizations:
 - Default LLM: `llama-3.1-8b-instruct` via OpenRouter
 - Default embeddings: `qwen3-embedding-8b` via OpenRouter API
 - ~14x cheaper than GPT-4, ~5x faster
+
+---
+
+## 🔥 News
+- **[01/18/2026]** **SimpleMem now supports Claude Skills!** 🚀 Use SimpleMem in claude.ai to remember long-term information and project history across conversations. Register at [mcp.simplemem.cloud](https://mcp.simplemem.cloud), add the domain to Claude's network whitelist, **configure with your token in the skill file**, and import the skill!
+- **[01/14/2026]** **SimpleMem MCP Server is now LIVE and Open Source!** 🎉 Experience SimpleMem as a cloud-hosted memory service at [mcp.simplemem.cloud](https://mcp.simplemem.cloud). Easily integrate with your favorite chat platforms (LM Studio, Cherry Studio) and AI agents (Cursor, Claude Desktop) using the **Streamable HTTP** MCP protocol. The MCP implementation features production-ready optimizations including multi-tenant user isolation, faster response times, and enhanced security. [View MCP Documentation →](MCP/README.md)
+- **[01/08/2026]** We've set up a Discord server and WeChat group to make it easier to collaborate and exchange ideas on this project. Welcome to join the Group to share your thoughts, ask questions, or contribute your ideas! 🔥 Join our [Discord](https://discord.gg/KA2zC32M) and [WeChat Group](fig/wechat_logo2.jpg) Now!
+- **[01/05/2026]** SimpleMem paper was released on [arXiv](https://arxiv.org/abs/2601.02553)!
 
 ---
 

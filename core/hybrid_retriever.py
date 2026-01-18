@@ -45,14 +45,15 @@ class HybridRetriever:
         enable_reflection: bool = True,
         max_reflection_rounds: int = 2,
         enable_parallel_retrieval: bool = True,
-        max_retrieval_workers: int = 3
+        max_retrieval_workers: int = 3,
+        cc_alpha: float = None
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
         self.semantic_top_k = semantic_top_k or config.SEMANTIC_TOP_K
         self.keyword_top_k = keyword_top_k or config.KEYWORD_TOP_K
         self.structured_top_k = structured_top_k or config.STRUCTURED_TOP_K
-        
+
         # Use config values as default if not explicitly provided
         self.enable_planning = enable_planning if enable_planning is not None else getattr(config, 'ENABLE_PLANNING', True)
         self.enable_reflection = enable_reflection if enable_reflection is not None else getattr(config, 'ENABLE_REFLECTION', True)
@@ -60,7 +61,10 @@ class HybridRetriever:
         self.enable_parallel_retrieval = enable_parallel_retrieval if enable_parallel_retrieval is not None else getattr(config, 'ENABLE_PARALLEL_RETRIEVAL', True)
         self.max_retrieval_workers = max_retrieval_workers if max_retrieval_workers is not None else getattr(config, 'MAX_RETRIEVAL_WORKERS', 3)
 
-    def retrieve(self, query: str, enable_reflection: Optional[bool] = None, use_hybrid_fusion: bool = True) -> List[MemoryEntry]:
+        # Convex Combination alpha for adaptive keyword boost
+        self.cc_alpha = cc_alpha if cc_alpha is not None else getattr(config, 'CC_ALPHA', 0.7)
+
+    def retrieve(self, query: str, enable_reflection: Optional[bool] = None) -> List[MemoryEntry]:
         """
         Execute retrieval with planning and optional reflection
 
@@ -68,28 +72,22 @@ class HybridRetriever:
         - query: Search query
         - enable_reflection: Override the global reflection setting for this query
                            (useful for adversarial questions that shouldn't use reflection)
-        - use_hybrid_fusion: Use RRF fusion + MMR for hybrid search (default True)
 
         Returns: List of relevant MemoryEntry
         """
         if self.enable_planning:
-            return self._retrieve_with_planning(query, enable_reflection, use_hybrid_fusion)
+            return self._retrieve_with_planning(query, enable_reflection)
         else:
-            # Use hybrid search with RRF/MMR fusion
-            if use_hybrid_fusion:
-                return self._hybrid_search_with_fusion(query)
-            else:
-                # Fallback to simple semantic search
-                return self._semantic_search(query)
+            # Fallback to simple semantic search
+            return self._semantic_search(query)
     
-    def _retrieve_with_planning(self, query: str, enable_reflection: Optional[bool] = None, use_hybrid_fusion: bool = True) -> List[MemoryEntry]:
+    def _retrieve_with_planning(self, query: str, enable_reflection: Optional[bool] = None) -> List[MemoryEntry]:
         """
         Execute retrieval with intelligent planning process
-
+        
         Args:
-        - query: Search query
+        - query: Search query  
         - enable_reflection: Override reflection setting for this query
-        - use_hybrid_fusion: Use RRF fusion + MMR for sub-queries (default True)
         """
         print(f"\n[Planning] Analyzing information requirements for: {query}")
         
@@ -114,19 +112,33 @@ class HybridRetriever:
         # Step 4: Merge and deduplicate results
         merged_results = self._merge_and_deduplicate_entries(all_results)
         print(f"[Planning] Found {len(merged_results)} unique results")
-        
-        # Step 5: If hybrid fusion enabled, also get keyword/structured results and apply RRF
-        if use_hybrid_fusion and merged_results:
-            # Get additional results from keyword and structured search
-            query_analysis = self._analyze_query(query)
-            keyword_results = self._keyword_search(query, query_analysis)
-            structured_results = self._structured_search(query_analysis)
 
-            if keyword_results or structured_results:
-                print(f"[Planning] Adding keyword ({len(keyword_results)}) and structured ({len(structured_results)}) results")
-                # Fuse all results using RRF
-                merged_results = self._rrf_fusion(merged_results, keyword_results, structured_results)
-                print(f"[Planning] RRF fusion: {len(merged_results)} total results")
+        # Step 5: Adaptive keyword boost (only when LLM detects exact match terms)
+        use_keyword_boost = information_plan.get("use_keyword_boost", False)
+        exact_match_terms = information_plan.get("exact_match_terms", [])
+
+        if merged_results and use_keyword_boost and exact_match_terms:
+            print(f"[Planning] Keyword boost enabled for terms: {exact_match_terms}")
+
+            # Convert planning results to scored format
+            total = len(merged_results)
+            semantic_with_scores = [
+                (entry, 1.0 - (i / max(total, 1)))
+                for i, entry in enumerate(merged_results)
+            ]
+
+            # Get keyword results with BM25 FTS scores
+            keyword_with_scores = self.vector_store.keyword_search_with_scores(
+                exact_match_terms, top_k=self.keyword_top_k
+            )
+
+            if keyword_with_scores:
+                merged_results = self._convex_combination_fusion(
+                    semantic_with_scores,
+                    keyword_with_scores,
+                    alpha=self.cc_alpha
+                )
+                print(f"[Planning] CC fusion (α={self.cc_alpha}): {len(merged_results)} results")
 
         # Step 6: Optional reflection-based additional retrieval
         # Use override parameter if provided, otherwise use global setting
@@ -134,11 +146,6 @@ class HybridRetriever:
 
         if should_use_reflection:
             merged_results = self._retrieve_with_intelligent_reflection(query, merged_results, information_plan)
-
-        # Step 7: Apply MMR for diversity in final results
-        if use_hybrid_fusion and merged_results and len(merged_results) > 1:
-            merged_results = self._mmr_rerank(query, merged_results, lambda_param=0.7, top_k=15)
-            print(f"[Planning] MMR rerank: {len(merged_results)} diverse results")
 
         return merged_results
     
@@ -311,71 +318,6 @@ Return ONLY JSON, no other content.
             top_k=self.structured_top_k
         )
 
-    def _hybrid_search_with_fusion(
-        self,
-        query: str,
-        apply_mmr: bool = True,
-        mmr_top_k: int = 10,
-        mmr_lambda: float = 0.7
-    ) -> List[MemoryEntry]:
-        """
-        True hybrid search combining semantic, keyword, and structured search with RRF fusion.
-
-        This implements the full hybrid scoring function from Section 3.3:
-        S(q, m_k) = λ₁·cos(e_q, v_k) + λ₂·BM25(q_lex, S_k) + γ·𝕀(R_k ⊨ C_meta)
-
-        Instead of weighted sum, we use RRF (Reciprocal Rank Fusion) which is more robust
-        when scores from different sources are not comparable.
-
-        Args:
-            query: The search query
-            apply_mmr: Whether to apply MMR for diversity (default True)
-            mmr_top_k: Number of results after MMR (default 10)
-            mmr_lambda: MMR lambda parameter (default 0.7)
-
-        Returns:
-            List of MemoryEntry ranked by fused relevance
-        """
-        # Analyze query for keywords and structured filters
-        query_analysis = self._analyze_query(query)
-
-        # Execute all three search types
-        print(f"[Hybrid Search] Executing semantic, keyword, and structured searches...")
-
-        semantic_results = self._semantic_search(query)
-        print(f"[Hybrid Search] Semantic: {len(semantic_results)} results")
-
-        keyword_results = self._keyword_search(query, query_analysis)
-        print(f"[Hybrid Search] Keyword: {len(keyword_results)} results")
-
-        structured_results = self._structured_search(query_analysis)
-        print(f"[Hybrid Search] Structured: {len(structured_results)} results")
-
-        # Fuse results using RRF
-        if semantic_results or keyword_results or structured_results:
-            fused_results = self._rrf_fusion(
-                semantic_results,
-                keyword_results,
-                structured_results
-            )
-            print(f"[Hybrid Search] RRF fusion: {len(fused_results)} unique results")
-        else:
-            fused_results = []
-
-        # Apply MMR for diversity if requested
-        if apply_mmr and fused_results and len(fused_results) > 1:
-            final_results = self._mmr_rerank(
-                query,
-                fused_results,
-                lambda_param=mmr_lambda,
-                top_k=mmr_top_k
-            )
-            print(f"[Hybrid Search] MMR rerank: {len(final_results)} results (diverse)")
-        else:
-            final_results = fused_results[:mmr_top_k] if fused_results else []
-
-        return final_results
-
     def _parse_time_range(self, time_expression: str) -> Optional[tuple]:
         """
         Parse time expression to time range
@@ -499,127 +441,62 @@ Return ONLY the JSON, no other text.
         """
         seen_ids = set()
         merged = []
-
+        
         for entry in entries:
             if entry.entry_id not in seen_ids:
                 seen_ids.add(entry.entry_id)
                 merged.append(entry)
-
+        
         return merged
 
-    def _rrf_fusion(
+    def _convex_combination_fusion(
         self,
-        *result_lists: List[MemoryEntry],
-        k: int = 60
+        semantic_results: List[tuple],
+        keyword_results: List[tuple],
+        alpha: float = 0.7
     ) -> List[MemoryEntry]:
         """
-        Reciprocal Rank Fusion (RRF) - combines multiple ranked lists.
+        Convex Combination (CC) fusion for hybrid retrieval.
 
-        Formula: RRF_score(d) = Σ 1/(k + rank(d))
+        Formula: S_final = α·S_sem + (1-α)·S_kw
 
         Args:
-            *result_lists: Multiple lists of MemoryEntry, each ordered by relevance
-            k: Constant to prevent high scores for top ranks (default 60)
+            semantic_results: List of (MemoryEntry, score) from semantic search
+            keyword_results: List of (MemoryEntry, score) from keyword search
+            alpha: Weight for semantic scores (default 0.7)
 
         Returns:
-            List of MemoryEntry sorted by fused RRF score (highest first)
+            List of MemoryEntry sorted by fused score
         """
-        rrf_scores: Dict[str, float] = {}
+        semantic_scores: Dict[str, float] = {}
+        keyword_scores: Dict[str, float] = {}
         entry_map: Dict[str, MemoryEntry] = {}
 
-        for result_list in result_lists:
-            for rank, entry in enumerate(result_list, start=1):
-                entry_id = entry.entry_id
+        for entry, score in semantic_results:
+            semantic_scores[entry.entry_id] = score
+            entry_map[entry.entry_id] = entry
 
-                # Store entry reference
-                if entry_id not in entry_map:
-                    entry_map[entry_id] = entry
+        for entry, score in keyword_results:
+            keyword_scores[entry.entry_id] = score
+            if entry.entry_id not in entry_map:
+                entry_map[entry.entry_id] = entry
 
-                # Accumulate RRF score
-                rrf_scores[entry_id] = rrf_scores.get(entry_id, 0.0) + 1.0 / (k + rank)
+        all_ids = set(semantic_scores.keys()) | set(keyword_scores.keys())
 
-        # Sort by RRF score (descending)
-        sorted_ids = sorted(rrf_scores.keys(), key=lambda x: rrf_scores[x], reverse=True)
+        fused_scores: Dict[str, float] = {}
+        for entry_id in all_ids:
+            sem_score = semantic_scores.get(entry_id, 0.0)
+            kw_score = keyword_scores.get(entry_id, 0.0)
 
+            if entry_id in semantic_scores and entry_id in keyword_scores:
+                fused_scores[entry_id] = alpha * sem_score + (1 - alpha) * kw_score
+            elif entry_id in semantic_scores:
+                fused_scores[entry_id] = alpha * sem_score
+            else:
+                fused_scores[entry_id] = (1 - alpha) * kw_score
+
+        sorted_ids = sorted(fused_scores.keys(), key=lambda x: fused_scores[x], reverse=True)
         return [entry_map[entry_id] for entry_id in sorted_ids]
-
-    def _mmr_rerank(
-        self,
-        query: str,
-        entries: List[MemoryEntry],
-        lambda_param: float = 0.7,
-        top_k: int = None
-    ) -> List[MemoryEntry]:
-        """
-        Maximal Marginal Relevance (MMR) - balances relevance and diversity.
-
-        Formula: MMR = λ * relevance(d, q) - (1-λ) * max_similarity(d, selected)
-
-        Args:
-            query: The search query
-            entries: List of candidate entries
-            lambda_param: Balance between relevance (1.0) and diversity (0.0). Default 0.7
-            top_k: Number of entries to return. If None, returns all re-ranked.
-
-        Returns:
-            List of MemoryEntry re-ranked by MMR
-        """
-        if not entries:
-            return []
-
-        if top_k is None:
-            top_k = len(entries)
-
-        # Get embeddings for query and all entries
-        query_embedding = self.vector_store.embedding_model.encode_single(query, is_query=True)
-
-        entry_embeddings = {}
-        for entry in entries:
-            # Use the lossless_restatement as the text to embed
-            text = entry.lossless_restatement if hasattr(entry, 'lossless_restatement') else str(entry)
-            entry_embeddings[entry.entry_id] = self.vector_store.embedding_model.encode_single(text, is_query=False)
-
-        def cosine_similarity(a, b):
-            """Compute cosine similarity between two vectors."""
-            import numpy as np
-            norm_a = np.linalg.norm(a)
-            norm_b = np.linalg.norm(b)
-            if norm_a == 0 or norm_b == 0:
-                return 0.0
-            return float(np.dot(a, b) / (norm_a * norm_b))
-
-        selected = []
-        candidates = list(entries)
-
-        while candidates and len(selected) < top_k:
-            best_score = float('-inf')
-            best_entry = None
-
-            for entry in candidates:
-                # Relevance to query
-                relevance = cosine_similarity(query_embedding, entry_embeddings[entry.entry_id])
-
-                # Max similarity to already selected (diversity penalty)
-                if selected:
-                    max_sim = max(
-                        cosine_similarity(entry_embeddings[entry.entry_id], entry_embeddings[s.entry_id])
-                        for s in selected
-                    )
-                else:
-                    max_sim = 0.0
-
-                # MMR score
-                mmr_score = lambda_param * relevance - (1 - lambda_param) * max_sim
-
-                if mmr_score > best_score:
-                    best_score = mmr_score
-                    best_entry = entry
-
-            if best_entry:
-                selected.append(best_entry)
-                candidates.remove(best_entry)
-
-        return selected
 
     def _check_answer_adequacy(self, query: str, contexts: List[MemoryEntry]) -> str:
         """
@@ -866,6 +743,7 @@ Think step by step:
 2. What key entities, events, or concepts need to be identified?
 3. What relationships or connections need to be established?
 4. What minimal set of information pieces would be sufficient to answer this question?
+5. Are there technical terms requiring exact lexical matching?
 
 Return your analysis in JSON format:
 ```json
@@ -880,11 +758,20 @@ Return your analysis in JSON format:
     }}
   ],
   "relationships": ["relationship1", "relationship2", ...],
-  "minimal_queries_needed": 2
+  "minimal_queries_needed": 2,
+  "exact_match_terms": [],
+  "use_keyword_boost": false
 }}
 ```
 
-Focus on identifying the minimal essential information needed, not exhaustive details.
+For exact_match_terms, include ONLY terms requiring exact lexical matching:
+- Function/method names: parseJWT, get_user_id
+- Error codes: ECONNREFUSED, CVE-2017-3156
+- Version numbers: v2.1.0, Oracle 12c
+- File names: config.yaml, .env
+
+Set use_keyword_boost=true ONLY if exact_match_terms is non-empty.
+For conversational queries about people/events, leave both fields as defaults.
 
 Return ONLY the JSON, no other text.
 """
@@ -917,7 +804,9 @@ Return ONLY the JSON, no other text.
                 "key_entities": [query],
                 "required_info": [{"info_type": "general", "description": "relevant information", "priority": "high"}],
                 "relationships": [],
-                "minimal_queries_needed": 1
+                "minimal_queries_needed": 1,
+                "exact_match_terms": [],
+                "use_keyword_boost": False
             }
     
     def _generate_targeted_queries(self, original_query: str, information_plan: Dict[str, Any]) -> List[str]:
