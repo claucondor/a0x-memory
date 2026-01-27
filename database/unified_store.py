@@ -542,38 +542,110 @@ class UnifiedMemoryStore:
         return memory
 
     def add_group_memories_batch(self, memories: List[GroupMemory]) -> List[GroupMemory]:
-        """Add multiple group-level memories with batch embeddings."""
+        """Add multiple group-level memories with batch embeddings and deduplication."""
         if not memories:
             return []
 
         contents = [m.content for m in memories]
         vectors = self.embedding_model.encode_documents(contents)
 
-        all_data = []
-        for memory, vector in zip(memories, vectors):
-            all_data.append({
-                "memory_id": memory.memory_id,
-                "agent_id": memory.agent_id,
-                "group_id": memory.group_id,
-                "memory_level": memory.memory_level.value,
-                "memory_type": memory.memory_type.value,
-                "privacy_scope": memory.privacy_scope.value,
-                "content": memory.content,
-                "speaker": memory.speaker or "",
-                "keywords": memory.keywords,
-                "topics": memory.topics,
-                "importance_score": memory.importance_score,
-                "evidence_count": memory.evidence_count,
-                "first_seen": memory.first_seen,
-                "last_seen": memory.last_seen,
-                "last_updated": memory.last_updated,
-                "source_message_id": memory.source_message_id or "",
-                "source_timestamp": memory.source_timestamp or "",
-                "vector": vector.tolist()
-            })
+        # Track memories to be added (for in-batch deduplication)
+        pending_memories = {}  # group_id -> list of (memory, vector) tuples
+        merged_count = 0
+        new_count = 0
 
-        self.group_memories_table.add(all_data)
-        print(f"[{self.agent_id}] Added {len(memories)} group memories")
+        # First, check for duplicates within the batch
+        for memory, vector in zip(memories, vectors):
+            group_id = memory.group_id
+
+            if group_id not in pending_memories:
+                pending_memories[group_id] = []
+
+            # Check against other memories in the same group from this batch
+            found_duplicate_in_batch = False
+            for existing_memory, existing_vector in pending_memories[group_id]:
+                similarity = self._compute_cosine_similarity(vector, existing_vector)
+                if similarity >= 0.85:
+                    # Duplicate found in batch - merge into the existing one
+                    found_duplicate_in_batch = True
+                    merged_count += 1
+                    # Update the existing memory's evidence count
+                    existing_memory.evidence_count += 1
+                    existing_memory.last_seen = memory.last_seen
+                    existing_memory.last_updated = datetime.now(timezone.utc).isoformat()
+                    break
+
+            if not found_duplicate_in_batch:
+                # No duplicate in batch, check against database
+                existing = self._find_similar_existing(
+                    self.group_memories_table,
+                    vector.tolist(),
+                    group_id,
+                    threshold=0.85
+                )
+
+                if existing:
+                    # Merge with existing memory in database (delete + re-add pattern)
+                    merged_count += 1
+                    updated_memory = GroupMemory(
+                        memory_id=existing["memory_id"],
+                        agent_id=existing["agent_id"],
+                        group_id=existing["group_id"],
+                        memory_level=MemoryLevel(existing["memory_level"]),
+                        memory_type=MemoryType(existing["memory_type"]),
+                        privacy_scope=PrivacyScope(existing["privacy_scope"]),
+                        content=existing["content"],
+                        speaker=existing.get("speaker"),
+                        keywords=list(existing.get("keywords") or []),
+                        topics=list(existing.get("topics") or []),
+                        importance_score=existing["importance_score"],
+                        evidence_count=existing["evidence_count"] + 1,
+                        first_seen=existing["first_seen"],
+                        last_seen=memory.last_seen,
+                        last_updated=datetime.now(timezone.utc).isoformat(),
+                        source_message_id=existing.get("source_message_id"),
+                        source_timestamp=existing.get("source_timestamp")
+                    )
+
+                    # Delete old from database
+                    self.group_memories_table.delete(f"memory_id = '{existing['memory_id']}'")
+
+                    # Add to pending as updated
+                    pending_memories[group_id].append((updated_memory, vector))
+                else:
+                    # No duplicate found - add as new
+                    new_count += 1
+                    pending_memories[group_id].append((memory, vector))
+
+        # Convert all pending memories to data format
+        all_data = []
+        for group_id, memory_list in pending_memories.items():
+            for memory, vector in memory_list:
+                all_data.append({
+                    "memory_id": memory.memory_id,
+                    "agent_id": memory.agent_id,
+                    "group_id": memory.group_id,
+                    "memory_level": memory.memory_level.value,
+                    "memory_type": memory.memory_type.value,
+                    "privacy_scope": memory.privacy_scope.value,
+                    "content": memory.content,
+                    "speaker": memory.speaker or "",
+                    "keywords": memory.keywords,
+                    "topics": memory.topics,
+                    "importance_score": memory.importance_score,
+                    "evidence_count": memory.evidence_count,
+                    "first_seen": memory.first_seen,
+                    "last_seen": memory.last_seen,
+                    "last_updated": memory.last_updated,
+                    "source_message_id": memory.source_message_id or "",
+                    "source_timestamp": memory.source_timestamp or "",
+                    "vector": vector.tolist() if hasattr(vector, 'tolist') else vector
+                })
+
+        if all_data:
+            self.group_memories_table.add(all_data)
+
+        print(f"[{self.agent_id}] Added {len(memories)} group memories (merged: {merged_count}, new: {new_count})")
 
         if not self._fts_initialized.get('group_memories'):
             self._init_fts_index(self.group_memories_table, "content", "group_memories")
@@ -615,40 +687,116 @@ class UnifiedMemoryStore:
         return memory
 
     def add_user_memories_batch(self, memories: List[UserMemory]) -> List[UserMemory]:
-        """Add multiple user-level memories with batch embeddings."""
+        """Add multiple user-level memories with batch embeddings and deduplication."""
         if not memories:
             return []
 
         contents = [m.content for m in memories]
         vectors = self.embedding_model.encode_documents(contents)
 
-        all_data = []
-        for memory, vector in zip(memories, vectors):
-            all_data.append({
-                "memory_id": memory.memory_id,
-                "agent_id": memory.agent_id,
-                "group_id": memory.group_id,
-                "user_id": memory.user_id,
-                "memory_level": memory.memory_level.value,
-                "memory_type": memory.memory_type.value,
-                "privacy_scope": memory.privacy_scope.value,
-                "content": memory.content,
-                "keywords": memory.keywords,
-                "topics": memory.topics,
-                "importance_score": memory.importance_score,
-                "evidence_count": memory.evidence_count,
-                "first_seen": memory.first_seen,
-                "last_seen": memory.last_seen,
-                "last_updated": memory.last_updated,
-                "source_message_id": memory.source_message_id or "",
-                "source_timestamp": memory.source_timestamp or "",
-                "username": memory.username or "",
-                "platform": memory.platform or "",
-                "vector": vector.tolist()
-            })
+        # Track memories to be added (for in-batch deduplication)
+        pending_memories = {}  # user_id -> list of (memory, vector) tuples
+        merged_count = 0
+        new_count = 0
 
-        self.user_memories_table.add(all_data)
-        print(f"[{self.agent_id}] Added {len(memories)} user memories")
+        # First, check for duplicates within the batch
+        for memory, vector in zip(memories, vectors):
+            user_id = memory.user_id
+
+            if user_id not in pending_memories:
+                pending_memories[user_id] = []
+
+            # Check against other memories for the same user from this batch
+            found_duplicate_in_batch = False
+            for existing_memory, existing_vector in pending_memories[user_id]:
+                similarity = self._compute_cosine_similarity(vector, existing_vector)
+                if similarity >= 0.85:
+                    # Duplicate found in batch - merge into the existing one
+                    found_duplicate_in_batch = True
+                    merged_count += 1
+                    # Update the existing memory's evidence count
+                    existing_memory.evidence_count += 1
+                    existing_memory.last_seen = memory.last_seen
+                    existing_memory.last_updated = datetime.now(timezone.utc).isoformat()
+                    break
+
+            if not found_duplicate_in_batch:
+                # No duplicate in batch, check against database
+                existing = self._find_similar_existing(
+                    self.user_memories_table,
+                    vector.tolist(),
+                    user_id,
+                    filter_field="user_id",
+                    threshold=0.85
+                )
+
+                if existing:
+                    # Merge with existing memory in database (delete + re-add pattern)
+                    merged_count += 1
+                    updated_memory = UserMemory(
+                        memory_id=existing["memory_id"],
+                        agent_id=existing["agent_id"],
+                        group_id=existing["group_id"],
+                        user_id=existing["user_id"],
+                        memory_level=MemoryLevel(existing["memory_level"]),
+                        memory_type=MemoryType(existing["memory_type"]),
+                        privacy_scope=PrivacyScope(existing["privacy_scope"]),
+                        content=existing["content"],
+                        keywords=list(existing.get("keywords") or []),
+                        topics=list(existing.get("topics") or []),
+                        importance_score=existing["importance_score"],
+                        evidence_count=existing["evidence_count"] + 1,
+                        first_seen=existing["first_seen"],
+                        last_seen=memory.last_seen,
+                        last_updated=datetime.now(timezone.utc).isoformat(),
+                        source_message_id=existing.get("source_message_id"),
+                        source_timestamp=existing.get("source_timestamp"),
+                        username=existing.get("username"),
+                        platform=existing.get("platform")
+                    )
+
+                    # Delete old from database
+                    self.user_memories_table.delete(f"memory_id = '{existing['memory_id']}'")
+
+                    # Add to pending as updated
+                    pending_memories[user_id].append((updated_memory, vector))
+                else:
+                    # No duplicate found - add as new
+                    new_count += 1
+                    pending_memories[user_id].append((memory, vector))
+
+        # Convert all pending memories to data format
+        all_data = []
+        for user_id, memory_list in pending_memories.items():
+            for memory, vector in memory_list:
+                all_data.append({
+                    "memory_id": memory.memory_id,
+                    "agent_id": memory.agent_id,
+                    "group_id": memory.group_id,
+                    "user_id": memory.user_id,
+                    "memory_level": memory.memory_level.value,
+                    "memory_type": memory.memory_type.value,
+                    "privacy_scope": memory.privacy_scope.value,
+                    "content": memory.content,
+                    "keywords": memory.keywords,
+                    "topics": memory.topics,
+                    "importance_score": memory.importance_score,
+                    "evidence_count": memory.evidence_count,
+                    "first_seen": memory.first_seen,
+                    "last_seen": memory.last_seen,
+                    "last_updated": memory.last_updated,
+                    "source_message_id": memory.source_message_id or "",
+                    "source_timestamp": memory.source_timestamp or "",
+                    "username": memory.username or "",
+                    "platform": memory.platform or "",
+                    "vector": vector.tolist() if hasattr(vector, 'tolist') else vector
+                })
+
+        if all_data:
+            self.user_memories_table.add(all_data)
+
+        print(f"[ingestion-dedup] Merged {merged_count} memories, inserted {new_count} new")
+        print(f"[{self.agent_id}] Added {len(memories)} user memories (merged: {merged_count}, new: {new_count})")
 
         if not self._fts_initialized.get('user_memories'):
             self._init_fts_index(self.user_memories_table, "content", "user_memories")
@@ -691,41 +839,118 @@ class UnifiedMemoryStore:
         return memory
 
     def add_interaction_memories_batch(self, memories: List[InteractionMemory]) -> List[InteractionMemory]:
-        """Add multiple interaction memories with batch embeddings."""
+        """Add multiple interaction memories with batch embeddings and deduplication."""
         if not memories:
             return []
 
         contents = [m.content for m in memories]
         vectors = self.embedding_model.encode_documents(contents)
 
-        all_data = []
-        for memory, vector in zip(memories, vectors):
-            all_data.append({
-                "memory_id": memory.memory_id,
-                "agent_id": memory.agent_id,
-                "group_id": memory.group_id,
-                "speaker_id": memory.speaker_id,
-                "listener_id": memory.listener_id,
-                "mentioned_users": memory.mentioned_users,
-                "memory_level": memory.memory_level.value,
-                "memory_type": memory.memory_type.value,
-                "privacy_scope": memory.privacy_scope.value,
-                "content": memory.content,
-                "keywords": memory.keywords,
-                "topics": memory.topics,
-                "importance_score": memory.importance_score,
-                "evidence_count": memory.evidence_count,
-                "first_seen": memory.first_seen,
-                "last_seen": memory.last_seen,
-                "last_updated": memory.last_updated,
-                "source_message_id": memory.source_message_id or "",
-                "source_timestamp": memory.source_timestamp or "",
-                "interaction_type": memory.interaction_type or "",
-                "vector": vector.tolist()
-            })
+        # Track memories to be added (for in-batch deduplication)
+        pending_memories = {}  # speaker_id -> list of (memory, vector) tuples
+        merged_count = 0
+        new_count = 0
 
-        self.interaction_memories_table.add(all_data)
-        print(f"[{self.agent_id}] Added {len(memories)} interaction memories")
+        # First, check for duplicates within the batch
+        for memory, vector in zip(memories, vectors):
+            speaker_id = memory.speaker_id
+
+            if speaker_id not in pending_memories:
+                pending_memories[speaker_id] = []
+
+            # Check against other memories for the same speaker from this batch
+            found_duplicate_in_batch = False
+            for existing_memory, existing_vector in pending_memories[speaker_id]:
+                similarity = self._compute_cosine_similarity(vector, existing_vector)
+                if similarity >= 0.85:
+                    # Duplicate found in batch - merge into the existing one
+                    found_duplicate_in_batch = True
+                    merged_count += 1
+                    # Update the existing memory's evidence count
+                    existing_memory.evidence_count += 1
+                    existing_memory.last_seen = memory.last_seen
+                    existing_memory.last_updated = datetime.now(timezone.utc).isoformat()
+                    break
+
+            if not found_duplicate_in_batch:
+                # No duplicate in batch, check against database
+                existing = self._find_similar_existing(
+                    self.interaction_memories_table,
+                    vector.tolist(),
+                    speaker_id,
+                    filter_field="speaker_id",
+                    threshold=0.85
+                )
+
+                if existing:
+                    # Merge with existing memory in database (delete + re-add pattern)
+                    merged_count += 1
+                    updated_memory = InteractionMemory(
+                        memory_id=existing["memory_id"],
+                        agent_id=existing["agent_id"],
+                        group_id=existing["group_id"],
+                        speaker_id=existing["speaker_id"],
+                        listener_id=existing["listener_id"],
+                        mentioned_users=list(existing.get("mentioned_users") or []),
+                        memory_level=MemoryLevel(existing["memory_level"]),
+                        memory_type=MemoryType(existing["memory_type"]),
+                        privacy_scope=PrivacyScope(existing["privacy_scope"]),
+                        content=existing["content"],
+                        keywords=list(existing.get("keywords") or []),
+                        topics=list(existing.get("topics") or []),
+                        importance_score=existing["importance_score"],
+                        evidence_count=existing["evidence_count"] + 1,
+                        first_seen=existing["first_seen"],
+                        last_seen=memory.last_seen,
+                        last_updated=datetime.now(timezone.utc).isoformat(),
+                        source_message_id=existing.get("source_message_id"),
+                        source_timestamp=existing.get("source_timestamp"),
+                        interaction_type=existing.get("interaction_type")
+                    )
+
+                    # Delete old from database
+                    self.interaction_memories_table.delete(f"memory_id = '{existing['memory_id']}'")
+
+                    # Add to pending as updated
+                    pending_memories[speaker_id].append((updated_memory, vector))
+                else:
+                    # No duplicate found - add as new
+                    new_count += 1
+                    pending_memories[speaker_id].append((memory, vector))
+
+        # Convert all pending memories to data format
+        all_data = []
+        for speaker_id, memory_list in pending_memories.items():
+            for memory, vector in memory_list:
+                all_data.append({
+                    "memory_id": memory.memory_id,
+                    "agent_id": memory.agent_id,
+                    "group_id": memory.group_id,
+                    "speaker_id": memory.speaker_id,
+                    "listener_id": memory.listener_id,
+                    "mentioned_users": memory.mentioned_users,
+                    "memory_level": memory.memory_level.value,
+                    "memory_type": memory.memory_type.value,
+                    "privacy_scope": memory.privacy_scope.value,
+                    "content": memory.content,
+                    "keywords": memory.keywords,
+                    "topics": memory.topics,
+                    "importance_score": memory.importance_score,
+                    "evidence_count": memory.evidence_count,
+                    "first_seen": memory.first_seen,
+                    "last_seen": memory.last_seen,
+                    "last_updated": memory.last_updated,
+                    "source_message_id": memory.source_message_id or "",
+                    "source_timestamp": memory.source_timestamp or "",
+                    "interaction_type": memory.interaction_type or "",
+                    "vector": vector.tolist() if hasattr(vector, 'tolist') else vector
+                })
+
+        if all_data:
+            self.interaction_memories_table.add(all_data)
+
+        print(f"[ingestion-dedup] Merged {merged_count} memories, inserted {new_count} new")
+        print(f"[{self.agent_id}] Added {len(memories)} interaction memories (merged: {merged_count}, new: {new_count})")
 
         if not self._fts_initialized.get('interaction_memories'):
             self._init_fts_index(self.interaction_memories_table, "content", "interaction_memories")
@@ -1667,6 +1892,70 @@ Return ONLY the JSON object.
     def count_entries(self) -> int:
         """Count entries for this agent."""
         return self.memories_table.count_rows()
+
+    # ============================================================
+    # Deduplication Methods
+    # ============================================================
+
+    def _compute_cosine_similarity(self, vec1, vec2) -> float:
+        """Compute cosine similarity between two vectors."""
+        try:
+            import numpy as np
+            v1 = np.array(vec1) if not isinstance(vec1, np.ndarray) else vec1
+            v2 = np.array(vec2) if not isinstance(vec2, np.ndarray) else vec2
+            dot_product = np.dot(v1, v2)
+            norm1 = np.linalg.norm(v1)
+            norm2 = np.linalg.norm(v2)
+            if norm1 == 0 or norm2 == 0:
+                return 0.0
+            return dot_product / (norm1 * norm2)
+        except Exception:
+            return 0.0
+
+    def _find_similar_existing(
+        self,
+        table,
+        vector: List[float],
+        filter_value: str,
+        filter_field: str = "group_id",
+        threshold: float = 0.85
+    ) -> Optional[Dict]:
+        """
+        Find a similar existing memory using cosine similarity.
+
+        Args:
+            table: LanceDB table to search
+            vector: Embedding vector to search for
+            filter_value: Value to filter by (e.g., group_id, user_id)
+            filter_field: Field name to filter on (default: group_id)
+            threshold: Similarity threshold (default: 0.85)
+
+        Returns:
+            Dictionary with existing memory data if found, None otherwise
+        """
+        try:
+            # Search with vector similarity and filter
+            results = (
+                table.search(vector)
+                .where(f"{filter_field} = '{filter_value}'", prefilter=True)
+                .limit(1)
+                .to_list()
+            )
+
+            if results:
+                result = results[0]
+                # LanceDB returns cosine distance, need to convert to similarity
+                # distance = 1 - similarity, so similarity = 1 - distance
+                distance = result.get("_distance", 1.0)
+                similarity = 1.0 - distance
+
+                if similarity >= threshold:
+                    return result
+
+        except Exception as e:
+            print(f"[{self.agent_id}] Error finding similar memory: {e}")
+
+        return None
 
     # ============================================================
     # Utility Methods
