@@ -1,0 +1,437 @@
+"""
+Adaptive Threshold Manager - Stateless version for Cloud Run
+
+Uses Firestore to persist activity metrics across requests.
+Each request reads metrics, calculates threshold, and updates metrics.
+
+For local testing, set USE_LOCAL_STORAGE=true to use in-memory storage.
+
+Problems with fixed thresholds:
+- Active groups wait too long (10 msgs = seconds)
+- Inactive groups process too often (10 msgs = days)
+- No urgency consideration (important messages wait)
+
+Adaptive approach:
+- Store activity metrics in Firestore per group
+- Calculate threshold on each request
+- Time-based fallback (max wait time)
+- Urgency detection (important messages trigger faster processing)
+"""
+import time
+from typing import Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from collections import defaultdict
+
+import config
+
+# Conditional Firestore import
+try:
+    from google.cloud import firestore
+    FIRESTORE_AVAILABLE = True
+except ImportError:
+    FIRESTORE_AVAILABLE = False
+    firestore = None
+
+
+@dataclass
+class ThresholdConfig:
+    """Configuration for adaptive thresholds"""
+    # Base thresholds
+    min_batch_size: int = 5
+    max_batch_size: int = 30
+    default_batch_size: int = 10
+
+    # Activity-based adjustments
+    high_activity_threshold: float = 20.0  # msgs/hour = high activity
+    low_activity_threshold: float = 2.0    # msgs/hour = low activity
+
+    # Time-based triggers
+    max_wait_time_seconds: int = 3600      # 1 hour max wait
+    min_wait_time_seconds: int = 60        # 1 minute min wait
+
+    # Urgency settings
+    urgency_trigger_count: int = 3         # N high-importance msgs = urgent
+    urgency_batch_size: int = 5            # Smaller batch for urgency
+
+
+# ============================================================
+# In-Memory Metrics Store (for local testing)
+# ============================================================
+
+# Simple Increment class for in-memory mode
+class InMemoryIncrement:
+    def __init__(self, value: int):
+        self._value = value
+
+
+class InMemoryMetricsStore:
+    """
+    In-memory implementation of metrics storage for local testing.
+    Singleton pattern to persist across AdaptiveThresholdManager instances.
+    """
+    _instance = None
+    _metrics: Dict[str, Dict[str, Any]] = {}
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._metrics = {}
+        return cls._instance
+
+    def get(self, doc_id: str) -> Optional[Dict[str, Any]]:
+        return self._metrics.get(doc_id)
+
+    def set(self, doc_id: str, data: Dict[str, Any], merge: bool = True):
+        if merge and doc_id in self._metrics:
+            existing = self._metrics[doc_id]
+            for key, value in data.items():
+                if isinstance(value, InMemoryIncrement):
+                    # Handle increment - add to existing value
+                    existing[key] = existing.get(key, 0) + value._value
+                else:
+                    existing[key] = value
+        else:
+            # New document - convert InMemoryIncrement to plain values
+            processed = {}
+            for key, value in data.items():
+                if isinstance(value, InMemoryIncrement):
+                    processed[key] = value._value
+                else:
+                    processed[key] = value
+            self._metrics[doc_id] = processed
+
+    def clear(self):
+        """Clear all metrics (for tests)."""
+        self._metrics = {}
+
+
+class AdaptiveThresholdManager:
+    """
+    Stateless adaptive threshold manager using Firestore or in-memory storage.
+
+    All state is persisted in Firestore (or memory for tests), making it Cloud Run compatible.
+
+    For local testing, set USE_LOCAL_STORAGE=true to use fast in-memory storage.
+
+    Firestore structure:
+        activity_metrics/{agent_id}_{group_id}:
+            - message_count: int
+            - first_message_time: timestamp
+            - last_message_time: timestamp
+            - last_process_time: timestamp
+            - total_processed: int
+            - high_importance_pending: int
+            - messages_per_hour_cached: float (calculated periodically)
+    """
+
+    COLLECTION = "activity_metrics"
+
+    def __init__(
+        self,
+        firestore_client=None,
+        threshold_config: Optional[ThresholdConfig] = None
+    ):
+        self.threshold_config = threshold_config or ThresholdConfig()
+        self._use_memory = config.USE_LOCAL_STORAGE
+        self._memory_store = InMemoryMetricsStore() if self._use_memory else None
+        self.db = firestore_client if not self._use_memory else None
+
+    def _get_db(self):
+        """Lazy initialization of Firestore client."""
+        if self._use_memory:
+            return None
+        if self.db is None and FIRESTORE_AVAILABLE:
+            self.db = firestore.Client()
+        return self.db
+
+    def _get_doc_id(self, agent_id: str, group_id: str) -> str:
+        """Generate document ID for metrics."""
+        # Sanitize for Firestore (no slashes)
+        safe_group = group_id.replace("/", "_").replace(":", "_")
+        return f"{agent_id}_{safe_group}"
+
+    def _get_metrics(self, agent_id: str, group_id: str) -> Dict[str, Any]:
+        """Get metrics from Firestore or in-memory store."""
+        doc_id = self._get_doc_id(agent_id, group_id)
+
+        if self._use_memory:
+            data = self._memory_store.get(doc_id)
+            return data if data else self._default_metrics()
+
+        try:
+            doc = self._get_db().collection(self.COLLECTION).document(doc_id).get()
+            if doc.exists:
+                return doc.to_dict()
+            else:
+                return self._default_metrics()
+        except Exception as e:
+            print(f"[AdaptiveThreshold] Error reading metrics: {e}")
+            return self._default_metrics()
+
+    def _update_metrics(self, agent_id: str, group_id: str, updates: Dict[str, Any]):
+        """Update metrics in Firestore or in-memory store."""
+        doc_id = self._get_doc_id(agent_id, group_id)
+
+        if self._use_memory:
+            self._memory_store.set(doc_id, updates, merge=True)
+            return
+
+        try:
+            self._get_db().collection(self.COLLECTION).document(doc_id).set(
+                updates,
+                merge=True
+            )
+        except Exception as e:
+            print(f"[AdaptiveThreshold] Error updating metrics: {e}")
+
+    def _default_metrics(self) -> Dict[str, Any]:
+        """Default metrics for new group."""
+        return {
+            "message_count": 0,
+            "last_message_time": None,
+            "last_process_time": None,
+            "total_processed": 0,
+            "high_importance_pending": 0
+        }
+
+    def _calculate_messages_per_hour(self, metrics: Dict[str, Any]) -> float:
+        """
+        Estimate activity rate based on messages since last processing.
+
+        Simple heuristic: pending_messages / time_since_last_process
+        """
+        last_process = metrics.get("last_process_time")
+        total_count = metrics.get("message_count", 0)
+        processed = metrics.get("total_processed", 0)
+        pending = total_count - processed
+
+        if pending <= 0:
+            return 0.0
+
+        if not last_process:
+            # No processing yet - use default rate
+            return 5.0  # Assume moderate activity
+
+        # Convert Firestore timestamp if needed
+        if hasattr(last_process, 'timestamp'):
+            last_process_ts = last_process.timestamp()
+        else:
+            last_process_ts = last_process
+
+        hours_since_process = (time.time() - last_process_ts) / 3600
+        if hours_since_process < 0.05:  # Less than 3 minutes
+            return 20.0  # Assume high activity if very recent
+
+        return pending / hours_since_process
+
+    def _calculate_batch_size(self, metrics: Dict[str, Any]) -> int:
+        """
+        Calculate optimal batch size based on activity.
+
+        High activity → smaller batches (process more frequently)
+        Low activity → larger batches (wait for more context)
+        """
+        cfg = self.threshold_config
+        msgs_per_hour = self._calculate_messages_per_hour(metrics)
+
+        if msgs_per_hour >= cfg.high_activity_threshold:
+            # High activity: smaller batches
+            activity_ratio = min(msgs_per_hour / cfg.high_activity_threshold, 3.0)
+            batch_size = cfg.default_batch_size - int(
+                (cfg.default_batch_size - cfg.min_batch_size) * (activity_ratio - 1) / 2
+            )
+            return max(cfg.min_batch_size, batch_size)
+
+        elif msgs_per_hour <= cfg.low_activity_threshold and msgs_per_hour > 0:
+            # Low activity: larger batches
+            activity_ratio = cfg.low_activity_threshold / msgs_per_hour
+            batch_size = cfg.default_batch_size + int(
+                (cfg.max_batch_size - cfg.default_batch_size) * min(activity_ratio - 1, 2) / 2
+            )
+            return min(cfg.max_batch_size, batch_size)
+
+        else:
+            # Normal activity or no data: default
+            return cfg.default_batch_size
+
+    def record_message(
+        self,
+        agent_id: str,
+        group_id: str,
+        importance_score: float = 0.5
+    ):
+        """
+        Record a new message - fire and forget, single write.
+        """
+        doc_id = self._get_doc_id(agent_id, group_id)
+
+        if self._use_memory:
+            # In-memory mode
+            updates = {
+                "message_count": InMemoryIncrement(1),
+                "last_message_time": time.time(),
+            }
+            if importance_score >= 0.8:
+                updates["high_importance_pending"] = InMemoryIncrement(1)
+            self._memory_store.set(doc_id, updates, merge=True)
+            return
+
+        # Firestore mode
+        try:
+            updates = {
+                "message_count": firestore.Increment(1),
+                "last_message_time": firestore.SERVER_TIMESTAMP,
+            }
+
+            if importance_score >= 0.8:
+                updates["high_importance_pending"] = firestore.Increment(1)
+
+            self._get_db().collection(self.COLLECTION).document(doc_id).set(
+                updates, merge=True
+            )
+        except Exception as e:
+            # Non-blocking - just log and continue
+            print(f"[AdaptiveThreshold] Warning: {e}")
+
+    def record_processing(self, agent_id: str, group_id: str, processed_count: int):
+        """Record that batch processing occurred."""
+        now = datetime.now(timezone.utc)
+
+        if self._use_memory:
+            self._update_metrics(agent_id, group_id, {
+                "last_process_time": time.time(),
+                "total_processed": InMemoryIncrement(processed_count),
+                "high_importance_pending": 0
+            })
+        else:
+            self._update_metrics(agent_id, group_id, {
+                "last_process_time": now,
+                "total_processed": firestore.Increment(processed_count),
+                "high_importance_pending": 0
+            })
+
+    def should_process(
+        self,
+        agent_id: str,
+        group_id: str,
+        pending_count: int
+    ) -> Tuple[bool, int]:
+        """
+        Determine if batch processing should occur.
+
+        Args:
+            agent_id: Agent identifier
+            group_id: Group/conversation identifier
+            pending_count: Current count of unprocessed messages
+
+        Returns:
+            Tuple of (should_process: bool, recommended_batch_size: int)
+        """
+        metrics = self._get_metrics(agent_id, group_id)
+        cfg = self.threshold_config
+
+        # Calculate adaptive batch size
+        batch_size = self._calculate_batch_size(metrics)
+
+        # ============================================================
+        # Trigger Conditions
+        # ============================================================
+
+        # 1. Enough messages accumulated
+        if pending_count >= batch_size:
+            print(f"[AdaptiveThreshold] Trigger: batch size ({pending_count} >= {batch_size})")
+            return True, batch_size
+
+        # 2. Time-based trigger
+        last_process = metrics.get("last_process_time")
+        if last_process and pending_count > 0:
+            if hasattr(last_process, 'timestamp'):
+                last_process_ts = last_process.timestamp()
+            else:
+                last_process_ts = last_process
+
+            time_since = time.time() - last_process_ts
+
+            if time_since >= cfg.max_wait_time_seconds:
+                print(f"[AdaptiveThreshold] Trigger: max wait time ({time_since:.0f}s)")
+                return True, pending_count
+
+        # 3. Urgency trigger
+        high_importance = metrics.get("high_importance_pending", 0)
+        if high_importance >= cfg.urgency_trigger_count:
+            print(f"[AdaptiveThreshold] Trigger: urgency ({high_importance} high-importance)")
+            return True, min(pending_count, cfg.urgency_batch_size)
+
+        return False, batch_size
+
+    def get_threshold(self, agent_id: str, group_id: str) -> int:
+        """Get current threshold for a group."""
+        metrics = self._get_metrics(agent_id, group_id)
+        return self._calculate_batch_size(metrics)
+
+    def get_metrics_debug(self, agent_id: str, group_id: str) -> Dict[str, Any]:
+        """Get metrics for debugging."""
+        metrics = self._get_metrics(agent_id, group_id)
+        return {
+            "group_id": group_id,
+            "message_count": metrics.get("message_count", 0),
+            "messages_per_hour": self._calculate_messages_per_hour(metrics),
+            "high_importance_pending": metrics.get("high_importance_pending", 0),
+            "current_threshold": self._calculate_batch_size(metrics),
+            "total_processed": metrics.get("total_processed", 0)
+        }
+
+
+# ============================================================
+# Convenience functions for stateless usage
+# ============================================================
+
+def should_process_batch(
+    agent_id: str,
+    group_id: str,
+    pending_count: int,
+    importance_score: float = 0.5,
+    firestore_client=None
+) -> Tuple[bool, int]:
+    """
+    Stateless convenience function.
+
+    Usage in main.py:
+        from core.adaptive_threshold import should_process_batch, record_batch_processed
+
+        should_process, batch_size = should_process_batch(
+            agent_id=self.agent_id,
+            group_id=effective_group_id,
+            pending_count=len(unprocessed),
+            importance_score=0.5
+        )
+
+        if should_process:
+            # Process batch...
+            record_batch_processed(agent_id, group_id, len(processed))
+    """
+    manager = AdaptiveThresholdManager(firestore_client=firestore_client)
+    manager.record_message(agent_id, group_id, importance_score)
+    return manager.should_process(agent_id, group_id, pending_count)
+
+
+def record_batch_processed(
+    agent_id: str,
+    group_id: str,
+    count: int,
+    firestore_client=None
+):
+    """Record that a batch was processed."""
+    manager = AdaptiveThresholdManager(firestore_client=firestore_client)
+    manager.record_processing(agent_id, group_id, count)
+
+
+def get_adaptive_threshold(
+    agent_id: str,
+    group_id: str,
+    firestore_client=None
+) -> int:
+    """Get current adaptive threshold for a group."""
+    manager = AdaptiveThresholdManager(firestore_client=firestore_client)
+    return manager.get_threshold(agent_id, group_id)
