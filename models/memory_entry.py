@@ -4,10 +4,34 @@ Core Data Structure - MemoryEntry (Atomic Entry)
 Paper Reference: Section 3.1 - Atomic Entries {m_k}
 Each MemoryEntry represents a self-contained, disambiguated fact extracted
 from dialogue via the De-linearization transformation F_θ
+
+Extended for Group Support:
+- Platform context (telegram, xmtp, farcaster, twitter, direct)
+- Group ID for group conversations
+- User identity linking
+- Memory classification (expertise, preference, fact, etc.)
+- Privacy scoping
 """
 from typing import List, Optional
 from pydantic import BaseModel, Field
+from enum import Enum
 import uuid
+
+
+class MemoryType(str, Enum):
+    """Type of memory content - for classification and retrieval"""
+    CONVERSATION = "conversation"  # General conversation
+    EXPERTISE = "expertise"        # User skill/knowledge
+    PREFERENCE = "preference"      # User preference/interest
+    FACT = "fact"                  # Factual information about user
+    ANNOUNCEMENT = "announcement"  # Group announcement/decision
+
+
+class PrivacyScope(str, Enum):
+    """Privacy scope for access control"""
+    PRIVATE = "private"           # Only agent can see (DMs)
+    GROUP_ONLY = "group_only"     # Only visible in this group
+    PUBLIC = "public"             # Cross-group visible
 
 
 class MemoryEntry(BaseModel):
@@ -54,6 +78,40 @@ class MemoryEntry(BaseModel):
         description="Topic phrase summarized by LLM"
     )
 
+    # ─── GROUP CONTEXT (NEW) ───
+    group_id: Optional[str] = Field(
+        None,
+        description="Group identifier (None = DM, 'telegram_-123456' = group)"
+    )
+    user_id: Optional[str] = Field(
+        None,
+        description="User identifier ('telegram:123456789')"
+    )
+    username: Optional[str] = Field(
+        None,
+        description="Username/handle ('@alice')"
+    )
+    platform: str = Field(
+        default="direct",
+        description="Platform: telegram, xmtp, farcaster, twitter, direct"
+    )
+
+    # ─── MEMORY CLASSIFICATION (NEW) ───
+    memory_type: MemoryType = Field(
+        default=MemoryType.CONVERSATION,
+        description="Type of memory for retrieval optimization"
+    )
+    privacy_scope: PrivacyScope = Field(
+        default=PrivacyScope.PRIVATE,
+        description="Privacy scope for access control"
+    )
+    importance_score: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Importance score 0-1 (higher = more important)"
+    )
+
     class Config:
         json_schema_extra = {
             "example": {
@@ -71,13 +129,57 @@ class MemoryEntry(BaseModel):
 
 class Dialogue(BaseModel):
     """
-    Original dialogue entry
+    Original dialogue entry with platform and group context.
+
+    Extended to carry all context needed for MemoryBuilder to decide
+    what type of memory to create and how to classify it.
     """
     dialogue_id: int
     speaker: str
     content: str
     timestamp: Optional[str] = None  # ISO 8601 format
 
+    # ─── PLATFORM CONTEXT (NEW) ───
+    platform: str = Field(
+        default="direct",
+        description="Platform: telegram, xmtp, farcaster, twitter, direct"
+    )
+    group_id: Optional[str] = Field(
+        None,
+        description="Group identifier (None = DM)"
+    )
+    user_id: Optional[str] = Field(
+        None,
+        description="User identifier ('platform:id')"
+    )
+    username: Optional[str] = Field(
+        None,
+        description="Username/handle"
+    )
+
+    # ─── MESSAGE METADATA (NEW) ───
+    message_id: Optional[str] = Field(
+        None,
+        description="Original message ID from platform"
+    )
+    is_reply: bool = Field(
+        default=False,
+        description="Is this a reply to another message"
+    )
+    reply_to_message_id: Optional[str] = Field(
+        None,
+        description="Message ID being replied to"
+    )
+    mentioned_users: List[str] = Field(
+        default_factory=list,
+        description="List of mentioned usernames"
+    )
+
     def __str__(self) -> str:
         time_str = f"[{self.timestamp}] " if self.timestamp else ""
-        return f"{time_str}{self.speaker}: {self.content}"
+        speaker_str = self.username or self.speaker
+        return f"{time_str}{speaker_str}: {self.content}"
+
+    def is_group_message(self) -> bool:
+        """Check if this is a group message"""
+        return self.group_id is not None
