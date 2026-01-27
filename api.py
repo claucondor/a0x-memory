@@ -19,7 +19,11 @@ from pydantic import BaseModel, Field
 
 from main import SimpleMemSystem
 from models.memory_entry import MemoryEntry
+from models.user_profile import UserProfile
+from models.group_memory import GroupProfile, UserInGroupProfile
 from database.vector_store import VectorStore
+from database.user_profile_store import UserProfileStore
+from database.group_profile_store import GroupProfileStore
 from utils.embedding import EmbeddingModel
 
 
@@ -114,6 +118,132 @@ class HealthResponse(BaseModel):
     version: str
     memory_instances: int
     timestamp: str
+
+
+class UserProfileResponse(BaseModel):
+    """User profile response"""
+    profile_id: str
+    agent_id: str
+    universal_user_id: str
+    platform_type: str
+    username: Optional[str] = None
+    summary: str
+    interests: List[Dict[str, Any]] = []
+    expertise_level: Optional[Dict[str, Any]] = None
+    communication_style: Optional[Dict[str, Any]] = None
+    total_messages_processed: int = 0
+    wallet_address: Optional[str] = None
+    basename: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class GroupProfileResponse(BaseModel):
+    """Group profile response"""
+    profile_id: str
+    agent_id: str
+    group_id: str
+    group_name: Optional[str] = None
+    platform: str
+    summary: str
+    main_topics: List[str] = []
+    group_purpose: Optional[str] = None
+    tone: str = "casual"
+    expertise_level: str = "intermediate"
+    total_messages_processed: int = 0
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class UserInGroupProfileResponse(BaseModel):
+    """User in group profile response"""
+    profile_id: str
+    agent_id: str
+    group_id: str
+    universal_user_id: str
+    username: Optional[str] = None
+    summary: str
+    role_in_group: str = "regular"
+    participation_level: str = "moderate"
+    expertise_in_group: str = "intermediate"
+    topics_engaged: List[str] = []
+    total_messages_in_group: int = 0
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class AgentResponseRequest(BaseModel):
+    """Request to add agent response for immediate context"""
+    response: str
+    timestamp: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class ContextResponse(BaseModel):
+    """Full context response with everything"""
+    memory_id: str
+    recent_messages: List[Dict[str, Any]] = []
+    memories: List[MemoryEntryResponse] = []
+    agent_responses: List[Dict[str, Any]] = []
+    user_profile: Optional[UserProfileResponse] = None
+    group_profile: Optional[GroupProfileResponse] = None
+    user_in_group_profile: Optional[UserInGroupProfileResponse] = None
+    memory_count: int = 0
+
+
+# ============================================================================
+# Unified API Request/Response Models
+# ============================================================================
+
+class PlatformIdentity(BaseModel):
+    """Platform-specific identity info"""
+    platform: str  # telegram, twitter, xmtp, farcaster
+    telegramId: Optional[int] = None
+    chatId: Optional[str] = None
+    groupId: Optional[str] = None
+    username: Optional[str] = None
+    walletAddress: Optional[str] = None
+    basename: Optional[str] = None
+
+
+class PassiveMemoryRequest(BaseModel):
+    """Request for passive memory (background processing)"""
+    agent_id: str
+    message: str
+    platform_identity: PlatformIdentity
+    speaker: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class ActiveMemoryRequest(BaseModel):
+    """Request for active memory (immediate context return)"""
+    agent_id: str
+    message: str
+    platform_identity: PlatformIdentity
+    speaker: Optional[str] = None
+    return_context: bool = True
+    context_limit: int = 10
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class ContextQueryRequest(BaseModel):
+    """Request for context retrieval"""
+    agent_id: str
+    query: Optional[str] = None
+    platform_identity: PlatformIdentity
+    include_recent: bool = True
+    recent_limit: int = 10
+    memory_limit: int = 5
+
+
+class UnifiedContextResponse(BaseModel):
+    """Response with full context"""
+    success: bool
+    recent_messages: List[Dict[str, Any]] = []
+    relevant_memories: List[Dict[str, Any]] = []
+    user_profile: Optional[Dict[str, Any]] = None
+    group_profile: Optional[Dict[str, Any]] = None
+    formatted_context: str = ""
 
 
 # ============================================================================
@@ -547,6 +677,560 @@ async def list_tenants():
 async def list_instances():
     """Alias for /tenants (backwards compatibility)"""
     return await list_tenants()
+
+
+# ============================================================================
+# Profile Endpoints
+# ============================================================================
+
+def get_profile_stores(memory_id: str):
+    """Get profile stores for tenant."""
+    agent_id, user_id = parse_memory_id(memory_id)
+
+    user_store = UserProfileStore(
+        db_path=shared_db_path,
+        embedding_model=get_shared_embedding_model(),
+        agent_id=agent_id
+    )
+
+    group_store = GroupProfileStore(
+        db_path=shared_db_path,
+        embedding_model=get_shared_embedding_model(),
+        agent_id=agent_id
+    )
+
+    return user_store, group_store, agent_id
+
+
+@app.get("/v1/profiles/user/{universal_user_id}", response_model=UserProfileResponse)
+async def get_user_profile(universal_user_id: str, agent_id: Optional[str] = None):
+    """Get user profile by universal_user_id (e.g., telegram:123456789)."""
+    memory_id = agent_id or "default"
+    user_store, _, _ = get_profile_stores(memory_id)
+
+    profile = user_store.get_profile_by_universal_id(universal_user_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"User profile not found: {universal_user_id}")
+
+    return UserProfileResponse(
+        profile_id=profile.profile_id,
+        agent_id=profile.agent_id,
+        universal_user_id=profile.universal_user_id,
+        platform_type=profile.platform_type,
+        username=profile.username,
+        summary=profile.summary,
+        interests=[{"keyword": i.keyword, "score": i.score} for i in profile.interests],
+        expertise_level={"value": profile.expertise_level.value, "confidence": profile.expertise_level.confidence} if profile.expertise_level else None,
+        communication_style={"value": profile.communication_style.value, "confidence": profile.communication_style.confidence} if profile.communication_style else None,
+        total_messages_processed=profile.total_messages_processed,
+        wallet_address=profile.wallet_address,
+        basename=profile.basename,
+        created_at=profile.created_at,
+        updated_at=profile.updated_at
+    )
+
+
+@app.get("/v1/profiles/group/{group_id}", response_model=GroupProfileResponse)
+async def get_group_profile(group_id: str, agent_id: Optional[str] = None):
+    """Get group profile by group_id."""
+    memory_id = agent_id or "default"
+    _, group_store, _ = get_profile_stores(memory_id)
+
+    profile = group_store.get_group_profile(group_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"Group profile not found: {group_id}")
+
+    return GroupProfileResponse(
+        profile_id=profile.profile_id,
+        agent_id=profile.agent_id,
+        group_id=profile.group_id,
+        group_name=profile.group_name,
+        platform=profile.platform,
+        summary=profile.summary,
+        main_topics=profile.main_topics,
+        group_purpose=profile.group_purpose,
+        tone=profile.tone.value,
+        expertise_level=profile.expertise_level,
+        total_messages_processed=profile.total_messages_processed,
+        created_at=profile.created_at,
+        updated_at=profile.updated_at
+    )
+
+
+@app.get("/v1/profiles/user/{universal_user_id}/group/{group_id}", response_model=UserInGroupProfileResponse)
+async def get_user_in_group_profile(universal_user_id: str, group_id: str, agent_id: Optional[str] = None):
+    """Get user-in-group profile."""
+    memory_id = agent_id or "default"
+    _, group_store, _ = get_profile_stores(memory_id)
+
+    profile = group_store.get_user_in_group_profile(group_id, universal_user_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"User-in-group profile not found: {universal_user_id} in {group_id}")
+
+    return UserInGroupProfileResponse(
+        profile_id=profile.profile_id,
+        agent_id=profile.agent_id,
+        group_id=profile.group_id,
+        universal_user_id=profile.universal_user_id,
+        username=profile.username,
+        summary=profile.summary,
+        role_in_group=profile.role_in_group,
+        participation_level=profile.participation_level,
+        expertise_in_group=profile.expertise_in_group,
+        topics_engaged=profile.topics_engaged,
+        total_messages_in_group=profile.total_messages_in_group,
+        created_at=profile.created_at,
+        updated_at=profile.updated_at
+    )
+
+
+@app.get("/v1/profiles/group/{group_id}/members", response_model=List[UserInGroupProfileResponse])
+async def get_group_members(group_id: str, agent_id: Optional[str] = None):
+    """Get all user profiles for a group."""
+    memory_id = agent_id or "default"
+    _, group_store, _ = get_profile_stores(memory_id)
+
+    profiles = group_store.get_users_in_group(group_id)
+
+    return [
+        UserInGroupProfileResponse(
+            profile_id=p.profile_id,
+            agent_id=p.agent_id,
+            group_id=p.group_id,
+            universal_user_id=p.universal_user_id,
+            username=p.username,
+            summary=p.summary,
+            role_in_group=p.role_in_group,
+            participation_level=p.participation_level,
+            expertise_in_group=p.expertise_in_group,
+            topics_engaged=p.topics_engaged,
+            total_messages_in_group=p.total_messages_in_group,
+            created_at=p.created_at,
+            updated_at=p.updated_at
+        )
+        for p in profiles
+    ]
+
+
+# ============================================================================
+# Context Endpoint (Everything in One Call)
+# ============================================================================
+
+@app.get("/v1/memory/context/{memory_id}", response_model=ContextResponse)
+async def get_full_context(
+    memory_id: str,
+    limit: int = 10,
+    include_profiles: bool = True
+):
+    """
+    Get full context for a memory_id including:
+    - Recent messages from Firestore sliding window
+    - Consolidated memories from LanceDB
+    - Agent responses
+    - User, group, and user-in-group profiles (if available)
+    """
+    system = get_memory_system(memory_id)
+    agent_id, user_id = parse_memory_id(memory_id)
+
+    # Get memories
+    entries = system.get_all_memories()
+    memory_entries = [
+        MemoryEntryResponse(
+            entry_id=entry.entry_id,
+            lossless_restatement=entry.lossless_restatement,
+            keywords=entry.keywords,
+            timestamp=entry.timestamp,
+            location=entry.location,
+            persons=entry.persons,
+            entities=entry.entities,
+            topic=entry.topic
+        )
+        for entry in entries[-limit:]
+    ]
+
+    # Get recent messages and agent responses from Firestore
+    recent_messages = []
+    agent_responses = []
+    try:
+        firestore_data = system.get_firestore_context()
+        recent_messages = firestore_data.get("raw_messages", [])
+        agent_responses = firestore_data.get("agent_responses", [])
+    except Exception as e:
+        print(f"[API] Warning: Could not get Firestore context: {e}")
+
+    # Get profiles if requested
+    user_profile = None
+    group_profile = None
+    user_in_group_profile = None
+
+    if include_profiles and agent_id:
+        try:
+            user_store, group_store, _ = get_profile_stores(memory_id)
+
+            # Try to get user profile
+            if user_id:
+                # Detect platform from user_id format
+                if user_id.startswith("telegram:"):
+                    universal_user_id = user_id
+                elif ":" in user_id:
+                    universal_user_id = user_id
+                else:
+                    # Default to telegram for backwards compatibility
+                    universal_user_id = f"telegram:{user_id}"
+
+                profile = user_store.get_profile_by_universal_id(universal_user_id)
+                if profile:
+                    user_profile = UserProfileResponse(
+                        profile_id=profile.profile_id,
+                        agent_id=profile.agent_id,
+                        universal_user_id=profile.universal_user_id,
+                        platform_type=profile.platform_type,
+                        username=profile.username,
+                        summary=profile.summary,
+                        interests=[{"keyword": i.keyword, "score": i.score} for i in profile.interests],
+                        expertise_level={"value": profile.expertise_level.value, "confidence": profile.expertise_level.confidence} if profile.expertise_level else None,
+                        communication_style={"value": profile.communication_style.value, "confidence": profile.communication_style.confidence} if profile.communication_style else None,
+                        total_messages_processed=profile.total_messages_processed,
+                        wallet_address=profile.wallet_address,
+                        basename=profile.basename,
+                        created_at=profile.created_at,
+                        updated_at=profile.updated_at
+                    )
+
+            # Try to get group profile if memory_id contains group info
+            group_id = None
+            meta = tenant_metadata.get(memory_id, {})
+            if meta.get("metadata", {}).get("group_id"):
+                group_id = meta["metadata"]["group_id"]
+            elif user_id and user_id.startswith("telegram_-"):
+                # Group ID format
+                group_id = user_id
+
+            if group_id:
+                gp = group_store.get_group_profile(group_id)
+                if gp:
+                    group_profile = GroupProfileResponse(
+                        profile_id=gp.profile_id,
+                        agent_id=gp.agent_id,
+                        group_id=gp.group_id,
+                        group_name=gp.group_name,
+                        platform=gp.platform,
+                        summary=gp.summary,
+                        main_topics=gp.main_topics,
+                        group_purpose=gp.group_purpose,
+                        tone=gp.tone.value,
+                        expertise_level=gp.expertise_level,
+                        total_messages_processed=gp.total_messages_processed,
+                        created_at=gp.created_at,
+                        updated_at=gp.updated_at
+                    )
+
+                # Try user-in-group profile
+                if user_id and universal_user_id:
+                    uigp = group_store.get_user_in_group_profile(group_id, universal_user_id)
+                    if uigp:
+                        user_in_group_profile = UserInGroupProfileResponse(
+                            profile_id=uigp.profile_id,
+                            agent_id=uigp.agent_id,
+                            group_id=uigp.group_id,
+                            universal_user_id=uigp.universal_user_id,
+                            username=uigp.username,
+                            summary=uigp.summary,
+                            role_in_group=uigp.role_in_group,
+                            participation_level=uigp.participation_level,
+                            expertise_in_group=uigp.expertise_in_group,
+                            topics_engaged=uigp.topics_engaged,
+                            total_messages_in_group=uigp.total_messages_in_group,
+                            created_at=uigp.created_at,
+                            updated_at=uigp.updated_at
+                        )
+        except Exception as e:
+            print(f"[API] Warning: Could not get profiles: {e}")
+
+    return ContextResponse(
+        memory_id=memory_id,
+        recent_messages=recent_messages,
+        memories=memory_entries,
+        agent_responses=agent_responses,
+        user_profile=user_profile,
+        group_profile=group_profile,
+        user_in_group_profile=user_in_group_profile,
+        memory_count=len(entries)
+    )
+
+
+@app.post("/v1/memory/{memory_id}/add-response")
+async def add_agent_response(memory_id: str, request: AgentResponseRequest):
+    """
+    Add agent response to Firestore sliding window for immediate context.
+    """
+    system = get_memory_system(memory_id)
+
+    try:
+        system.add_agent_response_to_window(
+            response=request.response,
+            timestamp=request.timestamp,
+            metadata=request.metadata
+        )
+        return {"success": True, "memory_id": memory_id}
+    except Exception as e:
+        print(f"[API] Error adding agent response: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Unified Memory Endpoints (Main API)
+# ============================================================================
+
+def _extract_identity_info(platform_identity: PlatformIdentity) -> Dict[str, Any]:
+    """Extract group_id, user_id, etc from platform_identity."""
+    platform = platform_identity.platform
+
+    # Determine if group or DM
+    chat_id = platform_identity.chatId or platform_identity.groupId
+    is_group = False
+    group_id = None
+
+    if chat_id:
+        # Negative chatId = group in Telegram
+        if str(chat_id).startswith('-') or str(chat_id).startswith('telegram_-'):
+            is_group = True
+            group_id = chat_id if str(chat_id).startswith('telegram_') else f"telegram_{chat_id}"
+
+    # Build user_id
+    user_id = None
+    if platform_identity.telegramId:
+        user_id = f"{platform}:{platform_identity.telegramId}"
+    elif platform_identity.walletAddress:
+        user_id = f"{platform}:{platform_identity.walletAddress}"
+    elif platform_identity.username:
+        user_id = f"{platform}:{platform_identity.username}"
+
+    return {
+        "platform": platform,
+        "is_group": is_group,
+        "group_id": group_id,
+        "user_id": user_id,
+        "username": platform_identity.username,
+        "wallet_address": platform_identity.walletAddress,
+        "basename": platform_identity.basename
+    }
+
+
+@app.post("/v1/memory/passive")
+async def add_passive_memory(request: PassiveMemoryRequest, background_tasks: BackgroundTasks):
+    """
+    Add message for background processing (fire and forget).
+
+    Used for messages that don't need immediate context response.
+    - Adds to Firestore window
+    - Triggers batch processing when threshold reached
+    - Returns immediately
+    """
+    identity = _extract_identity_info(request.platform_identity)
+
+    # Build memory_id
+    memory_id = f"{request.agent_id}:{identity['user_id']}" if identity['user_id'] else request.agent_id
+    system = get_memory_system(memory_id)
+
+    # Call add_dialogue (handles DM vs group, batch processing, profile generation)
+    result = system.add_dialogue(
+        speaker=request.speaker or identity['username'] or "user",
+        content=request.message,
+        platform=identity['platform'],
+        group_id=identity['group_id'],
+        user_id=identity['user_id'],
+        username=identity['username'],
+        add_to_firestore=True,
+        use_stateless_processing=True
+    )
+
+    return {
+        "success": result.get("added", False),
+        "is_group": identity['is_group'],
+        "group_id": identity['group_id'],
+        "user_id": identity['user_id'],
+        "processed": result.get("processed", False),
+        "memories_created": result.get("memories_created", 0)
+    }
+
+
+@app.post("/v1/memory/active")
+async def add_active_memory(request: ActiveMemoryRequest):
+    """
+    Add message AND return context immediately.
+
+    Used when agent needs to respond - adds message and returns relevant context.
+    - Adds to Firestore window
+    - Triggers batch processing if threshold reached
+    - Returns context for response generation
+    """
+    identity = _extract_identity_info(request.platform_identity)
+
+    # Build memory_id
+    memory_id = f"{request.agent_id}:{identity['user_id']}" if identity['user_id'] else request.agent_id
+    system = get_memory_system(memory_id)
+
+    # Add the message
+    result = system.add_dialogue(
+        speaker=request.speaker or identity['username'] or "user",
+        content=request.message,
+        platform=identity['platform'],
+        group_id=identity['group_id'],
+        user_id=identity['user_id'],
+        username=identity['username'],
+        add_to_firestore=True,
+        use_stateless_processing=True
+    )
+
+    response = {
+        "success": result.get("added", False),
+        "added": result.get("added", False),
+        "is_group": identity['is_group'],
+        "group_id": identity['group_id'],
+        "user_id": identity['user_id'],
+        "processed": result.get("processed", False),
+        "memories_created": result.get("memories_created", 0),
+        "context": None
+    }
+
+    # Get context if requested
+    if request.return_context:
+        try:
+            context_data = system.get_firestore_context()
+            response["context"] = {
+                "recent_messages": context_data.get("raw_messages", [])[-request.context_limit:],
+                "agent_responses": context_data.get("agent_responses", [])
+            }
+        except Exception as e:
+            print(f"[API] Warning: Could not get context: {e}")
+
+    return response
+
+
+@app.post("/v1/memory/context")
+async def get_memory_context(request: ContextQueryRequest):
+    """
+    Get context for query without adding a message.
+
+    Used for context retrieval only (e.g., for RAG).
+    """
+    identity = _extract_identity_info(request.platform_identity)
+
+    # Build memory_id
+    memory_id = f"{request.agent_id}:{identity['user_id']}" if identity['user_id'] else request.agent_id
+    system = get_memory_system(memory_id)
+
+    response = {
+        "success": True,
+        "recent_messages": [],
+        "relevant_memories": [],
+        "user_profile": None,
+        "group_profile": None,
+        "formatted_context": ""
+    }
+
+    # Get recent messages from Firestore
+    if request.include_recent:
+        try:
+            context_data = system.get_firestore_context()
+            response["recent_messages"] = context_data.get("raw_messages", [])[-request.recent_limit:]
+        except Exception as e:
+            print(f"[API] Warning: Could not get recent messages: {e}")
+
+    # Search memories if query provided
+    if request.query:
+        try:
+            memories = await asyncio.to_thread(
+                system.hybrid_retriever.retrieve,
+                request.query,
+                enable_reflection=True
+            )
+            response["relevant_memories"] = memories[:request.memory_limit] if memories else []
+        except Exception as e:
+            print(f"[API] Warning: Could not search memories: {e}")
+
+    # Build formatted context
+    context_parts = []
+    if response["recent_messages"]:
+        context_parts.append("Recent messages:")
+        for msg in response["recent_messages"]:
+            username = msg.get('username', 'unknown')
+            content = msg.get('content', '')
+            context_parts.append(f"  {username}: {content}")
+
+    if response["relevant_memories"]:
+        context_parts.append("\nRelevant memories:")
+        for mem in response["relevant_memories"]:
+            context_parts.append(f"  - {mem}")
+
+    response["formatted_context"] = "\n".join(context_parts)
+
+    return response
+
+
+@app.post("/v1/memory/process-pending")
+async def process_pending_messages(
+    agent_id: str,
+    group_id: Optional[str] = None
+):
+    """
+    Manually trigger processing of pending messages.
+
+    Useful for testing or forcing batch processing.
+    """
+    memory_id = agent_id
+    system = get_memory_system(memory_id)
+
+    effective_group_id = group_id or f"dm_{agent_id}"
+
+    # Force processing by calling internal method
+    try:
+        result = system._process_unprocessed_messages(
+            effective_group_id=effective_group_id,
+            original_group_id=group_id,
+            platform="telegram"
+        )
+        return {
+            "success": True,
+            "processed": result.get("processed", False),
+            "memories_created": result.get("memories_created", 0)
+        }
+    except Exception as e:
+        print(f"[API] Error processing pending: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.get("/v1/memory/stats/{agent_id}")
+async def get_memory_stats(agent_id: str):
+    """
+    Get memory statistics for an agent.
+    """
+    memory_id = agent_id
+    system = get_memory_system(memory_id)
+
+    stats = {
+        "agent_id": agent_id,
+        "memory_count": 0,
+        "user_profile_count": 0,
+        "group_profile_count": 0
+    }
+
+    try:
+        stats["memory_count"] = system.vector_store.count_entries()
+    except:
+        pass
+
+    try:
+        user_store, group_store, _ = get_profile_stores(memory_id)
+        stats["user_profile_count"] = user_store.count_profiles()
+    except:
+        pass
+
+    return stats
 
 
 # ============================================================================
