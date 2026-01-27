@@ -5,14 +5,27 @@ Paper Reference: Section 3.3 - Adaptive Query-Aware Retrieval with Pruning
 Implements:
 - Hybrid scoring function S(q, m_k) aggregating semantic, lexical, and symbolic signals
 - Query Complexity estimation C_q for adaptive retrieval depth
-- Dynamic retrieval depth k_dyn = k_base · (1 + δ · C_q)
+- Dynamic retrieval depth k_dyn = k_base * (1 + delta * C_q)
 - Complexity-Aware Pruning to minimize token usage while maximizing accuracy
+
+Extended for Unified Memory:
+- Multi-table search for groups (group_memories, user_memories, interaction_memories)
+- Cross-group search support
+- Result fusion across multiple tables
 """
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from models.memory_entry import MemoryEntry
+from models.group_memory import GroupMemory, UserMemory, InteractionMemory, CrossGroupMemory
 from utils.llm_client import LLMClient
-from database.vector_store import VectorStore
+from utils.structured_schemas import (
+    QUERY_ANALYSIS_SCHEMA, SEARCH_QUERIES_SCHEMA,
+    ANSWER_ADEQUACY_SCHEMA, ADDITIONAL_QUERIES_SCHEMA,
+    INFORMATION_REQUIREMENTS_SCHEMA, TARGETED_QUERIES_SCHEMA,
+    INFORMATION_COMPLETENESS_SCHEMA, MISSING_INFO_QUERIES_SCHEMA
+)
+# Note: unified_store (UnifiedMemoryStore or VectorStore) is injected via __init__
 import config
+import json
 import re
 from datetime import datetime, timedelta
 import dateparser
@@ -33,11 +46,16 @@ class HybridRetriever:
     2. Hybrid Scoring Function S(q, m_k): aggregates multi-layer signals
     3. Complexity-Aware Pruning: dynamic depth based on C_q
     4. Planning-based multi-query decomposition for comprehensive retrieval
+
+    Extended for Unified Memory:
+    5. Multi-table search for groups (search_all)
+    6. Result fusion across multiple memory types
     """
+
     def __init__(
         self,
         llm_client: LLMClient,
-        vector_store: VectorStore,
+        unified_store,  # UnifiedMemoryStore or VectorStore (backward compatible)
         semantic_top_k: int = None,
         keyword_top_k: int = None,
         structured_top_k: int = None,
@@ -49,7 +67,11 @@ class HybridRetriever:
         cc_alpha: float = None
     ):
         self.llm_client = llm_client
-        self.vector_store = vector_store
+        self.unified_store = unified_store
+
+        # Backward compatibility
+        self.vector_store = unified_store
+
         self.semantic_top_k = semantic_top_k or config.SEMANTIC_TOP_K
         self.keyword_top_k = keyword_top_k or config.KEYWORD_TOP_K
         self.structured_top_k = structured_top_k or config.STRUCTURED_TOP_K
@@ -63,6 +85,9 @@ class HybridRetriever:
 
         # Convex Combination alpha for adaptive keyword boost
         self.cc_alpha = cc_alpha if cc_alpha is not None else getattr(config, 'CC_ALPHA', 0.7)
+
+        # Check if unified_store supports multi-table search
+        self._supports_multi_table = hasattr(unified_store, 'search_all')
 
     def retrieve(self, query: str, enable_reflection: Optional[bool] = None) -> List[MemoryEntry]:
         """
@@ -235,17 +260,15 @@ Return ONLY JSON, no other content.
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Use JSON format if configured
-                response_format = None
-                if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
-                    response_format = {"type": "json_object"}
-
                 response = self.llm_client.chat_completion(
                     messages,
                     temperature=0.1,
-                    response_format=response_format
+                    response_format=QUERY_ANALYSIS_SCHEMA
                 )
-                analysis = self.llm_client.extract_json(response)
+                try:
+                    analysis = json.loads(response)
+                except (json.JSONDecodeError, TypeError):
+                    analysis = self.llm_client.extract_json(response)
                 return analysis
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -410,18 +433,15 @@ Return ONLY the JSON, no other text.
         ]
         
         try:
-            # Use JSON format if configured
-            response_format = None
-            if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
-                response_format = {"type": "json_object"}
-                
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.3,
-                response_format=response_format
+                response_format=SEARCH_QUERIES_SCHEMA
             )
-            
-            result = self.llm_client.extract_json(response)
+            try:
+                result = json.loads(response)
+            except (json.JSONDecodeError, TypeError):
+                result = self.llm_client.extract_json(response)
             queries = result.get("queries", [query])
             
             # Ensure original query is included
@@ -542,23 +562,19 @@ Return ONLY the JSON, no other text.
         ]
         
         try:
-            # Use JSON format if configured
-            response_format = None
-            if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
-                response_format = {"type": "json_object"}
-                
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.1,
-                response_format=response_format
+                response_format=ANSWER_ADEQUACY_SCHEMA
             )
-            
-            result = self.llm_client.extract_json(response)
+            try:
+                result = json.loads(response)
+            except (json.JSONDecodeError, TypeError):
+                result = self.llm_client.extract_json(response)
             return result.get("assessment", "insufficient")
-            
+
         except Exception as e:
             print(f"Failed to check answer adequacy: {e}")
-            # Default to insufficient to be safe
             return "insufficient"
     
     def _generate_additional_queries(self, original_query: str, current_contexts: List[MemoryEntry]) -> List[str]:
@@ -603,20 +619,17 @@ Return ONLY the JSON, no other text.
         ]
         
         try:
-            # Use JSON format if configured
-            response_format = None
-            if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
-                response_format = {"type": "json_object"}
-                
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.3,
-                response_format=response_format
+                response_format=ADDITIONAL_QUERIES_SCHEMA
             )
-            
-            result = self.llm_client.extract_json(response)
+            try:
+                result = json.loads(response)
+            except (json.JSONDecodeError, TypeError):
+                result = self.llm_client.extract_json(response)
             return result.get("additional_queries", [])
-            
+
         except Exception as e:
             print(f"Failed to generate additional queries: {e}")
             return []
@@ -782,20 +795,17 @@ Return ONLY the JSON, no other text.
         ]
         
         try:
-            # Use JSON format if configured
-            response_format = None
-            if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
-                response_format = {"type": "json_object"}
-                
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.2,
-                response_format=response_format
+                response_format=INFORMATION_REQUIREMENTS_SCHEMA
             )
-            
-            result = self.llm_client.extract_json(response)
+            try:
+                result = json.loads(response)
+            except (json.JSONDecodeError, TypeError):
+                result = self.llm_client.extract_json(response)
             return result
-            
+
         except Exception as e:
             print(f"Failed to analyze information requirements: {e}")
             # Fallback to simple analysis
@@ -855,18 +865,15 @@ Return ONLY the JSON, no other text.
         ]
         
         try:
-            # Use JSON format if configured
-            response_format = None
-            if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
-                response_format = {"type": "json_object"}
-                
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.3,
-                response_format=response_format
+                response_format=TARGETED_QUERIES_SCHEMA
             )
-            
-            result = self.llm_client.extract_json(response)
+            try:
+                result = json.loads(response)
+            except (json.JSONDecodeError, TypeError):
+                result = self.llm_client.extract_json(response)
             queries = result.get("queries", [original_query])
             
             # Ensure original query is included and limit to reasonable number
@@ -975,18 +982,15 @@ Return ONLY the JSON, no other text.
         ]
         
         try:
-            # Use JSON format if configured
-            response_format = None
-            if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
-                response_format = {"type": "json_object"}
-                
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.1,
-                response_format=response_format
+                response_format=INFORMATION_COMPLETENESS_SCHEMA
             )
-            
-            result = self.llm_client.extract_json(response)
+            try:
+                result = json.loads(response)
+            except (json.JSONDecodeError, TypeError):
+                result = self.llm_client.extract_json(response)
             assessment = result.get("assessment", "incomplete")
             coverage = result.get("coverage_percentage", 0)
             
@@ -1040,23 +1044,448 @@ Return ONLY the JSON, no other text.
         ]
         
         try:
-            # Use JSON format if configured
-            response_format = None
-            if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
-                response_format = {"type": "json_object"}
-                
             response = self.llm_client.chat_completion(
                 messages,
                 temperature=0.3,
-                response_format=response_format
+                response_format=MISSING_INFO_QUERIES_SCHEMA
             )
-            
-            result = self.llm_client.extract_json(response)
+            try:
+                result = json.loads(response)
+            except (json.JSONDecodeError, TypeError):
+                result = self.llm_client.extract_json(response)
             queries = result.get("targeted_queries", [])
-            
+
             print(f"[Intelligent Reflection] Missing info: {result.get('missing_analysis', 'Unknown')}")
             return queries
-            
+
         except Exception as e:
             print(f"Failed to generate missing info queries: {e}")
             return []
+
+    # ============================================================
+    # Multi-Table Retrieval (Extended for Unified Memory)
+    # ============================================================
+
+    def retrieve_for_context(
+        self,
+        query: str,
+        context: Dict[str, Any],
+        limit_per_table: int = 5
+    ) -> Dict[str, Any]:
+        """
+        Retrieve from all relevant tables using the intelligent planning pipeline.
+
+        This is the main entry point for group/multi-table retrieval.
+        Uses planning + multi-query fan-out + optional BM25 keyword boost.
+
+        Args:
+            query: Search query
+            context: Dict with group_id, user_id, platform, etc.
+            limit_per_table: Max results per table
+
+        Returns:
+            Dict with results from each table type and formatted context string
+        """
+        group_id = context.get('group_id')
+        user_id = context.get('user_id')
+        is_group = group_id is not None and not group_id.startswith('dm_')
+
+        # DM path: delegate to self.retrieve() which already has the full pipeline
+        if not is_group or not self._supports_multi_table:
+            results = self.retrieve(query)
+            return {
+                "dm_memories": results,
+                "group_memories": [],
+                "user_memories": [],
+                "interaction_memories": [],
+                "cross_group_memories": [],
+                "formatted_context": self._format_dm_context(results)
+            }
+
+        # Group path: intelligent pipeline with multi-table fan-out
+        print(f"\n[retrieve_for_context] Intelligent group retrieval for: {query}")
+
+        # Step 1: Planning - analyze info requirements and generate queries
+        information_plan = self._analyze_information_requirements(query)
+        print(f"[retrieve_for_context] Identified {len(information_plan.get('required_info', []))} info requirements")
+
+        search_queries = self._generate_targeted_queries(query, information_plan)
+        print(f"[retrieve_for_context] Generated {len(search_queries)} targeted queries")
+
+        use_keyword_boost = information_plan.get("use_keyword_boost", False)
+        exact_match_terms = information_plan.get("exact_match_terms", [])
+
+        top_k = self.semantic_top_k
+
+        # Step 2: Fan-out queries to all group tables (parallel)
+        all_group_memories = []
+        all_user_memories = []
+        all_interaction_memories = []
+        all_cross_group_memories = []
+
+        def _search_group_for_query(sq: str):
+            """Search all group tables for a single query."""
+            gm = self.unified_store.search_group_memories(group_id, sq, limit=top_k)
+            um = self.unified_store.search_user_memories_in_group(group_id, sq, limit=top_k, exclude_user_id=user_id)
+            im = self.unified_store.search_interactions(group_id, speaker_id=user_id, query=sq, limit=top_k)
+            cg = []
+            if user_id:
+                cg = self.unified_store.search_cross_group(user_id, sq, limit=top_k)
+            return gm, um, im, cg
+
+        if self.enable_parallel_retrieval and len(search_queries) > 1:
+            print(f"[retrieve_for_context] Parallel fan-out: {len(search_queries)} queries x 4 tables")
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_retrieval_workers) as executor:
+                    futures = {executor.submit(_search_group_for_query, sq): sq for sq in search_queries}
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            gm, um, im, cg = future.result()
+                            all_group_memories.extend(gm)
+                            all_user_memories.extend(um)
+                            all_interaction_memories.extend(im)
+                            all_cross_group_memories.extend(cg)
+                        except Exception as e:
+                            print(f"[retrieve_for_context] Query failed: {e}")
+            except Exception as e:
+                print(f"[retrieve_for_context] Parallel execution failed, falling back to sequential: {e}")
+                for sq in search_queries:
+                    gm, um, im, cg = _search_group_for_query(sq)
+                    all_group_memories.extend(gm)
+                    all_user_memories.extend(um)
+                    all_interaction_memories.extend(im)
+                    all_cross_group_memories.extend(cg)
+        else:
+            for sq in search_queries:
+                print(f"[retrieve_for_context] Searching: {sq}")
+                gm, um, im, cg = _search_group_for_query(sq)
+                all_group_memories.extend(gm)
+                all_user_memories.extend(um)
+                all_interaction_memories.extend(im)
+                all_cross_group_memories.extend(cg)
+
+        # Step 3: BM25 keyword boost for group tables
+        if use_keyword_boost and exact_match_terms:
+            print(f"[retrieve_for_context] Keyword boost for terms: {exact_match_terms}")
+            kw_top_k = self.keyword_top_k
+
+            all_group_memories = self._apply_group_keyword_boost(
+                all_group_memories,
+                lambda: self.unified_store.keyword_search_group_memories(group_id, exact_match_terms, top_k=kw_top_k),
+                id_attr="memory_id"
+            )
+            all_user_memories = self._apply_group_keyword_boost(
+                all_user_memories,
+                lambda: self.unified_store.keyword_search_user_memories(group_id, exact_match_terms, top_k=kw_top_k),
+                id_attr="memory_id"
+            )
+            all_interaction_memories = self._apply_group_keyword_boost(
+                all_interaction_memories,
+                lambda: self.unified_store.keyword_search_interactions(group_id, exact_match_terms, top_k=kw_top_k),
+                id_attr="memory_id"
+            )
+
+        # Step 4: Deduplicate within each table
+        all_group_memories = self._deduplicate_by_id(all_group_memories, "memory_id")
+        all_user_memories = self._deduplicate_by_id(all_user_memories, "memory_id")
+        all_interaction_memories = self._deduplicate_by_id(all_interaction_memories, "memory_id")
+        all_cross_group_memories = self._deduplicate_by_id(all_cross_group_memories, "memory_id")
+
+        print(f"[retrieve_for_context] Results (pre-rerank): group={len(all_group_memories)}, user={len(all_user_memories)}, "
+              f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}")
+
+        # Step 4.5: Rerank with a0x-models cross-encoder
+        rerank_top_k = limit_per_table
+        all_group_memories = self._rerank_with_cross_encoder(query, all_group_memories, top_k=rerank_top_k)
+        all_user_memories = self._rerank_with_cross_encoder(query, all_user_memories, top_k=rerank_top_k)
+        all_interaction_memories = self._rerank_with_cross_encoder(query, all_interaction_memories, top_k=rerank_top_k)
+        if all_cross_group_memories:
+            all_cross_group_memories = self._rerank_with_cross_encoder(query, all_cross_group_memories, top_k=rerank_top_k)
+
+        print(f"[retrieve_for_context] Results (post-rerank): group={len(all_group_memories)}, user={len(all_user_memories)}, "
+              f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}")
+
+        # Step 5: Format using existing method
+        raw_results = {
+            "dm_memories": [],
+            "group_memories": all_group_memories,
+            "user_memories": all_user_memories,
+            "interaction_memories": all_interaction_memories,
+            "cross_group_memories": all_cross_group_memories
+        }
+
+        formatted = self._format_multi_table_context(raw_results, context)
+
+        return {
+            **raw_results,
+            "formatted_context": formatted
+        }
+
+    def _apply_group_keyword_boost(
+        self,
+        semantic_items: list,
+        keyword_search_fn,
+        id_attr: str = "memory_id"
+    ) -> list:
+        """
+        Apply BM25 keyword boost to a list of group memory items using CC fusion.
+
+        Args:
+            semantic_items: Items from semantic search (no scores)
+            keyword_search_fn: Callable that returns List[Tuple[item, float]]
+            id_attr: Attribute name for the unique ID
+
+        Returns:
+            Re-ranked list of items
+        """
+        if not semantic_items:
+            return semantic_items
+
+        try:
+            keyword_with_scores = keyword_search_fn()
+            if not keyword_with_scores:
+                return semantic_items
+
+            # Convert semantic items to scored format (rank-based scores)
+            total = len(semantic_items)
+            semantic_scores = {}
+            item_map = {}
+            for i, item in enumerate(semantic_items):
+                item_id = getattr(item, id_attr)
+                semantic_scores[item_id] = 1.0 - (i / max(total, 1))
+                item_map[item_id] = item
+
+            keyword_scores = {}
+            for item, score in keyword_with_scores:
+                item_id = getattr(item, id_attr)
+                keyword_scores[item_id] = score
+                if item_id not in item_map:
+                    item_map[item_id] = item
+
+            # CC fusion
+            alpha = self.cc_alpha
+            all_ids = set(semantic_scores.keys()) | set(keyword_scores.keys())
+            fused = {}
+            for item_id in all_ids:
+                sem = semantic_scores.get(item_id, 0.0)
+                kw = keyword_scores.get(item_id, 0.0)
+                if item_id in semantic_scores and item_id in keyword_scores:
+                    fused[item_id] = alpha * sem + (1 - alpha) * kw
+                elif item_id in semantic_scores:
+                    fused[item_id] = alpha * sem
+                else:
+                    fused[item_id] = (1 - alpha) * kw
+
+            sorted_ids = sorted(fused.keys(), key=lambda x: fused[x], reverse=True)
+            return [item_map[item_id] for item_id in sorted_ids]
+
+        except Exception as e:
+            print(f"[retrieve_for_context] Keyword boost failed: {e}")
+            return semantic_items
+
+    def _deduplicate_by_id(self, items: list, id_attr: str = "memory_id") -> list:
+        """Deduplicate a list of items by their ID attribute."""
+        seen = set()
+        deduped = []
+        for item in items:
+            item_id = getattr(item, id_attr)
+            if item_id not in seen:
+                seen.add(item_id)
+                deduped.append(item)
+        return deduped
+
+    def _rerank_with_cross_encoder(
+        self,
+        query: str,
+        items: list,
+        top_k: int = 10
+    ) -> list:
+        """
+        Rerank items using a0x-models /rerank endpoint (cross-encoder/ms-marco-MiniLM-L6-v2).
+
+        Sends documents to the cross-encoder which scores each (query, document) pair.
+        Returns the top_k most relevant items sorted by reranker score.
+        """
+        if not items or len(items) <= 1:
+            return items
+
+        import requests
+        import os
+
+        a0x_models_url = os.getenv("A0X_MODELS_URL", "https://a0x-models-679925931457.us-central1.run.app")
+
+        # Extract text content from each item
+        documents = []
+        for item in items:
+            if hasattr(item, 'content'):
+                documents.append(item.content)
+            elif hasattr(item, 'lossless_restatement'):
+                documents.append(item.lossless_restatement)
+            else:
+                documents.append(str(item))
+
+        try:
+            response = requests.post(
+                f"{a0x_models_url}/rerank",
+                json={"query": query, "documents": documents, "top_k": top_k},
+                timeout=30
+            )
+            response.raise_for_status()
+            results = response.json().get("results", [])
+
+            # Reorder items by reranker score
+            reranked = []
+            for r in results:
+                idx = r["index"]
+                if idx < len(items):
+                    reranked.append(items[idx])
+
+            return reranked
+
+        except Exception as e:
+            print(f"[rerank] a0x-models rerank failed, keeping original order: {e}")
+            return items[:top_k]
+
+    def _format_dm_context(self, memories: List[MemoryEntry]) -> str:
+        """Format DM memories as context string."""
+        if not memories:
+            return "[No relevant memories found]"
+
+        formatted = []
+        for i, entry in enumerate(memories, 1):
+            parts = [f"[Memory {i}] {entry.lossless_restatement}"]
+            if entry.timestamp:
+                parts.append(f"(Time: {entry.timestamp})")
+            if entry.topic:
+                parts.append(f"(Topic: {entry.topic})")
+            formatted.append(" ".join(parts))
+
+        return "\n".join(formatted)
+
+    def _format_multi_table_context(
+        self,
+        results: Dict[str, List[Any]],
+        context: Dict[str, Any]
+    ) -> str:
+        """Format multi-table results as context string."""
+        sections = []
+        group_id = context.get('group_id')
+        user_id = context.get('user_id')
+
+        # DM memories
+        dm_mems = results.get("dm_memories", [])
+        if dm_mems:
+            dm_lines = ["## Personal Memories"]
+            for i, entry in enumerate(dm_mems, 1):
+                line = f"{i}. {entry.lossless_restatement}"
+                if entry.timestamp:
+                    line += f" ({entry.timestamp})"
+                dm_lines.append(line)
+            sections.append("\n".join(dm_lines))
+
+        # Group memories
+        group_mems = results.get("group_memories", [])
+        if group_mems:
+            group_lines = ["## Group Knowledge"]
+            for i, mem in enumerate(group_mems, 1):
+                line = f"{i}. {mem.content}"
+                if mem.speaker:
+                    line += f" (shared by {mem.speaker})"
+                group_lines.append(line)
+            sections.append("\n".join(group_lines))
+
+        # User memories (about other users in the group)
+        user_mems = results.get("user_memories", [])
+        if user_mems:
+            user_lines = ["## About Group Members"]
+            for i, mem in enumerate(user_mems, 1):
+                username = mem.username or mem.user_id
+                line = f"{i}. [{username}] {mem.content}"
+                user_lines.append(line)
+            sections.append("\n".join(user_lines))
+
+        # Interaction memories
+        interaction_mems = results.get("interaction_memories", [])
+        if interaction_mems:
+            interaction_lines = ["## Notable Interactions"]
+            for i, mem in enumerate(interaction_mems, 1):
+                line = f"{i}. {mem.content}"
+                if mem.interaction_type:
+                    line += f" ({mem.interaction_type})"
+                interaction_lines.append(line)
+            sections.append("\n".join(interaction_lines))
+
+        # Cross-group memories
+        cross_mems = results.get("cross_group_memories", [])
+        if cross_mems:
+            cross_lines = ["## User Profile (Cross-Group)"]
+            for i, mem in enumerate(cross_mems, 1):
+                line = f"{i}. {mem.content}"
+                if mem.confidence_score:
+                    line += f" (confidence: {mem.confidence_score:.0%})"
+                cross_lines.append(line)
+            sections.append("\n".join(cross_lines))
+
+        if not sections:
+            return "[No relevant memories found]"
+
+        return "\n\n".join(sections)
+
+    def retrieve_user_profile(
+        self,
+        user_id: str,
+        group_id: str = None
+    ) -> Dict[str, Any]:
+        """
+        Retrieve comprehensive user profile across tables.
+
+        Args:
+            user_id: User identifier
+            group_id: Optional group to focus on
+
+        Returns:
+            Dict with user information from various tables
+        """
+        if not self._supports_multi_table:
+            return {"error": "Multi-table search not supported"}
+
+        profile = {
+            "user_id": user_id,
+            "group_id": group_id,
+            "memories": [],
+            "interactions": [],
+            "cross_group": []
+        }
+
+        # Get user memories from this group
+        if group_id:
+            user_mems = self.unified_store.user_memories_table.search().where(
+                f"user_id = '{user_id}' AND group_id = '{group_id}'",
+                prefilter=True
+            ).limit(20).to_list()
+
+            profile["memories"] = [
+                self.unified_store._row_to_user_memory(r)
+                for r in user_mems
+            ]
+
+            # Get interactions involving this user
+            interactions = self.unified_store.search_interactions(
+                group_id=group_id,
+                speaker_id=user_id,
+                limit=10
+            )
+            profile["interactions"] = interactions
+
+        # Get cross-group profile
+        cross_group = self.unified_store.cross_group_memories_table.search().where(
+            f"universal_user_id = '{user_id}'",
+            prefilter=True
+        ).limit(10).to_list()
+
+        profile["cross_group"] = [
+            self.unified_store._row_to_cross_group_memory(r)
+            for r in cross_group
+        ]
+
+        return profile

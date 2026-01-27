@@ -7,7 +7,9 @@ Generates answers from the final context C_final synthesized by query-aware retr
 from typing import List
 from models.memory_entry import MemoryEntry
 from utils.llm_client import LLMClient
+from utils.structured_schemas import ANSWER_GENERATION_SCHEMA
 import config
+import json
 
 
 class AnswerGenerator:
@@ -62,19 +64,17 @@ class AnswerGenerator:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Use JSON format if configured
-                response_format = None
-                if hasattr(config, 'USE_JSON_FORMAT') and config.USE_JSON_FORMAT:
-                    response_format = {"type": "json_object"}
-
                 response = self.llm_client.chat_completion(
                     messages,
                     temperature=0.1,
-                    response_format=response_format
+                    response_format=ANSWER_GENERATION_SCHEMA
                 )
 
-                # Parse JSON response
-                result = self.llm_client.extract_json(response)
+                # Parse JSON response - structured outputs return valid JSON
+                try:
+                    result = json.loads(response)
+                except (json.JSONDecodeError, TypeError):
+                    result = self.llm_client.extract_json(response)
                 # Return the answer from JSON
                 return result.get("answer", response.strip())
 
