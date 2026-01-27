@@ -394,6 +394,77 @@ class UserProfileStore:
             self._init_table()
             print("[UserProfileStore] Cleared all profiles")
 
+    def get_relevant_profiles(
+        self,
+        query: str,
+        group_id: str = None,
+        top_k: int = 5
+    ) -> List[UserProfile]:
+        """
+        Search for profiles relevant to the query using semantic similarity.
+
+        This gives us "related entities" - people relevant to the current query,
+        similar to Zep's knowledge graph entities but simpler.
+
+        Args:
+            query: Search query
+            group_id: Optional group ID to filter by (requires filtering after search)
+            top_k: Number of profiles to return
+
+        Returns:
+            List of UserProfile objects most relevant to the query
+        """
+        if self.table.count_rows() == 0:
+            return []
+
+        # Generate query embedding
+        query_vector = self.embedding_model.encode_single(query, is_query=True)
+
+        # Vector search
+        search = self.table.search(query_vector.tolist())
+
+        # Apply agent filter
+        if self.agent_id:
+            search = search.where(f"agent_id = '{self.agent_id}'", prefilter=True)
+
+        # Get results
+        results = search.limit(top_k * 2).to_list()  # Get more for post-filtering
+
+        if not results:
+            return []
+
+        # Convert to profiles
+        profiles = [self._dict_to_profile(r) for r in results]
+
+        # Optional: Post-filter by group_id
+        # This requires checking which users have memories in the specified group
+        if group_id:
+            profiles = self._filter_profiles_by_group(profiles, group_id, top_k)
+
+        # Return top_k
+        return profiles[:top_k]
+
+    def _filter_profiles_by_group(
+        self,
+        profiles: List[UserProfile],
+        group_id: str,
+        top_k: int
+    ) -> List[UserProfile]:
+        """
+        Filter profiles to only include users who have memories in the specified group.
+
+        For simplicity, this skips the actual query and returns all profiles.
+        A full implementation would:
+        1. Query the user_memories table for the group_id
+        2. Extract unique user_ids
+        3. Filter profiles by universal_user_id
+
+        For now, we return profiles as-is since this is optional functionality.
+        """
+        # TODO: Implement group filtering by querying user_memories table
+        # For now, return all profiles (no filtering)
+        return profiles
+
     # ============================================================
     # Auto-Generation from Messages (a0x-models API)
     # ============================================================

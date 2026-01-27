@@ -288,6 +288,71 @@ class GroupProfileStore:
 
         return [UserInGroupProfile.model_validate_json(r["profile_data"]) for r in results]
 
+    def get_group_context(self, group_id: str) -> Dict[str, Any]:
+        """
+        Get comprehensive group context including profile and active users.
+
+        This is the equivalent of Zep's "group context" but richer:
+        - Group profile (culture, tone, topics)
+        - Top active users in the group
+        - User roles and participation levels
+
+        Args:
+            group_id: Group identifier
+
+        Returns:
+            Dict with:
+                - group_summary: str
+                - tone: str
+                - topics: list
+                - active_users: list of dicts with username, role, summary, participation_level
+        """
+        # Get group profile
+        group_profile = self.get_group_profile(group_id)
+
+        if not group_profile:
+            return {
+                "group_summary": f"Group {group_id}",
+                "tone": "casual",
+                "topics": [],
+                "active_users": []
+            }
+
+        # Get users in group, sorted by participation
+        users_in_group = self.get_users_in_group(group_id)
+
+        # Sort by total_messages (descending) to get most active users
+        users_in_group.sort(key=lambda u: u.total_messages_in_group, reverse=True)
+
+        # Take top 5-10 active users
+        top_active = users_in_group[:10]
+
+        # Format active users
+        active_users = []
+        for user_profile in top_active:
+            active_users.append({
+                "username": user_profile.username or user_profile.universal_user_id,
+                "universal_user_id": user_profile.universal_user_id,
+                "role": user_profile.role_in_group,
+                "summary": user_profile.summary,
+                "participation_level": user_profile.participation_level,
+                "expertise_in_group": user_profile.expertise_in_group,
+                "total_messages": user_profile.total_messages_in_group
+            })
+
+        return {
+            "group_summary": group_profile.summary,
+            "group_purpose": group_profile.group_purpose,
+            "tone": group_profile.tone.value if hasattr(group_profile.tone, 'value') else group_profile.tone,
+            "topics": group_profile.main_topics,
+            "expertise_level": group_profile.expertise_level,
+            "activity_level": group_profile.activity_level,
+            "communication_norms": group_profile.communication_norms,
+            "preferred_content_types": group_profile.preferred_content_types,
+            "member_count_estimate": group_profile.member_count_estimate,
+            "active_users": active_users
+        }
+
     # ============================================================
     # LLM-Based Profile Generation
     # ============================================================

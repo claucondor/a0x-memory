@@ -27,7 +27,7 @@ from utils.structured_schemas import (
 import config
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import dateparser
 import concurrent.futures
 import numpy as np
@@ -65,13 +65,19 @@ class HybridRetriever:
         max_reflection_rounds: int = 2,
         enable_parallel_retrieval: bool = True,
         max_retrieval_workers: int = 3,
-        cc_alpha: float = None
+        cc_alpha: float = None,
+        user_profile_store=None,  # UserProfileStore for entity lookups
+        group_profile_store=None  # GroupProfileStore for group context
     ):
         self.llm_client = llm_client
         self.unified_store = unified_store
 
         # Backward compatibility
         self.vector_store = unified_store
+
+        # Profile stores for lightweight entity system
+        self.user_profile_store = user_profile_store
+        self.group_profile_store = group_profile_store
 
         self.semantic_top_k = semantic_top_k or config.SEMANTIC_TOP_K
         self.keyword_top_k = keyword_top_k or config.KEYWORD_TOP_K
@@ -175,6 +181,10 @@ class HybridRetriever:
 
         if should_use_reflection:
             merged_results = self._retrieve_with_intelligent_reflection(query, merged_results, information_plan)
+
+        # Step 6.5: Apply temporal scoring before final rerank
+        if merged_results:
+            merged_results = self._apply_temporal_scoring(merged_results)
 
         # Final step: Rerank with cross-encoder
         if len(merged_results) > 10:
@@ -1102,6 +1112,9 @@ Return ONLY the JSON, no other text.
         user_id = context.get('user_id')
         is_group = group_id is not None and not group_id.startswith('dm_')
 
+        # Fetch conversation summary
+        conversation_summary = self._fetch_conversation_summary(group_id, user_id)
+
         # DM path: delegate to self.retrieve() which already has the full pipeline
         if not is_group or not self._supports_multi_table:
             results = self.retrieve(query)
@@ -1111,6 +1124,7 @@ Return ONLY the JSON, no other text.
                 "user_memories": [],
                 "interaction_memories": [],
                 "cross_group_memories": [],
+                "conversation_summary": conversation_summary,
                 "formatted_context": self._format_dm_context(results)
             }
 
@@ -1210,10 +1224,24 @@ Return ONLY the JSON, no other text.
         if all_cross_group_memories:
             all_cross_group_memories = self._deduplicate_by_content(all_cross_group_memories, "cross_group_memories")
 
+        print(f"[retrieve_for_context] Results (pre-temporal): group={len(all_group_memories)}, user={len(all_user_memories)}, "
+              f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}")
+
+        # Step 4.6: Apply temporal scoring (recency boost + decay)
+        # This is done BEFORE reranking so the cross-encoder sees temporally-adjusted scores
+        if all_group_memories:
+            all_group_memories = self._apply_temporal_scoring(all_group_memories)
+        if all_user_memories:
+            all_user_memories = self._apply_temporal_scoring(all_user_memories)
+        if all_interaction_memories:
+            all_interaction_memories = self._apply_temporal_scoring(all_interaction_memories)
+        if all_cross_group_memories:
+            all_cross_group_memories = self._apply_temporal_scoring(all_cross_group_memories)
+
         print(f"[retrieve_for_context] Results (pre-rerank): group={len(all_group_memories)}, user={len(all_user_memories)}, "
               f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}")
 
-        # Step 4.5: Rerank with a0x-models cross-encoder
+        # Step 4.7: Rerank with a0x-models cross-encoder
         rerank_top_k = limit_per_table
         all_group_memories = self._rerank_with_cross_encoder(query, all_group_memories, top_k=rerank_top_k)
         all_user_memories = self._rerank_with_cross_encoder(query, all_user_memories, top_k=rerank_top_k)
@@ -1233,11 +1261,37 @@ Return ONLY the JSON, no other text.
             "cross_group_memories": all_cross_group_memories
         }
 
+        # Step 6: Fetch relevant profiles and group context (lightweight entity system)
+        relevant_profiles = []
+        group_context = None
+
+        if self.user_profile_store:
+            try:
+                relevant_profiles = self.user_profile_store.get_relevant_profiles(
+                    query=query,
+                    group_id=group_id,
+                    top_k=5
+                )
+                if relevant_profiles:
+                    print(f"[retrieve_for_context] Found {len(relevant_profiles)} relevant user profiles")
+            except Exception as e:
+                print(f"[retrieve_for_context] Profile lookup failed: {e}")
+
+        if self.group_profile_store and group_id:
+            try:
+                group_context = self.group_profile_store.get_group_context(group_id)
+                print(f"[retrieve_for_context] Retrieved group context for {group_id}")
+            except Exception as e:
+                print(f"[retrieve_for_context] Group context lookup failed: {e}")
+
         formatted = self._format_multi_table_context(raw_results, context)
 
         return {
             **raw_results,
-            "formatted_context": formatted
+            "formatted_context": formatted,
+            "conversation_summary": conversation_summary,
+            "relevant_profiles": relevant_profiles,
+            "group_context": group_context
         }
 
     def _apply_group_keyword_boost(
@@ -1447,6 +1501,115 @@ Return ONLY the JSON, no other text.
             print(f"[rerank] a0x-models rerank failed, keeping original order: {e}")
             return items[:top_k]
 
+    def _apply_temporal_scoring(
+        self,
+        items: list,
+        recency_boost: float = 0.2,
+        decay_days: int = 30
+    ) -> list:
+        """
+        Apply temporal scoring (recency boost + decay) to memory items.
+
+        Adjusts importance_score based on memory age:
+        - < 7 days old: boost importance_score by +recency_boost (like Zep's +0.2)
+        - 7-30 days: no change
+        - 30-90 days: multiply importance_score by 0.8
+        - > 90 days: multiply importance_score by 0.5
+
+        Uses last_seen or first_seen field (available on all memory models).
+        This is READ-side only - doesn't modify stored importance_score.
+
+        Args:
+            items: List of memory objects with importance_score and timestamps
+            recency_boost: Boost amount for recent memories (default 0.2)
+            decay_days: Threshold for decay (default 30 days)
+
+        Returns:
+            List of items with adjusted importance_score (temporary, in-memory only)
+        """
+        if not items:
+            return items
+
+        now = datetime.now(timezone.utc)
+        scored_items = []
+
+        for item in items:
+            # Get the base importance_score
+            base_score = getattr(item, 'importance_score', 0.5)
+
+            # Get timestamp - try last_seen first, then first_seen, then timestamp
+            memory_time = None
+            for field in ['last_seen', 'first_seen', 'timestamp']:
+                if hasattr(item, field):
+                    ts = getattr(item, field)
+                    if ts:
+                        try:
+                            # Parse ISO timestamp
+                            memory_time = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                            # Ensure it's timezone-aware
+                            if memory_time.tzinfo is None:
+                                memory_time = memory_time.replace(tzinfo=timezone.utc)
+                            break
+                        except (ValueError, AttributeError):
+                            continue
+
+            if memory_time is None:
+                # No valid timestamp found, keep original score as dict
+                scored_items.append({
+                    'item': item,
+                    'temporal_score': getattr(item, 'importance_score', 0.5),
+                    'base_score': getattr(item, 'importance_score', 0.5),
+                    'age_days': 0
+                })
+                continue
+
+            # Calculate age in days
+            age_days = (now - memory_time).days
+
+            # Apply temporal adjustment
+            if age_days < 7:
+                # Boost recent memories
+                adjusted_score = min(1.0, base_score + recency_boost)
+            elif age_days < 30:
+                # No change for memories 7-30 days old
+                adjusted_score = base_score
+            elif age_days < 90:
+                # Decay memories 30-90 days old
+                adjusted_score = base_score * 0.8
+            else:
+                # Heavy decay for memories > 90 days old
+                adjusted_score = base_score * 0.5
+
+            # Create a wrapper with adjusted score (temporary)
+            # Use a dict to avoid modifying the original object
+            scored_items.append({
+                'item': item,
+                'temporal_score': adjusted_score,
+                'base_score': base_score,
+                'age_days': age_days
+            })
+
+        # Sort by temporally-adjusted score
+        scored_items.sort(key=lambda x: x['temporal_score'], reverse=True)
+
+        # Return original items in new order
+        return [x['item'] for x in scored_items]
+
+    def _apply_decay_to_results(self, items: list) -> list:
+        """
+        Re-sort items by temporally-adjusted importance_score.
+
+        This is a convenience method that applies temporal scoring and returns
+        the sorted list. Use this when you want the final sorted results.
+
+        Args:
+            items: List of memory objects
+
+        Returns:
+            List sorted by temporally-adjusted importance_score
+        """
+        return self._apply_temporal_scoring(items)
+
     def _format_dm_context(self, memories: List[MemoryEntry]) -> str:
         """Format DM memories as context string."""
         if not memories:
@@ -1590,3 +1753,44 @@ Return ONLY the JSON, no other text.
         ]
 
         return profile
+
+    def _fetch_conversation_summary(
+        self,
+        group_id: Optional[str],
+        user_id: Optional[str]
+    ) -> str:
+        """
+        Fetch conversation summary for a thread.
+
+        Args:
+            group_id: Group ID (None for DMs)
+            user_id: User ID
+
+        Returns:
+            Summary text (empty if not exists)
+        """
+        if not self._supports_multi_table or not hasattr(self.unified_store, 'get_or_create_summary'):
+            return ""
+
+        try:
+            # Construct thread_id format matches unified_store
+            # For DMs: "{agent_id}_dm_{user_id}"
+            # For groups: "{agent_id}_group_{group_id}"
+            agent_id = getattr(self.unified_store, 'agent_id', 'default')
+
+            if group_id is None or group_id.startswith('dm_'):
+                # DM - extract user_id if needed
+                effective_user_id = user_id
+                if group_id and group_id.startswith('dm_'):
+                    effective_user_id = group_id.replace('dm_', '', 1)
+                if not effective_user_id:
+                    return ""
+                thread_id = f"{agent_id}_dm_{effective_user_id}"
+            else:
+                # Group
+                thread_id = f"{agent_id}_group_{group_id}"
+
+            return self.unified_store.get_or_create_summary(thread_id)
+        except Exception as e:
+            print(f"[_fetch_conversation_summary] Error: {e}")
+            return ""

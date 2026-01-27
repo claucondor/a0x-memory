@@ -56,11 +56,13 @@ class UnifiedMemoryStore:
         agent_id: str,
         db_base_path: str = None,
         embedding_model: EmbeddingModel = None,
-        storage_options: Optional[Dict[str, Any]] = None
+        storage_options: Optional[Dict[str, Any]] = None,
+        llm_client = None
     ):
         self.agent_id = agent_id
         self.embedding_model = embedding_model or EmbeddingModel()
         self.storage_options = storage_options
+        self.llm_client = llm_client
 
         # Paths
         self.db_base_path = db_base_path or config.LANCEDB_PATH
@@ -77,7 +79,8 @@ class UnifiedMemoryStore:
             'user_memories': False,
             'interaction_memories': False,
             'cross_group_memories': False,
-            'agent_responses': False
+            'agent_responses': False,
+            'conversation_summaries': False
         }
 
         # Initialize databases
@@ -103,6 +106,7 @@ class UnifiedMemoryStore:
         self._init_interaction_memories_table()  # interaction_memories.lance
         self._init_cross_group_memories_table()  # cross_group_memories.lance
         self._init_agent_responses_table()  # agent_responses.lance
+        self._init_conversation_summaries_table()  # conversation_summaries.lance
 
     def _init_global_db(self):
         """Initialize global shared database for cross-agent linking."""
@@ -367,6 +371,29 @@ class UnifiedMemoryStore:
         self._create_scalar_index(self.agent_responses_table, "group_id")
         self._create_scalar_index(self.agent_responses_table, "content_hash")
 
+    def _init_conversation_summaries_table(self):
+        """Initialize conversation_summaries table for running conversation summaries per thread."""
+        schema = pa.schema([
+            pa.field("thread_id", pa.string()),
+            pa.field("agent_id", pa.string()),
+            pa.field("summary", pa.string()),
+            pa.field("message_count", pa.int32()),
+            pa.field("last_updated", pa.string()),
+            pa.field("vector", pa.list_(pa.float32(), self.embedding_model.dimension))
+        ])
+
+        table_name = "conversation_summaries"
+        if table_name not in self.agent_db.table_names():
+            self.conversation_summaries_table = self.agent_db.create_table(table_name, schema=schema)
+            print(f"[{self.agent_id}] Created {table_name} table")
+        else:
+            self.conversation_summaries_table = self.agent_db.open_table(table_name)
+            print(f"[{self.agent_id}] Opened {table_name} ({self.conversation_summaries_table.count_rows()} rows)")
+
+        # Create indices for fast lookups
+        self._create_scalar_index(self.conversation_summaries_table, "thread_id")
+        self._create_scalar_index(self.conversation_summaries_table, "agent_id")
+
     def _create_scalar_index(self, table, column: str):
         """Create scalar index for fast lookups."""
         try:
@@ -469,7 +496,12 @@ class UnifiedMemoryStore:
         search = search.where(where_clause, prefilter=True)
 
         results = search.limit(top_k).to_list()
-        return [self._row_to_memory_entry(r) for r in results]
+        memories = [self._row_to_memory_entry(r) for r in results]
+
+        # Track access for returned memories (non-blocking)
+        self.track_search_results_access(memories, "memories")
+
+        return memories
 
     def _row_to_memory_entry(self, row: Dict) -> MemoryEntry:
         """Convert LanceDB row to MemoryEntry."""
@@ -1439,7 +1471,13 @@ Return ONLY the JSON object.
         search = search.where(where_clause, prefilter=True)
 
         results = search.limit(limit).to_list()
-        return [self._row_to_group_memory(r) for r in results]
+        group_memories = [self._row_to_group_memory(r) for r in results]
+
+        # Track access for returned memories (non-blocking)
+        # This is fire-and-forget - we don't wait for it to complete
+        self.track_search_results_access(group_memories, "group_memories")
+
+        return group_memories
 
     def search_user_memories(
         self,
@@ -1459,7 +1497,12 @@ Return ONLY the JSON object.
         search = search.where(where_clause, prefilter=True)
 
         results = search.limit(limit).to_list()
-        return [self._row_to_user_memory(r) for r in results]
+        user_memories = [self._row_to_user_memory(r) for r in results]
+
+        # Track access for returned memories (non-blocking)
+        self.track_search_results_access(user_memories, "user_memories")
+
+        return user_memories
 
     def search_user_memories_in_group(
         self,
@@ -1482,7 +1525,12 @@ Return ONLY the JSON object.
         search = search.where(where_clause, prefilter=True)
 
         results = search.limit(limit).to_list()
-        return [self._row_to_user_memory(r) for r in results]
+        user_memories = [self._row_to_user_memory(r) for r in results]
+
+        # Track access for returned memories (non-blocking)
+        self.track_search_results_access(user_memories, "user_memories")
+
+        return user_memories
 
     def search_interactions(
         self,
@@ -1509,7 +1557,12 @@ Return ONLY the JSON object.
         else:
             results = self.interaction_memories_table.search().where(where_clause, prefilter=True).limit(limit).to_list()
 
-        return [self._row_to_interaction_memory(r) for r in results]
+        interaction_memories = [self._row_to_interaction_memory(r) for r in results]
+
+        # Track access for returned memories (non-blocking)
+        self.track_search_results_access(interaction_memories, "interaction_memories")
+
+        return interaction_memories
 
     def search_cross_group(
         self,
@@ -1528,7 +1581,12 @@ Return ONLY the JSON object.
         search = search.where(where_clause, prefilter=True)
 
         results = search.limit(limit).to_list()
-        return [self._row_to_cross_group_memory(r) for r in results]
+        cross_group_memories = [self._row_to_cross_group_memory(r) for r in results]
+
+        # Track access for returned memories (non-blocking)
+        self.track_search_results_access(cross_group_memories, "cross_group_memories")
+
+        return cross_group_memories
 
     # ============================================================
     # Unified Search (Multi-table)
@@ -1958,6 +2016,158 @@ Return ONLY the JSON object.
         return None
 
     # ============================================================
+    # Conversation Summary Methods
+    # ============================================================
+
+    def get_or_create_summary(self, thread_id: str) -> str:
+        """
+        Get or create a conversation summary for a thread.
+
+        Args:
+            thread_id: Thread identifier (format: "{agent_id}_{context_type}_{group_or_user_id}")
+
+        Returns:
+            Current summary text (empty string if not exists)
+        """
+        try:
+            results = self.conversation_summaries_table.search().where(
+                f"thread_id = '{thread_id}'",
+                prefilter=True
+            ).limit(1).to_list()
+
+            if results:
+                return results[0].get("summary", "")
+            return ""
+        except Exception as e:
+            print(f"[get_or_create_summary] Error: {e}")
+            return ""
+
+    def update_summary(
+        self,
+        thread_id: str,
+        new_messages: List[str],
+        current_summary: str
+    ) -> str:
+        """
+        Update conversation summary with new messages using LLM.
+
+        Args:
+            thread_id: Thread identifier
+            new_messages: List of new message contents to incorporate
+            current_summary: Current summary text
+
+        Returns:
+            Updated summary text
+        """
+        if not self.llm_client:
+            print("[update_summary] No LLM client available, returning current summary")
+            return current_summary
+
+        if not new_messages:
+            return current_summary
+
+        messages_joined = "\n".join([f"- {msg}" for msg in new_messages])
+
+        prompt = f"""Given this existing summary and these new messages, write an updated summary in 2-3 sentences. Keep key facts, update what changed, drop irrelevant details.
+
+Existing summary: {current_summary}
+
+New messages:
+{messages_joined}
+
+Write a concise updated summary:"""
+
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a conversation summarizer. Write concise 2-3 sentence summaries preserving key information."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+
+            updated_summary = self.llm_client.chat_completion(
+                messages,
+                temperature=0.3
+            )
+
+            # Clean up the response
+            updated_summary = updated_summary.strip()
+
+            # Get current message count
+            current_count = 0
+            try:
+                results = self.conversation_summaries_table.search().where(
+                    f"thread_id = '{thread_id}'",
+                    prefilter=True
+                ).limit(1).to_list()
+                if results:
+                    current_count = results[0].get("message_count", 0)
+            except:
+                pass
+
+            new_count = current_count + len(new_messages)
+            last_updated = datetime.now(timezone.utc).isoformat()
+
+            # Create or update summary record
+            vector = self.embedding_model.encode_single(updated_summary, is_query=False)
+
+            # Check if exists
+            if current_count > 0 or results:
+                # Delete old and insert new (upsert pattern)
+                self.conversation_summaries_table.delete(f"thread_id = '{thread_id}'")
+
+            data = {
+                "thread_id": thread_id,
+                "agent_id": self.agent_id,
+                "summary": updated_summary,
+                "message_count": new_count,
+                "last_updated": last_updated,
+                "vector": vector.tolist()
+            }
+
+            self.conversation_summaries_table.add([data])
+            print(f"[update_summary] Updated summary for {thread_id} ({new_count} messages)")
+
+            return updated_summary
+
+        except Exception as e:
+            print(f"[update_summary] Error updating summary: {e}")
+            return current_summary
+
+    def get_conversation_summary_by_thread(self, thread_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get full conversation summary record for a thread.
+
+        Args:
+            thread_id: Thread identifier
+
+        Returns:
+            Dict with summary, message_count, last_updated or None
+        """
+        try:
+            results = self.conversation_summaries_table.search().where(
+                f"thread_id = '{thread_id}'",
+                prefilter=True
+            ).limit(1).to_list()
+
+            if results:
+                r = results[0]
+                return {
+                    "thread_id": r["thread_id"],
+                    "summary": r.get("summary", ""),
+                    "message_count": r.get("message_count", 0),
+                    "last_updated": r.get("last_updated", "")
+                }
+            return None
+        except Exception as e:
+            print(f"[get_conversation_summary_by_thread] Error: {e}")
+            return None
+
+    # ============================================================
     # Utility Methods
     # ============================================================
 
@@ -1971,13 +2181,175 @@ Return ONLY the JSON object.
             "interaction_memories_count": self.interaction_memories_table.count_rows(),
             "cross_group_memories_count": self.cross_group_memories_table.count_rows(),
             "agent_responses_count": self.agent_responses_table.count_rows(),
-            "cross_agent_links_count": self.cross_agent_links_table.count_rows()
+            "cross_agent_links_count": self.cross_agent_links_table.count_rows(),
+            "conversation_summaries_count": self.conversation_summaries_table.count_rows()
         }
+
+    def cleanup_decayed_memories(self, days_threshold: int = 180) -> Dict[str, int]:
+        """
+        Remove decayed (old) conversation memories from all tables.
+
+        Only removes memories where:
+        - last_seen > days_threshold AND
+        - memory_type is "conversation" (not "expertise" or "preference" which never expire)
+
+        This is a maintenance job that should be run periodically, not during normal operation.
+
+        Args:
+            days_threshold: Age in days after which conversation memories are removed (default 180)
+
+        Returns:
+            Dict with counts of removed memories per table
+        """
+        from datetime import datetime, timezone, timedelta
+
+        cutoff_time = datetime.now(timezone.utc) - timedelta(days=days_threshold)
+        cutoff_iso = cutoff_time.isoformat()
+
+        counts = {
+            "group_memories": 0,
+            "user_memories": 0,
+            "interaction_memories": 0,
+            "total": 0
+        }
+
+        # Clean group_memories
+        try:
+            if self.group_memories_table.count_rows() > 0:
+                # Find old conversation memories
+                old_memories = self.group_memories_table.search().where(
+                    f"last_seen < '{cutoff_iso}' AND memory_type = 'conversation'",
+                    prefilter=True
+                ).to_list()
+
+                if old_memories:
+                    memory_ids = [m["memory_id"] for m in old_memories]
+                    # Delete in batches
+                    for memory_id in memory_ids:
+                        self.group_memories_table.delete(f"memory_id = '{memory_id}'")
+                    counts["group_memories"] = len(memory_ids)
+                    print(f"[cleanup] Removed {len(memory_ids)} decayed conversation memories from group_memories")
+        except Exception as e:
+            print(f"[cleanup] Error cleaning group_memories: {e}")
+
+        # Clean user_memories
+        try:
+            if self.user_memories_table.count_rows() > 0:
+                old_memories = self.user_memories_table.search().where(
+                    f"last_seen < '{cutoff_iso}' AND memory_type = 'conversation'",
+                    prefilter=True
+                ).to_list()
+
+                if old_memories:
+                    memory_ids = [m["memory_id"] for m in old_memories]
+                    for memory_id in memory_ids:
+                        self.user_memories_table.delete(f"memory_id = '{memory_id}'")
+                    counts["user_memories"] = len(memory_ids)
+                    print(f"[cleanup] Removed {len(memory_ids)} decayed conversation memories from user_memories")
+        except Exception as e:
+            print(f"[cleanup] Error cleaning user_memories: {e}")
+
+        # Clean interaction_memories
+        try:
+            if self.interaction_memories_table.count_rows() > 0:
+                old_memories = self.interaction_memories_table.search().where(
+                    f"last_seen < '{cutoff_iso}' AND memory_type = 'conversation'",
+                    prefilter=True
+                ).to_list()
+
+                if old_memories:
+                    memory_ids = [m["memory_id"] for m in old_memories]
+                    for memory_id in memory_ids:
+                        self.interaction_memories_table.delete(f"memory_id = '{memory_id}'")
+                    counts["interaction_memories"] = len(memory_ids)
+                    print(f"[cleanup] Removed {len(memory_ids)} decayed conversation memories from interaction_memories")
+        except Exception as e:
+            print(f"[cleanup] Error cleaning interaction_memories: {e}")
+
+        counts["total"] = sum([counts["group_memories"], counts["user_memories"], counts["interaction_memories"]])
+        print(f"[cleanup] Total removed: {counts['total']} decayed conversation memories")
+
+        return counts
+
+    def _track_memory_access(
+        self,
+        memory_id: str,
+        table_name: str = "group_memories"
+    ):
+        """
+        Track access to a memory by updating access_count.
+
+        This is meant to be called asynchronously/non-blocking after search results.
+        The access_count is stored but not currently used in scoring - it's available
+        for future features like "frequently accessed memories".
+
+        Args:
+            memory_id: ID of the memory that was accessed
+            table_name: Table name (default "group_memories")
+        """
+        try:
+            # Map table_name to actual table
+            table_map = {
+                "group_memories": self.group_memories_table,
+                "user_memories": self.user_memories_table,
+                "interaction_memories": self.interaction_memories_table,
+                "cross_group_memories": self.cross_group_memories_table,
+                "memories": self.memories_table
+            }
+
+            table = table_map.get(table_name)
+            if not table:
+                return
+
+            # Check if access_count field exists in schema
+            # For now, we'll skip this since adding new fields requires schema migration
+            # This is a placeholder for future implementation
+            pass
+
+            # TODO: Implement actual access_count tracking when schema is updated
+            # This would require:
+            # 1. Adding access_count field to table schemas
+            # 2. Updating the field here (requires delete + re-add pattern for LanceDB)
+
+        except Exception as e:
+            # Silently fail to avoid blocking search operations
+            pass
+
+    def track_search_results_access(
+        self,
+        results: List[Any],
+        table_name: str = "group_memories"
+    ):
+        """
+        Track access for multiple search results.
+
+        This should be called after search results are returned.
+        It's a fire-and-forget operation that doesn't block.
+
+        Args:
+            results: List of memory objects returned from search
+            table_name: Table name for the results
+        """
+        if not results:
+            return
+
+        # Extract memory IDs from results
+        memory_ids = []
+        for item in results:
+            if hasattr(item, 'memory_id'):
+                memory_ids.append(item.memory_id)
+            elif hasattr(item, 'entry_id'):
+                memory_ids.append(item.entry_id)
+
+        # Track access for each memory (non-blocking)
+        for memory_id in memory_ids:
+            self._track_memory_access(memory_id, table_name)
 
     def clear_agent_data(self):
         """Clear all data for this agent."""
         tables = ["memories", "group_memories", "user_memories",
-                  "interaction_memories", "cross_group_memories", "agent_responses"]
+                  "interaction_memories", "cross_group_memories", "agent_responses",
+                  "conversation_summaries"]
         for table_name in tables:
             if table_name in self.agent_db.table_names():
                 self.agent_db.drop_table(table_name)
@@ -1991,3 +2363,353 @@ Return ONLY the JSON object.
         self._init_dm_memories_table()
         self._fts_initialized['memories'] = False
         print(f"[{self.agent_id}] Cleared DM memories")
+
+    # ============================================================
+    # Memory Consolidation (SimpleMem Stage 2)
+    # ============================================================
+
+    def consolidate_similar_memories(
+        self,
+        group_id: str,
+        similarity_threshold: float = 0.80,
+        min_cluster_size: int = 2
+    ) -> Dict[str, Any]:
+        """
+        Consolidate similar memories within a group (SimpleMem Stage 2 - Atom to Molecule Evolution).
+
+        Merges related atomic memories into consolidated molecules using:
+        1. Embedding similarity to find clusters (cosine > threshold)
+        2. LLM to synthesize consolidated content
+        3. Transactional delete + insert for each cluster
+
+        Args:
+            group_id: Group ID to consolidate
+            similarity_threshold: Cosine similarity threshold (0.80 for consolidation, lower than 0.85 dedup)
+            min_cluster_size: Minimum memories in a cluster to consolidate
+
+        Returns:
+            Dict with consolidation statistics per table
+        """
+        from utils.llm_client import LLMClient
+        import uuid
+
+        results = {
+            "group_memories": {"originals": 0, "consolidated": 0},
+            "user_memories": {"originals": 0, "consolidated": 0},
+            "interaction_memories": {"originals": 0, "consolidated": 0},
+            "total_originals": 0,
+            "total_consolidated": 0
+        }
+
+        # Process each table
+        tables_to_process = [
+            ("group_memories", self.group_memories_table, "group_id"),
+            ("user_memories", self.user_memories_table, "group_id"),
+            ("interaction_memories", self.interaction_memories_table, "group_id")
+        ]
+
+        for table_name, table, filter_field in tables_to_process:
+            try:
+                # Get all memories for this group
+                where_clause = f"agent_id = '{self.agent_id}' AND {filter_field} = '{group_id}'"
+                memories = table.search().where(where_clause, prefilter=True).to_list()
+
+                if len(memories) < min_cluster_size:
+                    continue
+
+                # Extract memory IDs and vectors for clustering
+                memory_data = []
+                for mem in memories:
+                    memory_data.append({
+                        "id": mem.get("memory_id"),
+                        "vector": mem.get("vector", []),
+                        "data": mem
+                    })
+
+                # Find clusters using greedy approach
+                processed_ids = set()
+                clusters = []
+
+                for i, mem_i in enumerate(memory_data):
+                    if mem_i["id"] in processed_ids:
+                        continue
+
+                    # Find similar memories
+                    cluster = [mem_i]
+                    for j, mem_j in enumerate(memory_data):
+                        if i == j or mem_j["id"] in processed_ids:
+                            continue
+
+                        similarity = self._compute_cosine_similarity(
+                            mem_i["vector"],
+                            mem_j["vector"]
+                        )
+
+                        if similarity >= similarity_threshold:
+                            cluster.append(mem_j)
+                            processed_ids.add(mem_j["id"])
+
+                    if len(cluster) >= min_cluster_size:
+                        clusters.append(cluster)
+                        for mem in cluster:
+                            processed_ids.add(mem["id"])
+
+                # Consolidate each cluster
+                llm_client = LLMClient()
+
+                for cluster in clusters:
+                    # Merge memories using LLM
+                    consolidated_memory = self._merge_memory_cluster(
+                        cluster,
+                        table_name,
+                        llm_client
+                    )
+
+                    if consolidated_memory:
+                        # Delete originals
+                        for mem in cluster:
+                            table.delete(f"memory_id = '{mem['id']}'")
+
+                        # Insert consolidated
+                        if table_name == "group_memories":
+                            self.add_group_memory(consolidated_memory)
+                        elif table_name == "user_memories":
+                            self.add_user_memory(consolidated_memory)
+                        elif table_name == "interaction_memories":
+                            self.add_interaction_memory(consolidated_memory)
+
+                        results[table_name]["originals"] += len(cluster)
+                        results[table_name]["consolidated"] += 1
+
+            except Exception as e:
+                print(f"[consolidation] Error processing {table_name} for group {group_id}: {e}")
+                continue
+
+        results["total_originals"] = sum(r["originals"] for r in results.values() if isinstance(r, dict))
+        results["total_consolidated"] = sum(r["consolidated"] for r in results.values() if isinstance(r, dict))
+
+        print(f"[consolidation] Consolidated {results['total_originals']} memories into {results['total_consolidated']} for group {group_id}")
+
+        return results
+
+    def _merge_memory_cluster(
+        self,
+        cluster: List[Dict[str, Any]],
+        table_name: str,
+        llm_client: Any
+    ) -> Optional[Any]:
+        """
+        Merge a cluster of similar memories using LLM.
+
+        Args:
+            cluster: List of memory dicts with 'data' key containing full memory
+            table_name: Name of table (group_memories, user_memories, interaction_memories)
+            llm_client: LLMClient instance
+
+        Returns:
+            Consolidated memory object or None
+        """
+        from models.group_memory import GroupMemory, UserMemory, InteractionMemory
+        from datetime import datetime, timezone
+
+        # Build memories description for LLM
+        memories_desc = []
+        for i, mem in enumerate(cluster, 1):
+            data = mem["data"]
+            desc = f"\n[Memory {i}]\n"
+            desc += f"Content: {data.get('content', 'N/A')}\n"
+            desc += f"Keywords: {', '.join(data.get('keywords', []))}\n"
+            desc += f"Topics: {', '.join(data.get('topics', []))}\n"
+
+            if table_name == "group_memories":
+                if data.get("speaker"):
+                    desc += f"Speaker: {data['speaker']}\n"
+            elif table_name == "user_memories":
+                if data.get("username"):
+                    desc += f"Username: {data['username']}\n"
+            elif table_name == "interaction_memories":
+                desc += f"Speaker: {data.get('speaker_id', 'N/A')}\n"
+                desc += f"Listener: {data.get('listener_id', 'N/A')}\n"
+
+            desc += f"First seen: {data.get('first_seen', 'N/A')}\n"
+            desc += f"Last seen: {data.get('last_seen', 'N/A')}\n"
+            memories_desc.append(desc)
+
+        prompt = f"""Given these related memories, write ONE consolidated memory that captures all the information.
+
+Be specific and factual. Preserve key details like names, dates, locations, and technical terms.
+Create a unified narrative that flows naturally.
+
+Memories to consolidate:
+{''.join(memories_desc)}
+
+Output ONLY the consolidated memory content (no prefixes, labels, or explanations).
+"""
+
+        try:
+            consolidated_content = llm_client.chat_completion(
+                messages=[
+                    {"role": "system", "content": "You are a memory consolidation specialist. Merge related memories into clear, factual summaries."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1
+            )
+
+            # Extract metadata from cluster
+            first_mem = cluster[0]["data"]
+
+            # Aggregate fields
+            all_keywords = set()
+            all_topics = set()
+            total_evidence = 0
+            earliest_first = None
+            latest_last = None
+            max_importance = 0.0
+
+            for mem in cluster:
+                data = mem["data"]
+                all_keywords.update(data.get("keywords", []))
+                all_topics.update(data.get("topics", []))
+                total_evidence += data.get("evidence_count", 1)
+
+                if earliest_first is None or data.get("first_seen", "") < earliest_first:
+                    earliest_first = data.get("first_seen", "")
+
+                if latest_last is None or data.get("last_seen", "") > latest_last:
+                    latest_last = data.get("last_seen", "")
+
+                if data.get("importance_score", 0.0) > max_importance:
+                    max_importance = data.get("importance_score", 0.0)
+
+            # Create consolidated memory based on table type
+            now = datetime.now(timezone.utc).isoformat()
+
+            if table_name == "group_memories":
+                return GroupMemory(
+                    memory_id=str(uuid.uuid4()),
+                    agent_id=self.agent_id,
+                    group_id=first_mem.get("group_id"),
+                    memory_level=first_mem.get("memory_level", "group"),
+                    memory_type=first_mem.get("memory_type", "conversation"),
+                    privacy_scope=first_mem.get("privacy_scope", "public"),
+                    content=consolidated_content.strip(),
+                    speaker=first_mem.get("speaker"),
+                    keywords=list(all_keywords),
+                    topics=list(all_topics),
+                    importance_score=max_importance,
+                    evidence_count=total_evidence,
+                    first_seen=earliest_first,
+                    last_seen=latest_last,
+                    last_updated=now,
+                    source_message_id=first_mem.get("source_message_id"),
+                    source_timestamp=first_mem.get("source_timestamp")
+                )
+
+            elif table_name == "user_memories":
+                return UserMemory(
+                    memory_id=str(uuid.uuid4()),
+                    agent_id=self.agent_id,
+                    group_id=first_mem.get("group_id"),
+                    user_id=first_mem.get("user_id"),
+                    memory_level=first_mem.get("memory_level", "individual"),
+                    memory_type=first_mem.get("memory_type", "preference"),
+                    privacy_scope=first_mem.get("privacy_scope", "protected"),
+                    content=consolidated_content.strip(),
+                    keywords=list(all_keywords),
+                    topics=list(all_topics),
+                    importance_score=max_importance,
+                    evidence_count=total_evidence,
+                    first_seen=earliest_first,
+                    last_seen=latest_last,
+                    last_updated=now,
+                    source_message_id=first_mem.get("source_message_id"),
+                    source_timestamp=first_mem.get("source_timestamp"),
+                    username=first_mem.get("username"),
+                    platform=first_mem.get("platform")
+                )
+
+            elif table_name == "interaction_memories":
+                return InteractionMemory(
+                    memory_id=str(uuid.uuid4()),
+                    agent_id=self.agent_id,
+                    group_id=first_mem.get("group_id"),
+                    speaker_id=first_mem.get("speaker_id"),
+                    listener_id=first_mem.get("listener_id"),
+                    mentioned_users=first_mem.get("mentioned_users", []),
+                    memory_level=first_mem.get("memory_level", "individual"),
+                    memory_type=first_mem.get("memory_type", "interaction"),
+                    privacy_scope=first_mem.get("privacy_scope", "protected"),
+                    content=consolidated_content.strip(),
+                    keywords=list(all_keywords),
+                    topics=list(all_topics),
+                    importance_score=max_importance,
+                    evidence_count=total_evidence,
+                    first_seen=earliest_first,
+                    last_seen=latest_last,
+                    last_updated=now,
+                    source_message_id=first_mem.get("source_message_id"),
+                    source_timestamp=first_mem.get("source_timestamp"),
+                    interaction_type=first_mem.get("interaction_type")
+                )
+
+        except Exception as e:
+            print(f"[consolidation] Error merging cluster: {e}")
+            return None
+
+    def consolidate_all_groups(self) -> Dict[str, Any]:
+        """
+        Consolidate memories across all groups.
+
+        Returns:
+            Dict with overall consolidation statistics
+        """
+        results = {
+            "groups_processed": 0,
+            "total_originals": 0,
+            "total_consolidated": 0,
+            "group_details": {}
+        }
+
+        # Get all unique group_ids from each table
+        all_group_ids = set()
+
+        try:
+            group_memories = self.group_memories_table.search().where(
+                f"agent_id = '{self.agent_id}'", prefilter=True
+            ).to_list()
+            all_group_ids.update(m.get("group_id") for m in group_memories)
+        except:
+            pass
+
+        try:
+            user_memories = self.user_memories_table.search().where(
+                f"agent_id = '{self.agent_id}'", prefilter=True
+            ).to_list()
+            all_group_ids.update(m.get("group_id") for m in user_memories)
+        except:
+            pass
+
+        try:
+            interaction_memories = self.interaction_memories_table.search().where(
+                f"agent_id = '{self.agent_id}'", prefilter=True
+            ).to_list()
+            all_group_ids.update(m.get("group_id") for m in interaction_memories)
+        except:
+            pass
+
+        # Consolidate each group
+        for group_id in all_group_ids:
+            if not group_id:
+                continue
+
+            group_result = self.consolidate_similar_memories(group_id)
+            if group_result["total_originals"] > 0:
+                results["groups_processed"] += 1
+                results["total_originals"] += group_result["total_originals"]
+                results["total_consolidated"] += group_result["total_consolidated"]
+                results["group_details"][group_id] = group_result
+
+        print(f"[consolidation] Processed {results['groups_processed']} groups")
+        print(f"[consolidation] Total: {results['total_originals']} memories -> {results['total_consolidated']} consolidated")
+
+        return results

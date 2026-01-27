@@ -118,7 +118,8 @@ class SimpleMemSystem:
             self.unified_store = UnifiedMemoryStore(
                 agent_id=self.agent_id,
                 db_base_path=db_path or config.LANCEDB_PATH,
-                embedding_model=self.embedding_model
+                embedding_model=self.embedding_model,
+                llm_client=self.llm_client
             )
             # Expose as vector_store for backward compatibility
             self.vector_store = self.unified_store
@@ -188,6 +189,10 @@ class SimpleMemSystem:
             embedding_model=self.embedding_model,
             agent_id=self.agent_id
         )
+
+        # Pass profile stores to hybrid_retriever for lightweight entity system
+        self.hybrid_retriever.user_profile_store = self.user_profile_store
+        self.hybrid_retriever.group_profile_store = self.group_profile_store
 
         print("\nSystem initialization complete!")
         print("=" * 60)
@@ -427,6 +432,13 @@ class SimpleMemSystem:
         result["memories_created"] = processing_result.get("total", 0)
         result["processing_details"] = processing_result
 
+        # Update conversation summary after batch processing
+        self._update_conversation_summary(
+            effective_group_id=effective_group_id,
+            original_group_id=original_group_id,
+            unprocessed=unprocessed
+        )
+
         # Auto-generate profiles after batch processing
         self._generate_all_profiles(
             unprocessed=unprocessed,
@@ -645,6 +657,77 @@ class SimpleMemSystem:
             ).limit(500).to_list().__len__()
         except:
             return 0
+
+    def _update_conversation_summary(
+        self,
+        effective_group_id: str,
+        original_group_id: Optional[str],
+        unprocessed: List[Dict]
+    ):
+        """
+        Update conversation summary after batch processing.
+
+        This is called AFTER ingestion completes, never blocking the response path.
+
+        Args:
+            effective_group_id: Group ID (with dm_ prefix for DMs)
+            original_group_id: Original group ID (None for DMs)
+            unprocessed: List of processed message dicts
+        """
+        if not unprocessed:
+            return
+
+        # Determine thread_id format
+        # For DMs: "{agent_id}_dm_{user_id}"
+        # For groups: "{agent_id}_group_{group_id}"
+        if original_group_id is None:
+            # DM - extract user_id from effective_group_id (format: "dm_{user_id}")
+            user_id = effective_group_id.replace("dm_", "", 1) if effective_group_id.startswith("dm_") else effective_group_id
+            thread_id = f"{self.agent_id}_dm_{user_id}"
+        else:
+            # Group
+            thread_id = f"{self.agent_id}_group_{original_group_id}"
+
+        # Get current summary
+        current_summary = self.unified_store.get_or_create_summary(thread_id)
+
+        # Extract message contents
+        new_messages = [msg.get('content', '') for msg in unprocessed if msg.get('content')]
+
+        if new_messages:
+            # Update summary (non-blocking, happens in background)
+            try:
+                self.unified_store.update_summary(thread_id, new_messages, current_summary)
+            except Exception as e:
+                print(f"[SimpleMemSystem] Error updating conversation summary: {e}")
+
+    def get_conversation_summary(
+        self,
+        group_id: Optional[str] = None,
+        user_id: Optional[str] = None
+    ) -> str:
+        """
+        Get the current conversation summary for a thread.
+
+        Args:
+            group_id: Group ID (None for DMs)
+            user_id: User ID (for DMs)
+
+        Returns:
+            Current summary text (empty if not exists)
+        """
+        # Construct thread_id
+        if group_id is None:
+            # DM
+            effective_user_id = user_id or self.user_id
+            if not effective_user_id:
+                return ""
+            thread_id = f"{self.agent_id}_dm_{effective_user_id}"
+        else:
+            # Group
+            thread_id = f"{self.agent_id}_group_{group_id}"
+
+        return self.unified_store.get_or_create_summary(thread_id)
 
     def process_pending(self, group_id: Optional[str] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -938,6 +1021,8 @@ class SimpleMemSystem:
             - interaction_memories: List[InteractionMemory]
             - cross_group_memories: List[CrossGroupMemory]
             - agent_responses: List[Dict] from agent_responses table
+            - relevant_profiles: List[UserProfile] from lightweight entity system
+            - group_context: Dict with group profile and active users
             - formatted_context: str ready for LLM consumption
         """
         effective_user_id = user_id or self.user_id
@@ -954,6 +1039,8 @@ class SimpleMemSystem:
             "interaction_memories": [],
             "cross_group_memories": [],
             "agent_responses": [],
+            "relevant_profiles": [],
+            "group_context": None,
             "formatted_context": "",
         }
 
@@ -980,6 +1067,9 @@ class SimpleMemSystem:
             result["user_memories"] = retrieval.get("user_memories", [])
             result["interaction_memories"] = retrieval.get("interaction_memories", [])
             result["cross_group_memories"] = retrieval.get("cross_group_memories", [])
+            # Include profiles and group context from lightweight entity system
+            result["relevant_profiles"] = retrieval.get("relevant_profiles", [])
+            result["group_context"] = retrieval.get("group_context")
         else:
             result["dm_memories"] = self.hybrid_retriever.retrieve(query)
 
@@ -1142,6 +1232,55 @@ class SimpleMemSystem:
             return {
                 "memories_count": self.vector_store.count_entries() if hasattr(self.vector_store, 'count_entries') else len(self.get_all_memories())
             }
+
+    def run_consolidation(self, group_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Run memory consolidation (SimpleMem Stage 2 - Atom to Molecule Evolution).
+
+        This is an offline/background process - NEVER run during user request handling.
+        Intended for cron jobs or manual triggering.
+
+        Consolidates similar atomic memories into higher-level molecules:
+        - Finds clusters of similar memories using embedding similarity (cosine > 0.80)
+        - Uses LLM to synthesize consolidated content
+        - Replaces clusters with consolidated memories
+
+        Args:
+            group_id: Specific group ID to consolidate (None = all groups)
+
+        Returns:
+            Dict with consolidation results
+
+        Example:
+            # Consolidate all groups
+            results = system.run_consolidation()
+
+            # Consolidate specific group
+            results = system.run_consolidation(group_id="telegram_group_123")
+        """
+        if not self.use_unified_store:
+            return {"error": "Consolidation requires UnifiedMemoryStore"}
+
+        print("\n" + "=" * 60)
+        print("Starting Memory Consolidation (SimpleMem Stage 2)")
+        print("=" * 60)
+
+        if group_id:
+            print(f"Group ID: {group_id}")
+            results = self.unified_store.consolidate_similar_memories(group_id)
+        else:
+            print("Processing all groups...")
+            results = self.unified_store.consolidate_all_groups()
+
+        print("=" * 60)
+        print("Consolidation Complete")
+        print(f"  Groups processed: {results.get('groups_processed', 'N/A')}")
+        print(f"  Original memories: {results.get('total_originals', 0)}")
+        print(f"  Consolidated memories: {results.get('total_consolidated', 0)}")
+        print(f"  Reduction: {results.get('total_originals', 0) - results.get('total_consolidated', 0)} memories")
+        print("=" * 60 + "\n")
+
+        return results
 
 
 # Convenience function
