@@ -139,6 +139,9 @@ class HybridRetriever:
         merged_results = self._merge_and_deduplicate_entries(all_results)
         print(f"[Planning] Found {len(merged_results)} unique results")
 
+        # Step 4.5: Content similarity dedup
+        merged_results = self._deduplicate_by_content(merged_results, "dm_memories")
+
         # Step 5: Adaptive keyword boost (only when LLM detects exact match terms)
         use_keyword_boost = information_plan.get("use_keyword_boost", False)
         exact_match_terms = information_plan.get("exact_match_terms", [])
@@ -172,6 +175,10 @@ class HybridRetriever:
 
         if should_use_reflection:
             merged_results = self._retrieve_with_intelligent_reflection(query, merged_results, information_plan)
+
+        # Final step: Rerank with cross-encoder
+        if len(merged_results) > 10:
+            merged_results = self._rerank_with_cross_encoder(query, merged_results, top_k=10)
 
         return merged_results
     
@@ -214,6 +221,8 @@ class HybridRetriever:
                 # Merge with existing results
                 all_results = current_results + additional_results
                 current_results = self._merge_and_deduplicate_entries(all_results)
+                # Content similarity dedup
+                current_results = self._deduplicate_by_content(current_results, "dm_memories_reflection")
                 print(f"[Reflection Round {round_num + 1}] Total results: {len(current_results)}")
                 
             else:  # "no_results"
@@ -931,6 +940,8 @@ Return ONLY the JSON, no other text.
                 # Merge with existing results
                 all_results = current_results + additional_results
                 current_results = self._merge_and_deduplicate_entries(all_results)
+                # Content similarity dedup
+                current_results = self._deduplicate_by_content(current_results, "dm_memories_intelligent_reflection")
                 print(f"[Intelligent Reflection Round {round_num + 1}] Total results: {len(current_results)}")
                 
             else:  # "no_results"
@@ -1325,12 +1336,14 @@ Return ONLY the JSON, no other text.
         if not items or len(items) <= 1:
             return items
 
-        # Check if items have required attributes
-        if not hasattr(items[0], 'content'):
+        # Check if items have required attributes (content or lossless_restatement)
+        first_item = items[0]
+        if hasattr(first_item, 'content'):
+            contents = [item.content for item in items]
+        elif hasattr(first_item, 'lossless_restatement'):
+            contents = [item.lossless_restatement for item in items]
+        else:
             return items
-
-        # Extract contents
-        contents = [item.content for item in items]
 
         try:
             # Get embeddings using the unified_store's embedding model
