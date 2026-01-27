@@ -142,6 +142,44 @@ class EmbeddingCache:
             return {"enabled": False}
 
 
+class A0XEmbeddingProvider:
+    """
+    Embedding provider using a0x-models API.
+    Uses intfloat/multilingual-e5-small (384D) optimized for semantic retrieval.
+    Faster and more discriminative than larger models for this use case.
+    """
+
+    def __init__(
+        self,
+        api_url: str = None
+    ):
+        self.api_url = api_url or os.getenv("A0X_MODELS_URL", "https://a0x-models-679925931457.us-central1.run.app")
+        self.dimension = 384  # intfloat/multilingual-e5-small
+        self.model = "intfloat/multilingual-e5-small"
+        print(f"a0x-models Embedding provider initialized: {self.model} ({self.dimension}D)")
+
+    def encode(self, texts: List[str], is_query: bool = False) -> np.ndarray:
+        """Encode texts using a0x-models API."""
+        if isinstance(texts, str):
+            texts = [texts]
+
+        try:
+            import requests
+            response = requests.post(
+                f"{self.api_url}/embeddings",
+                json={"texts": texts},
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            embeddings = data["embeddings"]
+            return np.array(embeddings, dtype=np.float32)
+
+        except Exception as e:
+            print(f"a0x-models API error: {e}")
+            raise
+
+
 class APIEmbeddingProvider:
     """
     Embedding provider using OpenRouter API.
@@ -285,12 +323,17 @@ class LocalEmbeddingProvider:
 class EmbeddingModel:
     """
     Unified embedding model with caching support.
-    Supports both API (OpenRouter) and local (SentenceTransformers) providers.
+    Supports a0x-models (384D), OpenRouter API (4096D), and local (SentenceTransformers) providers.
 
     Config options:
-        EMBEDDING_PROVIDER = "api" | "local"
-        EMBEDDING_MODEL = "qwen/qwen3-embedding-8b" (API) or "Qwen/Qwen3-Embedding-0.6B" (local)
-        EMBEDDING_DIMENSION = 4096 (API) or 1024 (local)
+        EMBEDDING_PROVIDER = "a0x" | "api" | "local"
+        EMBEDDING_MODEL = model name (optional, auto-detected for each provider)
+        EMBEDDING_DIMENSION = auto-detected based on provider
+
+    Provider comparison:
+        a0x: 384D, fastest, best for retrieval, multilingual
+        api: 4096D (OpenRouter), slower, general purpose
+        local: varies, free but cold start
     """
 
     def __init__(
@@ -301,11 +344,14 @@ class EmbeddingModel:
         storage_options: Optional[Dict[str, Any]] = None
     ):
         # Determine provider
-        self.provider_type = provider or getattr(config, 'EMBEDDING_PROVIDER', 'api')
+        self.provider_type = provider or getattr(config, 'EMBEDDING_PROVIDER', 'a0x')
         self.model_name = model_name or config.EMBEDDING_MODEL
 
         # Initialize provider
-        if self.provider_type == "api":
+        if self.provider_type == "a0x":
+            self.provider = A0XEmbeddingProvider()
+            self.dimension = self.provider.dimension
+        elif self.provider_type == "api":
             self.provider = APIEmbeddingProvider(model=self.model_name)
             self.dimension = self.provider.dimension
         else:

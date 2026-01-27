@@ -25,6 +25,11 @@ class LLMClient:
         self.enable_thinking = enable_thinking if enable_thinking is not None else config.ENABLE_THINKING
         self.use_streaming = use_streaming if use_streaming is not None else config.USE_STREAMING
 
+        # Token usage tracking
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_calls = 0
+
         # Initialize OpenAI client with optional base_url
         client_kwargs = {"api_key": self.api_key}
         if self.base_url:
@@ -85,6 +90,7 @@ class LLMClient:
                     return self._handle_streaming_response(**kwargs)
                 else:
                     response = self.client.chat.completions.create(**kwargs)
+                    self._track_usage(response)
                     return response.choices[0].message.content
                 
                 # kwargs["stream"] = True
@@ -109,27 +115,52 @@ class LLMClient:
         """
         Handle streaming response and collect full content
         """
+        # Request usage stats in streaming mode
+        kwargs["stream_options"] = {"include_usage": True}
         full_content = []
         stream = self.client.chat.completions.create(**kwargs)
 
-        # for chunk in stream:
-        #     if chunk.choices is not None:
-        #         print(chunk.choices[0].delta.content)
-        
-        # print('---------')
-
         for chunk in stream:
-            # print(chunk)
-            # fix list index out of range
             if len(chunk.choices) > 0 and chunk.choices[0].delta.content is not None:
                 content = chunk.choices[0].delta.content
                 full_content.append(content)
-                # print(full_content)
-                # Optional: print streaming content in real-time
-                # print(content, end='', flush=True)
-        # print(full_content)
+            # Track usage from final chunk (has usage but empty choices)
+            if hasattr(chunk, 'usage') and chunk.usage:
+                self._track_usage(chunk)
         print()
         return ''.join(full_content)
+
+    def _track_usage(self, response) -> None:
+        """Track token usage from API response."""
+        if hasattr(response, 'usage') and response.usage:
+            self.total_prompt_tokens += response.usage.prompt_tokens or 0
+            self.total_completion_tokens += response.usage.completion_tokens or 0
+            self.total_calls += 1
+
+    def get_usage_stats(self) -> Dict[str, Any]:
+        """Get accumulated token usage and estimated cost.
+
+        Cost based on OpenRouter Llama 3.1 8B pricing:
+        - Input: $0.06 / 1M tokens
+        - Output: $0.06 / 1M tokens
+        """
+        input_cost = (self.total_prompt_tokens / 1_000_000) * 0.06
+        output_cost = (self.total_completion_tokens / 1_000_000) * 0.06
+        return {
+            "total_calls": self.total_calls,
+            "prompt_tokens": self.total_prompt_tokens,
+            "completion_tokens": self.total_completion_tokens,
+            "total_tokens": self.total_prompt_tokens + self.total_completion_tokens,
+            "estimated_cost_usd": round(input_cost + output_cost, 6),
+            "input_cost_usd": round(input_cost, 6),
+            "output_cost_usd": round(output_cost, 6),
+        }
+
+    def reset_usage_stats(self) -> None:
+        """Reset token usage counters."""
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_calls = 0
 
     def extract_json(self, text: str) -> Any:
         """
