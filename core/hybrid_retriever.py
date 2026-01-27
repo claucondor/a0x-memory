@@ -30,6 +30,7 @@ import re
 from datetime import datetime, timedelta
 import dateparser
 import concurrent.futures
+import numpy as np
 
 
 class HybridRetriever:
@@ -1191,6 +1192,13 @@ Return ONLY the JSON, no other text.
         all_interaction_memories = self._deduplicate_by_id(all_interaction_memories, "memory_id")
         all_cross_group_memories = self._deduplicate_by_id(all_cross_group_memories, "memory_id")
 
+        # Step 4.5: Deduplicate by content similarity
+        all_group_memories = self._deduplicate_by_content(all_group_memories, "group_memories")
+        all_user_memories = self._deduplicate_by_content(all_user_memories, "user_memories")
+        all_interaction_memories = self._deduplicate_by_content(all_interaction_memories, "interaction_memories")
+        if all_cross_group_memories:
+            all_cross_group_memories = self._deduplicate_by_content(all_cross_group_memories, "cross_group_memories")
+
         print(f"[retrieve_for_context] Results (pre-rerank): group={len(all_group_memories)}, user={len(all_user_memories)}, "
               f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}")
 
@@ -1293,6 +1301,86 @@ Return ONLY the JSON, no other text.
                 seen.add(item_id)
                 deduped.append(item)
         return deduped
+
+    def _deduplicate_by_content(
+        self,
+        items: list,
+        table_name: str,
+        similarity_threshold: float = 0.85
+    ) -> list:
+        """
+        Deduplicate items by content similarity using cosine similarity.
+
+        Computes embeddings for all items and removes items with high similarity,
+        keeping only the one with higher importance_score (or first seen if tied).
+
+        Args:
+            items: List of memory objects with 'content' and 'importance_score' attributes
+            table_name: Table name for logging
+            similarity_threshold: Cosine similarity threshold (default 0.85)
+
+        Returns:
+            Deduplicated list of items
+        """
+        if not items or len(items) <= 1:
+            return items
+
+        # Check if items have required attributes
+        if not hasattr(items[0], 'content'):
+            return items
+
+        # Extract contents
+        contents = [item.content for item in items]
+
+        try:
+            # Get embeddings using the unified_store's embedding model
+            embeddings = self.unified_store.embedding_model.encode_documents(contents)
+
+            # Compute cosine similarity matrix
+            # Normalize embeddings for cosine similarity
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            normalized_embeddings = embeddings / np.where(norms > 0, norms, 1)
+
+            # Compute similarity matrix (all pairs)
+            similarity_matrix = np.dot(normalized_embeddings, normalized_embeddings.T)
+
+            # Find duplicates (excluding self-similarity on diagonal)
+            to_remove = set()
+            n = len(items)
+
+            for i in range(n):
+                if i in to_remove:
+                    continue
+                for j in range(i + 1, n):
+                    if j in to_remove:
+                        continue
+
+                    # Check if similarity exceeds threshold
+                    if similarity_matrix[i, j] > similarity_threshold:
+                        # Keep the one with higher importance_score
+                        score_i = getattr(items[i], 'importance_score', 0.5)
+                        score_j = getattr(items[j], 'importance_score', 0.5)
+
+                        if score_i >= score_j:
+                            to_remove.add(j)
+                        else:
+                            to_remove.add(i)
+                            # If we remove i, we should continue comparing with j as the reference
+                            # So we break the inner loop to let j be compared to others
+                            break
+
+            # Create deduplicated list
+            removed_count = len(to_remove)
+            deduped = [item for idx, item in enumerate(items) if idx not in to_remove]
+
+            if removed_count > 0:
+                print(f"[content-dedup] Removed {removed_count} content duplicates from {table_name}")
+
+            return deduped
+
+        except Exception as e:
+            print(f"[content-dedup] Failed to deduplicate {table_name}: {e}")
+            return items
 
     def _rerank_with_cross_encoder(
         self,
