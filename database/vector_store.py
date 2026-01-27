@@ -12,7 +12,7 @@ Indexing dimensions:
 from typing import List, Optional, Dict, Any, Tuple
 import lancedb
 import pyarrow as pa
-from models.memory_entry import MemoryEntry
+from models.memory_entry import MemoryEntry, MemoryType, PrivacyScope
 from utils.embedding import EmbeddingModel
 import config
 import os
@@ -61,10 +61,13 @@ class VectorStore:
         self._init_table()
 
     def _init_table(self):
-        """Initialize table schema with multi-tenant support."""
+        """Initialize table schema with multi-tenant and group support."""
         schema = pa.schema([
-            pa.field("agent_id", pa.string()),  # Multi-tenant: agent identifier
-            pa.field("user_id", pa.string()),   # Multi-tenant: user identifier
+            # ─── MULTI-TENANT ───
+            pa.field("agent_id", pa.string()),  # Agent identifier
+            pa.field("user_id", pa.string()),   # User identifier
+
+            # ─── CORE MEMORY ───
             pa.field("entry_id", pa.string()),
             pa.field("lossless_restatement", pa.string()),
             pa.field("keywords", pa.list_(pa.string())),
@@ -73,6 +76,18 @@ class VectorStore:
             pa.field("persons", pa.list_(pa.string())),
             pa.field("entities", pa.list_(pa.string())),
             pa.field("topic", pa.string()),
+
+            # ─── GROUP CONTEXT (NEW) ───
+            pa.field("group_id", pa.string()),   # Group identifier (empty = DM)
+            pa.field("username", pa.string()),   # Username/handle
+            pa.field("platform", pa.string()),   # Platform: telegram, xmtp, etc.
+
+            # ─── CLASSIFICATION (NEW) ───
+            pa.field("memory_type", pa.string()),     # conversation, expertise, etc.
+            pa.field("privacy_scope", pa.string()),   # private, group_only, public
+            pa.field("importance_score", pa.float32()), # 0.0 - 1.0
+
+            # ─── VECTOR ───
             pa.field("vector", pa.list_(pa.float32(), self.embedding_model.dimension))
         ])
 
@@ -124,6 +139,20 @@ class VectorStore:
         entries = []
         for r in results:
             try:
+                # Parse memory_type enum
+                memory_type_str = r.get("memory_type", "conversation")
+                try:
+                    memory_type = MemoryType(memory_type_str) if memory_type_str else MemoryType.CONVERSATION
+                except ValueError:
+                    memory_type = MemoryType.CONVERSATION
+
+                # Parse privacy_scope enum
+                privacy_scope_str = r.get("privacy_scope", "private")
+                try:
+                    privacy_scope = PrivacyScope(privacy_scope_str) if privacy_scope_str else PrivacyScope.PRIVATE
+                except ValueError:
+                    privacy_scope = PrivacyScope.PRIVATE
+
                 entries.append(MemoryEntry(
                     entry_id=r["entry_id"],
                     lossless_restatement=r["lossless_restatement"],
@@ -132,7 +161,16 @@ class VectorStore:
                     location=r.get("location") or None,
                     persons=list(r.get("persons") or []),
                     entities=list(r.get("entities") or []),
-                    topic=r.get("topic") or None
+                    topic=r.get("topic") or None,
+                    # Group context (NEW)
+                    group_id=r.get("group_id") or None,
+                    user_id=r.get("user_id") or None,
+                    username=r.get("username") or None,
+                    platform=r.get("platform") or "direct",
+                    # Classification (NEW)
+                    memory_type=memory_type,
+                    privacy_scope=privacy_scope,
+                    importance_score=r.get("importance_score", 0.5)
                 ))
             except Exception as e:
                 print(f"Warning: Failed to parse result: {e}")
@@ -154,8 +192,10 @@ class VectorStore:
         data = []
         for entry, vector in zip(entries, vectors):
             data.append({
+                # Multi-tenant
                 "agent_id": _agent_id,
-                "user_id": _user_id,
+                "user_id": entry.user_id or _user_id,
+                # Core memory
                 "entry_id": entry.entry_id,
                 "lossless_restatement": entry.lossless_restatement,
                 "keywords": entry.keywords,
@@ -164,6 +204,15 @@ class VectorStore:
                 "persons": entry.persons,
                 "entities": entry.entities,
                 "topic": entry.topic or "",
+                # Group context (NEW)
+                "group_id": entry.group_id or "",
+                "username": entry.username or "",
+                "platform": entry.platform or "direct",
+                # Classification (NEW)
+                "memory_type": entry.memory_type.value if isinstance(entry.memory_type, MemoryType) else str(entry.memory_type),
+                "privacy_scope": entry.privacy_scope.value if isinstance(entry.privacy_scope, PrivacyScope) else str(entry.privacy_scope),
+                "importance_score": entry.importance_score,
+                # Vector
                 "vector": vector.tolist()
             })
 
@@ -330,17 +379,9 @@ class VectorStore:
                 score = r.get("_score", 0.0)
                 max_score = max(max_score, score)
                 try:
-                    entry = MemoryEntry(
-                        entry_id=r["entry_id"],
-                        lossless_restatement=r["lossless_restatement"],
-                        keywords=list(r.get("keywords") or []),
-                        timestamp=r.get("timestamp") or None,
-                        location=r.get("location") or None,
-                        persons=list(r.get("persons") or []),
-                        entities=list(r.get("entities") or []),
-                        topic=r.get("topic") or None
-                    )
-                    scored_entries.append((entry, score))
+                    entries = self._results_to_entries([r])
+                    if entries:
+                        scored_entries.append((entries[0], score))
                 except Exception as e:
                     print(f"Warning: Failed to parse FTS result: {e}")
                     continue
@@ -353,4 +394,139 @@ class VectorStore:
 
         except Exception as e:
             print(f"Error during keyword search with scores: {e}")
+            return []
+
+    # ─── GROUP SEARCH METHODS (NEW) ───
+
+    def search_group(
+        self,
+        query: str,
+        group_id: str,
+        top_k: int = 5,
+        memory_type: Optional[MemoryType] = None
+    ) -> List[MemoryEntry]:
+        """
+        Search within a specific group.
+
+        Args:
+            query: Search query
+            group_id: Group identifier to filter by
+            top_k: Maximum results
+            memory_type: Optional filter by memory type
+        """
+        try:
+            if self.table.count_rows() == 0:
+                return []
+
+            query_vector = self.embedding_model.encode_single(query, is_query=True)
+            search = self.table.search(query_vector.tolist())
+
+            # Build filter
+            conditions = [f"group_id = '{group_id}'"]
+
+            # Add tenant filter
+            tenant_filter = self._get_tenant_filter()
+            if tenant_filter:
+                conditions.append(tenant_filter)
+
+            # Add memory type filter
+            if memory_type:
+                conditions.append(f"memory_type = '{memory_type.value}'")
+
+            where_clause = " AND ".join(conditions)
+            search = search.where(where_clause, prefilter=True)
+
+            results = search.limit(top_k).to_list()
+            return self._results_to_entries(results)
+
+        except Exception as e:
+            print(f"Error during group search: {e}")
+            return []
+
+    def search_user_in_group(
+        self,
+        query: str,
+        group_id: str,
+        user_id: str,
+        top_k: int = 5
+    ) -> List[MemoryEntry]:
+        """
+        Search for memories about a specific user within a group.
+
+        Args:
+            query: Search query
+            group_id: Group identifier
+            user_id: User identifier to filter by
+            top_k: Maximum results
+        """
+        try:
+            if self.table.count_rows() == 0:
+                return []
+
+            query_vector = self.embedding_model.encode_single(query, is_query=True)
+            search = self.table.search(query_vector.tolist())
+
+            # Build filter
+            conditions = [
+                f"group_id = '{group_id}'",
+                f"user_id = '{user_id}'"
+            ]
+
+            # Add tenant filter
+            tenant_filter = self._get_tenant_filter()
+            if tenant_filter:
+                conditions.append(tenant_filter)
+
+            where_clause = " AND ".join(conditions)
+            search = search.where(where_clause, prefilter=True)
+
+            results = search.limit(top_k).to_list()
+            return self._results_to_entries(results)
+
+        except Exception as e:
+            print(f"Error during user-in-group search: {e}")
+            return []
+
+    def search_by_memory_type(
+        self,
+        query: str,
+        memory_type: MemoryType,
+        top_k: int = 5,
+        group_id: Optional[str] = None
+    ) -> List[MemoryEntry]:
+        """
+        Search by memory type (expertise, preference, fact, etc.).
+
+        Args:
+            query: Search query
+            memory_type: Type of memory to filter by
+            top_k: Maximum results
+            group_id: Optional group filter
+        """
+        try:
+            if self.table.count_rows() == 0:
+                return []
+
+            query_vector = self.embedding_model.encode_single(query, is_query=True)
+            search = self.table.search(query_vector.tolist())
+
+            # Build filter
+            conditions = [f"memory_type = '{memory_type.value}'"]
+
+            if group_id:
+                conditions.append(f"group_id = '{group_id}'")
+
+            # Add tenant filter
+            tenant_filter = self._get_tenant_filter()
+            if tenant_filter:
+                conditions.append(tenant_filter)
+
+            where_clause = " AND ".join(conditions)
+            search = search.where(where_clause, prefilter=True)
+
+            results = search.limit(top_k).to_list()
+            return self._results_to_entries(results)
+
+        except Exception as e:
+            print(f"Error during memory type search: {e}")
             return []
