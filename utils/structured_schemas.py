@@ -141,9 +141,42 @@ USER_PROFILE_EXTRACTION_SCHEMA = {
                         "required": ["keyword", "score"],
                         "additionalProperties": False
                     }
+                },
+                "expertise_level": {
+                    "type": "string",
+                    "enum": ["beginner", "intermediate", "advanced", "expert"]
+                },
+                "communication_style": {
+                    "type": "string",
+                    "enum": ["formal", "casual", "technical", "conversational"]
+                },
+                "domains": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "enum": ["defi", "nfts", "gaming", "trading", "development", "design", "marketing", "music", "other"]},
+                            "score": {"type": "number"}
+                        },
+                        "required": ["name", "score"],
+                        "additionalProperties": False
+                    }
+                },
+                "entities": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "enum": ["person", "project", "protocol", "token", "organization", "tool", "other"]},
+                            "name": {"type": "string"},
+                            "context": {"type": "string"}
+                        },
+                        "required": ["type", "name", "context"],
+                        "additionalProperties": False
+                    }
                 }
             },
-            "required": ["summary", "interests"],
+            "required": ["summary", "interests", "expertise_level", "communication_style", "domains", "entities"],
             "additionalProperties": False
         }
     }

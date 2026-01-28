@@ -95,3 +95,4 @@ docs/
 *.pt
 *.pth
 *.onnx
+PLAN_INCREMENTAL_PROFILES.md

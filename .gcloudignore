@@ -1,0 +1,53 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Database files (not needed in container - uses GCS)
+lancedb_data/
+*.lance/
+data/
+embedding_cache/
+
+# Test files
+tests/
+test_results/
+locomo10_test_results.json
+test_llm_check/
+*.json
+
+# Docs and session files
+CLAUDE_*.md
+CLAUDE.md
+ROADMAP.md
+docs/
+
+# Large model files
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints
+
+# Git
+.git/
+.gitignore
