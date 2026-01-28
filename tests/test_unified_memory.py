@@ -14,7 +14,7 @@ import uuid
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from database.unified_store import UnifiedMemoryStore
+from database.legacy.unified_store import UnifiedMemoryStore
 from models.memory_entry import MemoryEntry, Dialogue, MemoryType, PrivacyScope
 from models.group_memory import (
     GroupMemory, UserMemory, InteractionMemory,
