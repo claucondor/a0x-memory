@@ -23,10 +23,14 @@ class LanceDBConnection:
         cls._storage_options = storage_options
 
     @classmethod
-    def get_agent_db(cls, agent_id: str, db_base_path: str = None) -> lancedb.DBConnection:
+    def get_agent_db(cls, agent_id: str, db_base_path: str = None, storage_options: Dict[str, Any] = None) -> lancedb.DBConnection:
         """Get or create agent-specific database connection."""
         if agent_id in cls._instances:
             return cls._instances[agent_id]
+
+        # Use passed storage_options or configured ones
+        if storage_options:
+            cls._storage_options = storage_options
 
         base_path = db_base_path or config.LANCEDB_PATH
         agent_db_path = f"{base_path}/agents/{agent_id}"
@@ -44,10 +48,14 @@ class LanceDBConnection:
         return db
 
     @classmethod
-    def get_global_db(cls, db_base_path: str = None) -> lancedb.DBConnection:
+    def get_global_db(cls, db_base_path: str = None, storage_options: Dict[str, Any] = None) -> lancedb.DBConnection:
         """Get global database connection (cross-agent data)."""
         if cls._global_instance is not None:
             return cls._global_instance
+
+        # Use passed storage_options or configured ones
+        if storage_options:
+            cls._storage_options = storage_options
 
         base_path = db_base_path or config.LANCEDB_PATH
         global_db_path = f"{base_path}/global"
