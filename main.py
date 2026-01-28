@@ -65,7 +65,10 @@ class SimpleMemSystem:
         user_id: Optional[str] = None,
         # New options for unified memory
         use_unified_store: bool = True,
-        enable_firestore: bool = True
+        enable_firestore: bool = True,
+        # Shared components (singletons)
+        embedding_model: Optional["EmbeddingModel"] = None,
+        llm_client: Optional["LLMClient"] = None
     ):
         """
         Initialize system
@@ -103,15 +106,15 @@ class SimpleMemSystem:
         print(f"Store: {'UnifiedMemoryStore' if use_unified_store else 'VectorStore'}")
         print("=" * 60)
 
-        # Initialize core components
-        self.llm_client = LLMClient(
+        # Initialize core components (use shared if provided)
+        self.llm_client = llm_client or LLMClient(
             api_key=api_key,
             model=model,
             base_url=base_url,
             enable_thinking=enable_thinking,
             use_streaming=use_streaming
         )
-        self.embedding_model = EmbeddingModel()
+        self.embedding_model = embedding_model or EmbeddingModel()
 
         # Initialize storage (unified or legacy)
         if use_unified_store:
@@ -269,7 +272,17 @@ class SimpleMemSystem:
                 "user_id": user_id,
                 "username": username
             }
-            doc_id = self.firestore.add_message(
+
+            # Generate embedding for spam detection (reuse shared model)
+            message_embedding = None
+            try:
+                message_embedding = self.embedding_model.encode_single(content, is_query=False)
+                if hasattr(message_embedding, 'tolist'):
+                    message_embedding = message_embedding.tolist()
+            except Exception as e:
+                print(f"[Spam] Warning: Could not generate embedding: {e}")
+
+            add_result = self.firestore.add_message(
                 agent_id=self.agent_id,
                 group_id=effective_group_id,
                 message=content,
@@ -282,9 +295,22 @@ class SimpleMemSystem:
                     "mentioned_users": mentioned_users,
                     "reply_to_message_id": reply_to_message_id,
                     "speaker": speaker
-                }
+                },
+                embedding=message_embedding
             )
-            result["added"] = doc_id is not None
+
+            # Handle new return format (dict with doc_id, is_spam, etc.)
+            if isinstance(add_result, dict):
+                doc_id = add_result.get('doc_id')
+                result["added"] = doc_id is not None
+                result["is_spam"] = add_result.get('is_spam', False)
+                result["spam_score"] = add_result.get('spam_score', 0.0)
+                if add_result.get('is_spam'):
+                    print(f"[Spam] Detected spam from {username}: {add_result.get('spam_reason')}")
+            else:
+                # Backwards compatibility
+                doc_id = add_result
+                result["added"] = doc_id is not None
 
             # Record message for adaptive threshold metrics
             # Use existing Firestore client to avoid creating new connections
@@ -432,24 +458,23 @@ class SimpleMemSystem:
         result["memories_created"] = processing_result.get("total", 0)
         result["processing_details"] = processing_result
 
-        # Update conversation summary after batch processing
-        self._update_conversation_summary(
-            effective_group_id=effective_group_id,
-            original_group_id=original_group_id,
-            unprocessed=unprocessed
-        )
-
-        # Auto-generate profiles after batch processing
-        self._generate_all_profiles(
+        # Update conversation summary + generate profiles (parallel LLM calls)
+        self._post_batch_processing(
             unprocessed=unprocessed,
             platform=platform,
             original_group_id=original_group_id,
             effective_group_id=effective_group_id
         )
 
+        # Compact LanceDB fragments accumulated during this batch
+        try:
+            self.unified_store.optimize_tables()
+        except Exception as e:
+            print(f"[optimize] Non-fatal error: {e}")
+
         return result
 
-    def _generate_all_profiles(
+    def _post_batch_processing(
         self,
         unprocessed: List[Dict],
         platform: str,
@@ -457,13 +482,12 @@ class SimpleMemSystem:
         effective_group_id: str
     ):
         """
-        Generate all profile types after batch processing:
-        1. UserProfile (global) - aggregates DM + group messages
-        2. GroupProfile - group culture and context
-        3. UserInGroupProfile - user behavior within this group
+        Post-batch processing: summary update + all profile generations in parallel.
 
-        Uses LLM (llama-3.1-8b-instruct) and a0x-models API.
+        Fires all LLM calls concurrently (summary, group profile, user profiles)
+        with sequential fallback on error.
         """
+        import concurrent.futures
         from collections import defaultdict
 
         # Group messages by user
@@ -489,94 +513,138 @@ class SimpleMemSystem:
                 user_data[user_id]['universal_user_id'] = user_id
                 user_data[user_id]['username'] = msg.get('username') or platform_identity.get('username')
 
-            # Extract group name from first message
             if not group_name:
                 metadata = msg.get('metadata', {})
                 group_name = metadata.get('group_name') or platform_identity.get('groupName')
 
         # ============================================================
-        # 1. GENERATE/UPDATE GROUP PROFILE (for groups only)
+        # Collect all tasks to run in parallel
         # ============================================================
-        if original_group_id is not None:  # It's a group, not DM
+        tasks = []
+
+        # Task: conversation summary
+        def task_summary():
+            self._update_conversation_summary(
+                effective_group_id=effective_group_id,
+                original_group_id=original_group_id,
+                unprocessed=unprocessed
+            )
+            return "summary"
+
+        tasks.append(("summary", task_summary))
+
+        # Task: group profile
+        if original_group_id is not None:
             total_group_messages = self._count_group_messages(original_group_id)
             print(f"\n[ProfileGen] Group {original_group_id}: {total_group_messages} memories (threshold: 10)")
 
-            if total_group_messages >= 10:  # Threshold for group profile (10 memories = ~20 raw msgs)
-                print(f"\n[GroupProfile] Generating profile for {original_group_id} ({total_group_messages} messages)")
+            if total_group_messages >= 10:
+                def task_group_profile():
+                    print(f"\n[GroupProfile] Generating profile for {original_group_id} ({total_group_messages} messages)")
+                    self.group_profile_store.generate_group_profile_from_messages(
+                        agent_id=self.agent_id,
+                        group_id=original_group_id,
+                        platform=platform,
+                        group_name=group_name,
+                        messages=all_messages
+                    )
+                    return "group_profile"
 
-                self.group_profile_store.generate_group_profile_from_messages(
-                    agent_id=self.agent_id,
-                    group_id=original_group_id,
-                    platform=platform,
-                    group_name=group_name,
-                    messages=all_messages
-                )
+                tasks.append(("group_profile", task_group_profile))
 
-        # ============================================================
-        # 2. GENERATE/UPDATE USER-IN-GROUP PROFILES
-        # ============================================================
-        if original_group_id is not None:  # Only for groups
-            for user_id, data in user_data.items():
+        # Task: user-in-group profiles
+        if original_group_id is not None:
+            for uid, data in user_data.items():
                 if not data['messages']:
                     continue
-
-                # Count user's messages in this group
                 total_in_group = self._count_user_messages_in_group(original_group_id, data['universal_user_id'])
                 print(f"[ProfileGen] User {data['universal_user_id']} in group: {total_in_group} memories (threshold: 10)")
 
-                if total_in_group >= 10:  # Threshold for user-in-group profile
-                    print(f"\n[UserInGroupProfile] Generating profile for {data['universal_user_id']} in {original_group_id}")
+                if total_in_group >= 10:
+                    _uid = data['universal_user_id']
+                    _uname = data['username']
+                    _msgs = data['messages']
+                    def task_user_in_group(uid=_uid, uname=_uname, msgs=_msgs):
+                        print(f"\n[UserInGroupProfile] Generating profile for {uid} in {original_group_id}")
+                        self.group_profile_store.generate_user_in_group_profile(
+                            agent_id=self.agent_id,
+                            group_id=original_group_id,
+                            universal_user_id=uid,
+                            username=uname,
+                            user_messages=msgs
+                        )
+                        return f"user_in_group:{uid}"
 
-                    self.group_profile_store.generate_user_in_group_profile(
-                        agent_id=self.agent_id,
-                        group_id=original_group_id,
-                        universal_user_id=data['universal_user_id'],
-                        username=data['username'],
-                        user_messages=data['messages']
-                    )
+                    tasks.append((f"user_in_group:{_uid}", task_user_in_group))
 
-        # ============================================================
-        # 3. GENERATE/UPDATE GLOBAL USER PROFILES (aggregates all sources)
-        # ============================================================
-        for user_id, data in user_data.items():
+        # Tasks: global user profiles
+        for uid, data in user_data.items():
             if not data['messages']:
                 continue
 
             universal_user_id = data['universal_user_id']
             platform_type = data['platform_type']
-            # Extract platform_specific_id from universal_user_id or use username as fallback
             if ':' in universal_user_id:
                 platform_specific_id = universal_user_id.split(':', 1)[1]
             else:
-                # Fallback to username if no colon
                 platform_specific_id = data.get('username', universal_user_id)
 
-            # Get existing profile to count total messages
             existing_profile = self.user_profile_store.get_profile_by_universal_id(universal_user_id)
 
             total_messages = len(data['messages'])
             if existing_profile:
                 total_messages += existing_profile.total_messages_processed
 
-            # Also count messages from memories (all sources)
             memory_messages = self._get_all_user_messages(universal_user_id, platform_type)
             if memory_messages:
                 total_messages = max(total_messages, len(memory_messages))
 
-            # Only generate if >= 10 messages
             if total_messages >= 10:
-                print(f"\n[UserProfile] Generating global profile for {universal_user_id} ({total_messages} total messages)")
+                _uid = universal_user_id
+                _pt = platform_type
+                _psid = platform_specific_id
+                _msgs = memory_messages if memory_messages else data['messages']
+                _uname = data['username']
+                _total = total_messages
+                def task_user_profile(uid=_uid, pt=_pt, psid=_psid, msgs=_msgs, uname=_uname, total=_total):
+                    print(f"\n[UserProfile] Generating global profile for {uid} ({total} total messages)")
+                    self.user_profile_store.generate_profile_from_messages(
+                        agent_id=self.agent_id,
+                        platform_type=pt,
+                        platform_specific_id=psid,
+                        messages=msgs,
+                        username=uname
+                    )
+                    return f"user_profile:{uid}"
 
-                # Use memory messages for better profile (includes all sources)
-                messages_for_profile = memory_messages if memory_messages else data['messages']
+                tasks.append((f"user_profile:{_uid}", task_user_profile))
 
-                self.user_profile_store.generate_profile_from_messages(
-                    agent_id=self.agent_id,
-                    platform_type=platform_type,
-                    platform_specific_id=platform_specific_id,
-                    messages=messages_for_profile,
-                    username=data['username']
-                )
+        # ============================================================
+        # Execute all tasks in parallel
+        # ============================================================
+        if not tasks:
+            return
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                futures = {
+                    executor.submit(fn): name
+                    for name, fn in tasks
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    name = futures[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        print(f"[PostBatch] Task '{name}' failed: {e}")
+        except Exception as e:
+            # Fallback: run everything sequentially
+            print(f"[PostBatch] Parallel execution failed, running sequentially: {e}")
+            for name, fn in tasks:
+                try:
+                    fn()
+                except Exception as e2:
+                    print(f"[PostBatch] Sequential task '{name}' failed: {e2}")
 
     def _get_all_user_messages(self, user_id: str, platform_type: str) -> Optional[List[str]]:
         """
@@ -1125,7 +1193,8 @@ class SimpleMemSystem:
         question: str,
         group_id: Optional[str] = None,
         user_id: Optional[str] = None,
-        include_firestore_context: bool = True
+        include_firestore_context: bool = True,
+        search_results: Optional[Dict[str, Any]] = None
     ) -> str:
         """
         Ask question - Q&A interface. Uses search() + answer generator.
@@ -1135,6 +1204,7 @@ class SimpleMemSystem:
         - group_id: Group context for multi-table search
         - user_id: User context for personalized retrieval
         - include_firestore_context: Include recent messages from Firestore
+        - search_results: Pre-fetched search results (skip re-running search pipeline)
 
         Returns:
         - Answer string
@@ -1143,12 +1213,13 @@ class SimpleMemSystem:
         print(f"Question: {question}")
         print("=" * 60)
 
-        search_results = self.search(
-            query=question,
-            group_id=group_id,
-            user_id=user_id,
-            include_window=include_firestore_context,
-        )
+        if search_results is None:
+            search_results = self.search(
+                query=question,
+                group_id=group_id,
+                user_id=user_id,
+                include_window=include_firestore_context,
+            )
 
         full_context = search_results["formatted_context"]
 

@@ -8,8 +8,12 @@ import os
 import uuid
 import asyncio
 import threading
+import queue
+import time
+import schedule
+import psutil
 from collections import OrderedDict
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -17,6 +21,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+import config
 from main import SimpleMemSystem
 from models.memory_entry import MemoryEntry
 from models.user_profile import UserProfile
@@ -25,6 +30,7 @@ from database.vector_store import VectorStore
 from database.user_profile_store import UserProfileStore
 from database.group_profile_store import GroupProfileStore
 from utils.embedding import EmbeddingModel
+from utils.llm_client import LLMClient
 
 
 # ============================================================================
@@ -252,12 +258,95 @@ class UnifiedContextResponse(BaseModel):
 
 # Shared components (initialized on startup)
 shared_embedding_model: Optional[EmbeddingModel] = None
-shared_db_path = os.environ.get("LANCEDB_PATH", "./data/lancedb_shared")
+shared_llm_client: Optional[LLMClient] = None
+shared_db_path = config.LANCEDB_PATH
 shared_table_name = os.environ.get("MEMORY_TABLE_NAME", "memories")
 
 # Tenant metadata (lightweight, no LRU needed)
 tenant_metadata: Dict[str, Dict[str, Any]] = {}
 
+# Cache for SimpleMemSystem instances (by agent_id to avoid re-opening GCS tables)
+_system_cache: Dict[str, SimpleMemSystem] = {}
+
+# Startup time for uptime tracking
+_startup_time: float = 0
+
+# Known agents to pre-warm on startup (eliminates 5s cold start)
+KNOWN_AGENTS = [
+    "71f6f657-6800-0892-875f-f26e8c213756",  # jessexbt
+]
+
+# ============================================================================
+# Background Worker (dedicated thread for maintenance tasks)
+# ============================================================================
+
+_task_queue: queue.Queue = queue.Queue()
+_worker_thread: Optional[threading.Thread] = None
+_worker_running: bool = False
+
+
+def _background_worker():
+    """Background worker thread for maintenance tasks."""
+    global _worker_running
+    print("[Worker] Background worker started")
+    while _worker_running:
+        try:
+            task = _task_queue.get(timeout=1.0)
+            if task is None:
+                break
+            func, args, kwargs = task
+            try:
+                func(*args, **kwargs)
+            except Exception as e:
+                print(f"[Worker] Task error: {e}")
+            finally:
+                _task_queue.task_done()
+        except queue.Empty:
+            continue
+    print("[Worker] Background worker stopped")
+
+
+def schedule_task(func: Callable, *args, **kwargs):
+    """Schedule a task to run in the background worker."""
+    _task_queue.put((func, args, kwargs))
+
+
+# ============================================================================
+# Scheduled Maintenance (LanceDB compaction, etc.)
+# ============================================================================
+
+def compact_all_tables():
+    """Compact LanceDB tables for all cached agents."""
+    print("[Maintenance] Starting LanceDB compaction...")
+    compacted = 0
+    for agent_id, system in list(_system_cache.items()):
+        try:
+            if hasattr(system, 'unified_store') and hasattr(system.unified_store, 'optimize_tables'):
+                system.unified_store.optimize_tables()
+                compacted += 1
+                print(f"[Maintenance] Compacted tables for {agent_id[:8]}...")
+        except Exception as e:
+            print(f"[Maintenance] Compaction failed for {agent_id}: {e}")
+    print(f"[Maintenance] Compaction complete: {compacted} agents")
+
+
+def _scheduler_thread():
+    """Thread that runs scheduled maintenance tasks."""
+    # Schedule compaction at 4am UTC daily (low traffic)
+    schedule.every().day.at("04:00").do(lambda: schedule_task(compact_all_tables))
+    # Also compact every 6 hours for high-volume scenarios
+    schedule.every(6).hours.do(lambda: schedule_task(compact_all_tables))
+
+    print("[Scheduler] Maintenance scheduler started (compaction at 04:00 UTC + every 6h)")
+    while _worker_running:
+        schedule.run_pending()
+        time.sleep(60)
+    print("[Scheduler] Maintenance scheduler stopped")
+
+
+# ============================================================================
+# Shared Singletons
+# ============================================================================
 
 def get_shared_embedding_model() -> EmbeddingModel:
     """Get or create shared embedding model."""
@@ -265,6 +354,14 @@ def get_shared_embedding_model() -> EmbeddingModel:
     if shared_embedding_model is None:
         shared_embedding_model = EmbeddingModel()
     return shared_embedding_model
+
+
+def get_shared_llm_client() -> LLMClient:
+    """Get or create shared LLM client (reduces memory, reuses HTTP connections)."""
+    global shared_llm_client
+    if shared_llm_client is None:
+        shared_llm_client = LLMClient()
+    return shared_llm_client
 
 
 def parse_memory_id(memory_id: str) -> tuple:
@@ -282,7 +379,7 @@ def parse_memory_id(memory_id: str) -> tuple:
 
 
 def get_memory_system(memory_id: str, config: Optional[MemoryInstanceConfig] = None) -> SimpleMemSystem:
-    """Get SimpleMem instance for tenant (creates lightweight tenant-scoped system)."""
+    """Get SimpleMem instance for tenant (cached by agent_id to avoid re-opening GCS tables)."""
     agent_id, user_id = parse_memory_id(memory_id)
 
     # Override with config if provided
@@ -294,14 +391,30 @@ def get_memory_system(memory_id: str, config: Optional[MemoryInstanceConfig] = N
 
     clear_db = config.clear_db if config else False
 
-    # Create tenant-scoped system (shares DB, filters by tenant)
+    # Use agent_id as cache key (tables are per-agent, user_id only affects filtering)
+    cache_key = agent_id or "default"
+
+    # Return cached system if exists and not clearing DB
+    if cache_key in _system_cache and not clear_db:
+        system = _system_cache[cache_key]
+        # Update user_id for this request (affects Firestore context filtering)
+        system.user_id = user_id
+        return system
+
+    # Create new tenant-scoped system (use shared singletons)
     system = SimpleMemSystem(
         db_path=shared_db_path,
         table_name=shared_table_name,
         clear_db=clear_db,
         agent_id=agent_id,
-        user_id=user_id
+        user_id=user_id,
+        embedding_model=get_shared_embedding_model(),
+        llm_client=get_shared_llm_client()
     )
+
+    # Cache it
+    _system_cache[cache_key] = system
+    print(f"[SimpleMem API] Cached system for agent: {cache_key}")
 
     # Track metadata
     if memory_id not in tenant_metadata:
@@ -325,7 +438,10 @@ def get_memory_system(memory_id: str, config: Optional[MemoryInstanceConfig] = N
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
+    global _worker_running, _worker_thread, _startup_time
+
     # Startup
+    _startup_time = time.time()
     print("=" * 60)
     print("SimpleMem API Starting (Multi-tenant Mode)")
     print(f"Shared DB: {shared_db_path}")
@@ -335,13 +451,42 @@ async def lifespan(app: FastAPI):
     # Create data directory
     os.makedirs("./data", exist_ok=True)
 
-    # Pre-initialize shared embedding model
+    # 1. Pre-initialize shared singletons
+    print("[Startup] Initializing shared embedding model...")
     get_shared_embedding_model()
+    print("[Startup] Initializing shared LLM client...")
+    get_shared_llm_client()
+
+    # 2. Start background worker thread
+    _worker_running = True
+    _worker_thread = threading.Thread(target=_background_worker, daemon=True)
+    _worker_thread.start()
+
+    # 3. Start maintenance scheduler thread
+    scheduler_thread = threading.Thread(target=_scheduler_thread, daemon=True)
+    scheduler_thread.start()
+
+    # 4. Pre-warm known agents (eliminates 5s cold start for main agents)
+    print(f"[Startup] Pre-warming {len(KNOWN_AGENTS)} known agents...")
+    for agent_id in KNOWN_AGENTS:
+        try:
+            get_memory_system(f"{agent_id}:prewarm")
+            print(f"  ✓ {agent_id[:12]}...")
+        except Exception as e:
+            print(f"  ✗ {agent_id[:12]}: {e}")
+
+    print("=" * 60)
+    print(f"[Startup] Ready! Pre-warmed {len(_system_cache)} agents")
+    print("=" * 60)
 
     yield
 
     # Shutdown
     print("SimpleMem API Shutting down...")
+    _worker_running = False
+    _task_queue.put(None)  # Signal worker to stop
+    if _worker_thread:
+        _worker_thread.join(timeout=5)
     tenant_metadata.clear()
 
 
@@ -375,6 +520,85 @@ async def health_check():
         memory_instances=len(tenant_metadata),
         timestamp=datetime.utcnow().isoformat()
     )
+
+
+@app.get("/metrics")
+async def get_metrics():
+    """
+    Detailed metrics endpoint for monitoring and debugging.
+    Returns system state, cache stats, and per-agent info.
+    """
+    # Process memory usage
+    process = psutil.Process()
+    memory_info = process.memory_info()
+
+    # Embedding cache stats
+    embedding_stats = {}
+    if shared_embedding_model:
+        try:
+            embedding_stats = shared_embedding_model.get_cache_stats()
+        except:
+            embedding_stats = {"error": "unavailable"}
+
+    # Per-agent stats
+    agent_stats = {}
+    for agent_id, system in list(_system_cache.items()):
+        try:
+            memory_count = 0
+            if hasattr(system, 'unified_store'):
+                # Try to get memory count without expensive queries
+                memory_count = getattr(system.unified_store, '_cached_count', 0)
+            agent_stats[agent_id[:12] + "..."] = {
+                "cached": True,
+                "memory_count": memory_count,
+            }
+        except Exception as e:
+            agent_stats[agent_id[:12] + "..."] = {"error": str(e)}
+
+    return {
+        "status": "healthy",
+        "uptime_seconds": round(time.time() - _startup_time, 1),
+        "uptime_human": _format_uptime(time.time() - _startup_time),
+        "memory": {
+            "rss_mb": round(memory_info.rss / 1024 / 1024, 1),
+            "vms_mb": round(memory_info.vms / 1024 / 1024, 1),
+        },
+        "cache": {
+            "cached_agents": len(_system_cache),
+            "tenant_metadata": len(tenant_metadata),
+        },
+        "worker": {
+            "queue_size": _task_queue.qsize(),
+            "running": _worker_running,
+        },
+        "embedding": embedding_stats,
+        "agents": agent_stats,
+        "config": {
+            "embedding_provider": config.EMBEDDING_PROVIDER,
+            "embedding_dimension": config.EMBEDDING_DIMENSION,
+            "lancedb_path": shared_db_path[:50] + "..." if len(shared_db_path) > 50 else shared_db_path,
+        }
+    }
+
+
+def _format_uptime(seconds: float) -> str:
+    """Format uptime in human readable format."""
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    if days > 0:
+        return f"{days}d {hours}h {minutes}m"
+    elif hours > 0:
+        return f"{hours}h {minutes}m"
+    else:
+        return f"{minutes}m"
+
+
+@app.post("/maintenance/compact")
+async def trigger_compaction():
+    """Manually trigger LanceDB table compaction."""
+    schedule_task(compact_all_tables)
+    return {"status": "scheduled", "message": "Compaction task queued"}
 
 
 @app.get("/")
@@ -592,9 +816,12 @@ async def ask_memory(memory_id: str, request: AskRequest):
         contexts
     )
 
+    # Convert contexts to strings for response model
+    context_strings = [str(c) for c in contexts] if contexts else []
+
     return AskResponse(
         answer=answer,
-        contexts=contexts if contexts else [],
+        contexts=context_strings,
         memory_count=memory_count
     )
 
@@ -1023,17 +1250,18 @@ async def add_passive_memory(request: PassiveMemoryRequest, background_tasks: Ba
     Add message for background processing (fire and forget).
 
     Used for messages that don't need immediate context response.
-    - Adds to Firestore window
-    - Triggers batch processing when threshold reached
+    - Adds to Firestore window (fast, <100ms)
+    - Checks batch threshold
+    - If threshold met, schedules processing in background (non-blocking)
     - Returns immediately
     """
     identity = _extract_identity_info(request.platform_identity)
 
-    # Build memory_id
-    memory_id = f"{request.agent_id}:{identity['user_id']}" if identity['user_id'] else request.agent_id
+    # Build memory_id - always include colon so parse_memory_id extracts agent_id correctly
+    memory_id = f"{request.agent_id}:{identity['user_id'] or ''}"
     system = get_memory_system(memory_id)
 
-    # Call add_dialogue (handles DM vs group, batch processing, profile generation)
+    # Step 1: Add to Firestore only (fast, no LLM processing)
     result = system.add_dialogue(
         speaker=request.speaker or identity['username'] or "user",
         content=request.message,
@@ -1042,16 +1270,65 @@ async def add_passive_memory(request: PassiveMemoryRequest, background_tasks: Ba
         user_id=identity['user_id'],
         username=identity['username'],
         add_to_firestore=True,
-        use_stateless_processing=True
+        use_stateless_processing=False  # Don't process synchronously
     )
+
+    # Step 2: Check if we should trigger background processing
+    effective_group_id = identity['group_id'] or f"dm_{identity['user_id']}"
+    should_process = False
+
+    if result.get("added") and system.firestore:
+        try:
+            # Check threshold without processing
+            from core.adaptive_threshold import AdaptiveThresholdManager
+            threshold_manager = AdaptiveThresholdManager(
+                firestore_client=system.firestore.db
+            )
+            adaptive_threshold = threshold_manager.get_threshold(request.agent_id, effective_group_id)
+
+            # Count unprocessed
+            unprocessed = system.firestore.get_unprocessed(
+                agent_id=request.agent_id,
+                group_id=effective_group_id,
+                min_count=adaptive_threshold
+            )
+
+            if unprocessed:
+                should_process_now, _ = threshold_manager.should_process(
+                    request.agent_id,
+                    effective_group_id,
+                    len(unprocessed)
+                )
+                should_process = should_process_now
+        except Exception as e:
+            print(f"[Passive] Warning checking threshold: {e}")
+
+    # Step 3: Schedule background processing if needed (non-blocking)
+    if should_process:
+        def process_batch():
+            try:
+                processing_result = system._process_unprocessed_messages(
+                    effective_group_id=effective_group_id,
+                    original_group_id=identity['group_id'],
+                    platform=identity['platform']
+                )
+                print(f"[Background] Processed batch for {effective_group_id}: {processing_result.get('memories_created', 0)} memories")
+            except Exception as e:
+                print(f"[Background] Error processing batch: {e}")
+
+        schedule_task(process_batch)
+        print(f"[Passive] Scheduled background processing for {effective_group_id}")
 
     return {
         "success": result.get("added", False),
         "is_group": identity['is_group'],
         "group_id": identity['group_id'],
         "user_id": identity['user_id'],
-        "processed": result.get("processed", False),
-        "memories_created": result.get("memories_created", 0)
+        "processing_scheduled": should_process,
+        "processed": False,  # Always False now - processing is async
+        "memories_created": 0,  # Will be created in background
+        "is_spam": result.get("is_spam", False),
+        "spam_score": result.get("spam_score", 0.0)
     }
 
 
@@ -1061,17 +1338,17 @@ async def add_active_memory(request: ActiveMemoryRequest):
     Add message AND return context immediately.
 
     Used when agent needs to respond - adds message and returns relevant context.
-    - Adds to Firestore window
-    - Triggers batch processing if threshold reached
+    - Adds to Firestore window (fast)
     - Returns context for response generation
+    - Schedules batch processing in background if threshold reached
     """
     identity = _extract_identity_info(request.platform_identity)
 
-    # Build memory_id
-    memory_id = f"{request.agent_id}:{identity['user_id']}" if identity['user_id'] else request.agent_id
+    # Build memory_id - always include colon so parse_memory_id extracts agent_id correctly
+    memory_id = f"{request.agent_id}:{identity['user_id'] or ''}"
     system = get_memory_system(memory_id)
 
-    # Add the message
+    # Step 1: Add to Firestore only (fast, no LLM processing)
     result = system.add_dialogue(
         speaker=request.speaker or identity['username'] or "user",
         content=request.message,
@@ -1080,8 +1357,10 @@ async def add_active_memory(request: ActiveMemoryRequest):
         user_id=identity['user_id'],
         username=identity['username'],
         add_to_firestore=True,
-        use_stateless_processing=True
+        use_stateless_processing=False  # Don't process synchronously
     )
+
+    effective_group_id = identity['group_id'] or f"dm_{identity['user_id']}"
 
     response = {
         "success": result.get("added", False),
@@ -1089,12 +1368,11 @@ async def add_active_memory(request: ActiveMemoryRequest):
         "is_group": identity['is_group'],
         "group_id": identity['group_id'],
         "user_id": identity['user_id'],
-        "processed": result.get("processed", False),
-        "memories_created": result.get("memories_created", 0),
+        "processing_scheduled": False,
         "context": None
     }
 
-    # Get context if requested
+    # Get context if requested (fast - just Firestore read)
     if request.return_context:
         try:
             context_data = system.get_firestore_context()
@@ -1104,6 +1382,45 @@ async def add_active_memory(request: ActiveMemoryRequest):
             }
         except Exception as e:
             print(f"[API] Warning: Could not get context: {e}")
+
+    # Step 2: Check if we should trigger background processing
+    if result.get("added") and system.firestore:
+        try:
+            from core.adaptive_threshold import AdaptiveThresholdManager
+            threshold_manager = AdaptiveThresholdManager(
+                firestore_client=system.firestore.db
+            )
+            adaptive_threshold = threshold_manager.get_threshold(request.agent_id, effective_group_id)
+
+            unprocessed = system.firestore.get_unprocessed(
+                agent_id=request.agent_id,
+                group_id=effective_group_id,
+                min_count=adaptive_threshold
+            )
+
+            if unprocessed:
+                should_process_now, _ = threshold_manager.should_process(
+                    request.agent_id,
+                    effective_group_id,
+                    len(unprocessed)
+                )
+                if should_process_now:
+                    def process_batch():
+                        try:
+                            processing_result = system._process_unprocessed_messages(
+                                effective_group_id=effective_group_id,
+                                original_group_id=identity['group_id'],
+                                platform=identity['platform']
+                            )
+                            print(f"[Background] Processed batch for {effective_group_id}: {processing_result.get('memories_created', 0)} memories")
+                        except Exception as e:
+                            print(f"[Background] Error processing batch: {e}")
+
+                    schedule_task(process_batch)
+                    response["processing_scheduled"] = True
+                    print(f"[Active] Scheduled background processing for {effective_group_id}")
+        except Exception as e:
+            print(f"[Active] Warning checking threshold: {e}")
 
     return response
 
@@ -1117,8 +1434,8 @@ async def get_memory_context(request: ContextQueryRequest):
     """
     identity = _extract_identity_info(request.platform_identity)
 
-    # Build memory_id
-    memory_id = f"{request.agent_id}:{identity['user_id']}" if identity['user_id'] else request.agent_id
+    # Build memory_id - always include colon so parse_memory_id extracts agent_id correctly
+    memory_id = f"{request.agent_id}:{identity['user_id'] or ''}"
     system = get_memory_system(memory_id)
 
     response = {
@@ -1141,12 +1458,37 @@ async def get_memory_context(request: ContextQueryRequest):
     # Search memories if query provided
     if request.query:
         try:
-            memories = await asyncio.to_thread(
-                system.hybrid_retriever.retrieve,
-                request.query,
-                enable_reflection=True
-            )
-            response["relevant_memories"] = memories[:request.memory_limit] if memories else []
+            # Use retrieve_for_context for groups (includes group_memories, user_memories tables)
+            if identity['is_group'] and identity['group_id']:
+                context = {
+                    'group_id': identity['group_id'],
+                    'user_id': identity['user_id'],
+                    'platform': identity['platform']
+                }
+                results = await asyncio.to_thread(
+                    system.hybrid_retriever.retrieve_for_context,
+                    request.query,
+                    context,
+                    limit_per_table=request.memory_limit
+                )
+                # Combine all memory types from the results
+                all_memories = []
+                all_memories.extend(results.get("individual_memories", []))
+                all_memories.extend(results.get("group_memories", []))
+                all_memories.extend(results.get("user_memories", []))
+                all_memories.extend(results.get("interaction_memories", []))
+                all_memories.extend(results.get("cross_group_memories", []))
+                response["relevant_memories"] = all_memories[:request.memory_limit]
+                response["group_profile"] = results.get("group_context")
+                response["user_profile"] = results.get("relevant_profiles")
+            else:
+                # DM context - use basic retrieve
+                memories = await asyncio.to_thread(
+                    system.hybrid_retriever.retrieve,
+                    request.query,
+                    enable_reflection=True
+                )
+                response["relevant_memories"] = memories[:request.memory_limit] if memories else []
         except Exception as e:
             print(f"[API] Warning: Could not search memories: {e}")
 
@@ -1179,7 +1521,8 @@ async def process_pending_messages(
 
     Useful for testing or forcing batch processing.
     """
-    memory_id = agent_id
+    # Include colon so parse_memory_id extracts agent_id correctly
+    memory_id = f"{agent_id}:"
     system = get_memory_system(memory_id)
 
     effective_group_id = group_id or f"dm_{agent_id}"
@@ -1209,7 +1552,7 @@ async def get_memory_stats(agent_id: str):
     """
     Get memory statistics for an agent.
     """
-    memory_id = agent_id
+    memory_id = f"{agent_id}:"  # Include colon for proper agent_id parsing
     system = get_memory_system(memory_id)
 
     stats = {
@@ -1229,6 +1572,16 @@ async def get_memory_stats(agent_id: str):
         stats["user_profile_count"] = user_store.count_profiles()
     except:
         pass
+
+    try:
+        _, group_store, _ = get_profile_stores(memory_id)
+        # Count group profiles for this agent
+        results = group_store.group_profiles_table.search().where(
+            f"agent_id = '{agent_id}'", prefilter=True
+        ).limit(1000).to_list()
+        stats["group_profile_count"] = len(results)
+    except Exception as e:
+        print(f"[Stats] Error counting group profiles: {e}")
 
     return stats
 
