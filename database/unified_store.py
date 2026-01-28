@@ -162,6 +162,8 @@ class UnifiedMemoryStore:
             self.memories_table = self.agent_db.open_table(table_name)
             print(f"[{self.agent_id}] Opened {table_name} ({self.memories_table.count_rows()} rows)")
 
+        self._create_vector_index(self.memories_table, "memories")
+
     def _init_group_memories_table(self):
         """Initialize group_memories table."""
         schema = pa.schema([
@@ -195,6 +197,7 @@ class UnifiedMemoryStore:
 
         # Create indices
         self._create_scalar_index(self.group_memories_table, "group_id")
+        self._create_vector_index(self.group_memories_table, "group_memories")
 
     def _init_user_memories_table(self):
         """Initialize user_memories table."""
@@ -232,6 +235,7 @@ class UnifiedMemoryStore:
         # Create indices
         self._create_scalar_index(self.user_memories_table, "group_id")
         self._create_scalar_index(self.user_memories_table, "user_id")
+        self._create_vector_index(self.user_memories_table, "user_memories")
 
     def _init_interaction_memories_table(self):
         """Initialize interaction_memories table."""
@@ -271,6 +275,7 @@ class UnifiedMemoryStore:
         self._create_scalar_index(self.interaction_memories_table, "group_id")
         self._create_scalar_index(self.interaction_memories_table, "speaker_id")
         self._create_scalar_index(self.interaction_memories_table, "listener_id")
+        self._create_vector_index(self.interaction_memories_table, "interaction_memories")
 
     def _init_cross_group_memories_table(self):
         """Initialize cross_group_memories table."""
@@ -308,6 +313,7 @@ class UnifiedMemoryStore:
 
         # Create indices
         self._create_scalar_index(self.cross_group_memories_table, "universal_user_id")
+        self._create_vector_index(self.cross_group_memories_table, "cross_group_memories")
 
     def _init_cross_agent_links_table(self):
         """Initialize cross_agent_links table in global DB."""
@@ -401,6 +407,28 @@ class UnifiedMemoryStore:
         except Exception as e:
             pass  # Index may already exist
 
+    def _create_vector_index(self, table, table_name: str, min_rows: int = 256):
+        """
+        Create IVF_PQ vector index for fast ANN search.
+
+        Only creates index when table has enough rows (LanceDB requires >= 256
+        for IVF_PQ). Falls back to brute-force for smaller tables which is fine.
+        """
+        try:
+            row_count = table.count_rows()
+            if row_count < min_rows:
+                return
+
+            table.create_index(
+                metric="cosine",
+                num_partitions=min(row_count // 20, 64),
+                num_sub_vectors=min(self.embedding_model.dimension // 16, 24),
+                replace=True
+            )
+            print(f"[{self.agent_id}] Vector index created for {table_name} ({row_count} rows)")
+        except Exception as e:
+            pass  # Index may already exist or not enough data
+
     def _init_fts_index(self, table, column: str, table_name: str):
         """Initialize Full-Text Search index."""
         if self._fts_initialized.get(table_name, False):
@@ -471,7 +499,8 @@ class UnifiedMemoryStore:
         self,
         query: str,
         user_id: str = None,
-        top_k: int = 10
+        top_k: int = 10,
+        query_vector=None
     ) -> List[MemoryEntry]:
         """
         Search DM memories (SimpleMem compatible).
@@ -480,12 +509,15 @@ class UnifiedMemoryStore:
             query: Search query
             user_id: Optional user filter
             top_k: Max results
+            query_vector: Pre-computed query embedding (skip encoding if provided)
         """
         if self.memories_table.count_rows() == 0:
             return []
 
-        query_vector = self.embedding_model.encode_single(query, is_query=True)
-        search = self.memories_table.search(query_vector.tolist())
+        if query_vector is None:
+            query_vector = self.embedding_model.encode_single(query, is_query=True)
+        vec = query_vector.tolist() if hasattr(query_vector, 'tolist') else query_vector
+        search = self.memories_table.search(vec).distance_type("cosine")
 
         # Apply filters
         conditions = [f"agent_id = '{self.agent_id}'"]
@@ -494,6 +526,14 @@ class UnifiedMemoryStore:
 
         where_clause = " AND ".join(conditions)
         search = search.where(where_clause, prefilter=True)
+
+        # Select only needed columns (skip vector to reduce I/O)
+        search = search.select([
+            "_distance", "entry_id", "lossless_restatement", "keywords", "timestamp",
+            "location", "persons", "entities", "topic", "group_id",
+            "user_id", "username", "platform", "memory_type",
+            "privacy_scope", "importance_score"
+        ])
 
         results = search.limit(top_k).to_list()
         memories = [self._row_to_memory_entry(r) for r in results]
@@ -1454,14 +1494,17 @@ Return ONLY the JSON object.
         group_id: str,
         query: str,
         limit: int = 10,
-        memory_type: Optional[MemoryType] = None
+        memory_type: Optional[MemoryType] = None,
+        query_vector=None
     ) -> List[GroupMemory]:
         """Search group memories by semantic similarity."""
         if self.group_memories_table.count_rows() == 0:
             return []
 
-        query_vector = self.embedding_model.encode_single(query, is_query=True)
-        search = self.group_memories_table.search(query_vector.tolist())
+        if query_vector is None:
+            query_vector = self.embedding_model.encode_single(query, is_query=True)
+        vec = query_vector.tolist() if hasattr(query_vector, 'tolist') else query_vector
+        search = self.group_memories_table.search(vec).distance_type("cosine")
 
         conditions = [f"group_id = '{group_id}'"]
         if memory_type:
@@ -1469,6 +1512,15 @@ Return ONLY the JSON object.
 
         where_clause = " AND ".join(conditions)
         search = search.where(where_clause, prefilter=True)
+
+        # Select only needed columns (skip vector to reduce I/O)
+        search = search.select([
+            "_distance", "memory_id", "agent_id", "group_id", "memory_level",
+            "memory_type", "privacy_scope", "content", "speaker",
+            "keywords", "topics", "importance_score", "evidence_count",
+            "first_seen", "last_seen", "last_updated",
+            "source_message_id", "source_timestamp"
+        ])
 
         results = search.limit(limit).to_list()
         group_memories = [self._row_to_group_memory(r) for r in results]
@@ -1509,20 +1561,32 @@ Return ONLY the JSON object.
         group_id: str,
         query: str,
         limit: int = 10,
-        exclude_user_id: Optional[str] = None
+        exclude_user_id: Optional[str] = None,
+        query_vector=None
     ) -> List[UserMemory]:
         """Search user memories across ALL users in a group."""
         if self.user_memories_table.count_rows() == 0:
             return []
 
-        query_vector = self.embedding_model.encode_single(query, is_query=True)
-        search = self.user_memories_table.search(query_vector.tolist())
+        if query_vector is None:
+            query_vector = self.embedding_model.encode_single(query, is_query=True)
+        vec = query_vector.tolist() if hasattr(query_vector, 'tolist') else query_vector
+        search = self.user_memories_table.search(vec).distance_type("cosine")
 
         where_clause = f"group_id = '{group_id}'"
         if exclude_user_id:
             where_clause += f" AND user_id != '{exclude_user_id}'"
 
         search = search.where(where_clause, prefilter=True)
+
+        # Select only needed columns (skip vector to reduce I/O)
+        search = search.select([
+            "_distance", "memory_id", "agent_id", "group_id", "user_id",
+            "memory_level", "memory_type", "privacy_scope", "content",
+            "keywords", "topics", "importance_score", "evidence_count",
+            "first_seen", "last_seen", "last_updated",
+            "source_message_id", "source_timestamp", "username", "platform"
+        ])
 
         results = search.limit(limit).to_list()
         user_memories = [self._row_to_user_memory(r) for r in results]
@@ -1537,7 +1601,8 @@ Return ONLY the JSON object.
         group_id: str,
         speaker_id: Optional[str] = None,
         query: Optional[str] = None,
-        limit: int = 10
+        limit: int = 10,
+        query_vector=None
     ) -> List[InteractionMemory]:
         """Search interaction memories."""
         if self.interaction_memories_table.count_rows() == 0:
@@ -1549,13 +1614,25 @@ Return ONLY the JSON object.
 
         where_clause = " AND ".join(conditions)
 
+        # Columns needed by _row_to_interaction_memory
+        select_cols = [
+            "_distance", "memory_id", "agent_id", "group_id", "speaker_id",
+            "listener_id", "mentioned_users", "memory_level",
+            "memory_type", "privacy_scope", "content", "keywords",
+            "topics", "importance_score", "evidence_count",
+            "first_seen", "last_seen", "last_updated",
+            "source_message_id", "source_timestamp", "interaction_type"
+        ]
+
         if query:
-            query_vector = self.embedding_model.encode_single(query, is_query=True)
-            search = self.interaction_memories_table.search(query_vector.tolist())
-            search = search.where(where_clause, prefilter=True)
+            if query_vector is None:
+                query_vector = self.embedding_model.encode_single(query, is_query=True)
+            vec = query_vector.tolist() if hasattr(query_vector, 'tolist') else query_vector
+            search = self.interaction_memories_table.search(vec).distance_type("cosine")
+            search = search.where(where_clause, prefilter=True).select(select_cols)
             results = search.limit(limit).to_list()
         else:
-            results = self.interaction_memories_table.search().where(where_clause, prefilter=True).limit(limit).to_list()
+            results = self.interaction_memories_table.search().where(where_clause, prefilter=True).select(select_cols).limit(limit).to_list()
 
         interaction_memories = [self._row_to_interaction_memory(r) for r in results]
 
@@ -1568,17 +1645,30 @@ Return ONLY the JSON object.
         self,
         universal_user_id: str,
         query: str,
-        limit: int = 10
+        limit: int = 10,
+        query_vector=None
     ) -> List[CrossGroupMemory]:
         """Search cross-group memories for a user."""
         if self.cross_group_memories_table.count_rows() == 0:
             return []
 
-        query_vector = self.embedding_model.encode_single(query, is_query=True)
-        search = self.cross_group_memories_table.search(query_vector.tolist())
+        if query_vector is None:
+            query_vector = self.embedding_model.encode_single(query, is_query=True)
+        vec = query_vector.tolist() if hasattr(query_vector, 'tolist') else query_vector
+        search = self.cross_group_memories_table.search(vec).distance_type("cosine")
 
         where_clause = f"universal_user_id = '{universal_user_id}'"
         search = search.where(where_clause, prefilter=True)
+
+        # Select only needed columns (skip vector to reduce I/O)
+        search = search.select([
+            "_distance", "memory_id", "agent_id", "universal_user_id",
+            "user_identities", "groups_involved", "group_count",
+            "memory_level", "memory_type", "privacy_scope", "content",
+            "keywords", "topics", "confidence_score", "pattern_type",
+            "evidence_count", "first_seen", "last_seen", "last_updated",
+            "consolidated_at", "source_memory_ids"
+        ])
 
         results = search.limit(limit).to_list()
         cross_group_memories = [self._row_to_cross_group_memory(r) for r in results]
@@ -1992,9 +2082,9 @@ Return ONLY the JSON object.
             Dictionary with existing memory data if found, None otherwise
         """
         try:
-            # Search with vector similarity and filter
             results = (
                 table.search(vector)
+                .distance_type("cosine")
                 .where(f"{filter_field} = '{filter_value}'", prefilter=True)
                 .limit(1)
                 .to_list()
@@ -2002,8 +2092,6 @@ Return ONLY the JSON object.
 
             if results:
                 result = results[0]
-                # LanceDB returns cosine distance, need to convert to similarity
-                # distance = 1 - similarity, so similarity = 1 - distance
                 distance = result.get("_distance", 1.0)
                 similarity = 1.0 - distance
 
@@ -2014,6 +2102,40 @@ Return ONLY the JSON object.
             print(f"[{self.agent_id}] Error finding similar memory: {e}")
 
         return None
+
+    # ============================================================
+    # Compaction / Optimization
+    # ============================================================
+
+    def optimize_tables(self):
+        """
+        Compact LanceDB table fragments and clean up old versions.
+
+        Every table.add() creates a new fragment. Over time, scans become
+        O(fragments) instead of O(rows). Call this periodically (e.g., after
+        each batch) to merge fragments back into a compact layout.
+        """
+        tables = [
+            ("memories", self.memories_table),
+            ("group_memories", self.group_memories_table),
+            ("user_memories", self.user_memories_table),
+            ("interaction_memories", self.interaction_memories_table),
+            ("cross_group_memories", self.cross_group_memories_table),
+            ("agent_responses", self.agent_responses_table),
+            ("conversation_summaries", self.conversation_summaries_table),
+        ]
+
+        optimized = 0
+        for name, table in tables:
+            try:
+                table.optimize()
+                optimized += 1
+            except Exception as e:
+                if "No data" not in str(e) and "Nothing" not in str(e):
+                    print(f"[optimize] {name}: {e}")
+
+        if optimized > 0:
+            print(f"[optimize] Compacted {optimized} tables")
 
     # ============================================================
     # Conversation Summary Methods
@@ -2321,29 +2443,13 @@ Write a concise updated summary:"""
         table_name: str = "group_memories"
     ):
         """
-        Track access for multiple search results.
+        Track access for search results (no-op for now).
 
-        This should be called after search results are returned.
-        It's a fire-and-forget operation that doesn't block.
-
-        Args:
-            results: List of memory objects returned from search
-            table_name: Table name for the results
+        Access tracking is not yet implemented — _track_memory_access
+        requires schema migration to add access_count field.
+        Keeping the method signature for future use.
         """
-        if not results:
-            return
-
-        # Extract memory IDs from results
-        memory_ids = []
-        for item in results:
-            if hasattr(item, 'memory_id'):
-                memory_ids.append(item.memory_id)
-            elif hasattr(item, 'entry_id'):
-                memory_ids.append(item.entry_id)
-
-        # Track access for each memory (non-blocking)
-        for memory_id in memory_ids:
-            self._track_memory_access(memory_id, table_name)
+        pass
 
     def clear_agent_data(self):
         """Clear all data for this agent."""

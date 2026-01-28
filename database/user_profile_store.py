@@ -480,13 +480,10 @@ class UserProfileStore:
         basename: Optional[str] = None
     ) -> UserProfile:
         """
-        Generate or update user profile from conversation messages using a0x-models API.
+        Generate or update user profile from conversation messages.
 
-        Calls:
-        1. /summarize - User summary
-        2. /classify - Expertise level, Communication style, Domains
-        3. /keywords - Interest keywords
-        4. /ner - Named entities
+        Single LLM call extracts everything: summary, interests, expertise,
+        communication style, domains, and entities.
 
         Args:
             agent_id: Agent ID
@@ -500,26 +497,27 @@ class UserProfileStore:
         Returns:
             Created or updated UserProfile
         """
-        import requests
         import json as json_module
 
         # Combine messages for analysis
         full_text = "\n".join(messages)
         universal_user_id = f"{platform_type}:{platform_specific_id}"
 
-        a0x_models_url = os.getenv("A0X_MODELS_URL", "https://a0x-models-679925931457.us-central1.run.app")
-
-        # 1 + 5. SUMMARIZE + KEYWORDS via Llama structured output (replaces a0x-models /summarize and /keywords)
+        # Single LLM call for full profile extraction (replaces 1 LLM + 3 /classify + 1 /ner)
         from utils.structured_schemas import USER_PROFILE_EXTRACTION_SCHEMA
         try:
-            profile_prompt = f"""Analyze the following user messages and extract a profile.
+            profile_prompt = f"""Analyze the following user messages and extract a complete profile.
 
 MESSAGES:
 {full_text[:6000]}
 
 INSTRUCTIONS:
-1. "summary": Write a 1-2 sentence summary of who this user is based ONLY on evidence in the messages. Include their name/handle if mentioned, what they do, and their main focus areas. Do NOT repeat words or phrases.
-2. "interests": List 5-10 specific interests as keywords. Each must be a concrete topic (e.g. "Solidity development", "MEV strategies", "NFT art") NOT generic bigrams. Score each 0.0-1.0 based on how much evidence supports it.
+1. "summary": 1-2 sentence summary of who this user is based ONLY on evidence. Include name/handle, what they do, main focus areas. No repeated phrases.
+2. "interests": 5-10 specific interest keywords (e.g. "Solidity development", "MEV strategies", "NFT art"). Score each 0.0-1.0 by evidence strength.
+3. "expertise_level": One of "beginner", "intermediate", "advanced", "expert" based on demonstrated knowledge.
+4. "communication_style": One of "formal", "casual", "technical", "conversational" based on how they write.
+5. "domains": Which domains they engage with. For each, score 0.0-1.0 by relevance. Only include domains with score > 0.3.
+6. "entities": Named entities mentioned (projects, protocols, tokens, tools, people, organizations). Include context for each.
 
 Return ONLY the JSON."""
             extraction_response = self.profile_llm.chat_completion(
@@ -528,84 +526,42 @@ Return ONLY the JSON."""
                 response_format=USER_PROFILE_EXTRACTION_SCHEMA,
             )
             extracted = json_module.loads(extraction_response)
+
             summary = extracted["summary"]
             interests = []
             for item in extracted.get("interests", [])[:10]:
                 interests.append(Interest(keyword=item["keyword"], score=item["score"]))
-        except Exception as e:
-            print(f"[UserProfileStore] Llama profile extraction failed: {e}")
-            summary = f"User with {len(messages)} messages"
-            interests = []
 
-        # 2. CLASSIFY EXPERTISE
-        try:
-            response = requests.post(
-                f"{a0x_models_url}/classify",
-                json={"text": full_text, "labels": ["beginner", "intermediate", "advanced", "expert"]},
-                timeout=60
-            )
-            response.raise_for_status()
-            expertise_data = response.json()
             expertise = TraitScore(
-                value=expertise_data["labels"][0],
-                confidence=expertise_data["scores"][0]
+                value=extracted.get("expertise_level", "intermediate"),
+                confidence=0.8
             )
-        except Exception as e:
-            print(f"[UserProfileStore] Expertise classify failed: {e}")
-            expertise = TraitScore(value="intermediate", confidence=0.5)
-
-        # 3. CLASSIFY COMMUNICATION STYLE
-        try:
-            response = requests.post(
-                f"{a0x_models_url}/classify",
-                json={"text": full_text, "labels": ["formal", "casual", "technical", "conversational"]},
-                timeout=60
-            )
-            response.raise_for_status()
-            style_data = response.json()
             communication_style = TraitScore(
-                value=style_data["labels"][0],
-                confidence=style_data["scores"][0]
+                value=extracted.get("communication_style", "conversational"),
+                confidence=0.8
             )
-        except Exception as e:
-            print(f"[UserProfileStore] Style classify failed: {e}")
-            communication_style = TraitScore(value="conversational", confidence=0.5)
-
-        # 4. CLASSIFY DOMAINS
-        try:
-            response = requests.post(
-                f"{a0x_models_url}/classify",
-                json={"text": full_text, "labels": ["defi", "nfts", "gaming", "trading", "development", "design", "marketing", "music"]},
-                timeout=60
-            )
-            response.raise_for_status()
-            domains_data = response.json()
-        except Exception as e:
-            print(f"[UserProfileStore] Domains classify failed: {e}")
-            domains_data = {"labels": [], "scores": []}
-
-        # 5. KEYWORDS - already extracted in step 1+5 via Llama structured output
-
-        # 6. EXTRACT ENTITIES (NER)
-        entities = []
-        try:
-            response = requests.post(
-                f"{a0x_models_url}/ner",
-                json={"text": full_text},
-                timeout=60
-            )
-            response.raise_for_status()
-            ner_data = response.json()
-            for ent in ner_data.get("entities", []):
+            domains_data = {
+                "labels": [d["name"] for d in extracted.get("domains", [])],
+                "scores": [d["score"] for d in extracted.get("domains", [])]
+            }
+            entities = []
+            for ent in extracted.get("entities", []):
                 entities.append(EntityInfo(
-                    type=ent.get("type", "unknown"),
-                    name=ent.get("text", ""),
+                    type=ent.get("type", "other"),
+                    name=ent.get("name", ""),
                     context=ent.get("context", "")
                 ))
-        except Exception as e:
-            print(f"[UserProfileStore] NER failed: {e}")
 
-        # Build traits from classifications
+        except Exception as e:
+            print(f"[UserProfileStore] Profile extraction failed: {e}")
+            summary = f"User with {len(messages)} messages"
+            interests = []
+            expertise = TraitScore(value="intermediate", confidence=0.5)
+            communication_style = TraitScore(value="conversational", confidence=0.5)
+            domains_data = {"labels": [], "scores": []}
+            entities = []
+
+        # Build traits
         traits = {
             "engagement_level": TraitScore(value="active" if len(messages) >= 10 else "casual", confidence=0.7),
         }

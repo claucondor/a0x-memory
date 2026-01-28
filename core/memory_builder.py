@@ -735,6 +735,13 @@ Return a JSON array, each element is a memory entry:
 ```
 """
 
+        if is_group:
+            group_example_suffix1 = ',\n    "memory_type": "announcement",\n    "importance_score": 0.7'
+            group_example_suffix2 = ',\n    "memory_type": "conversation",\n    "importance_score": 0.4'
+        else:
+            group_example_suffix1 = ""
+            group_example_suffix2 = ""
+
         return f"""
 Your task is to extract all valuable information from the following dialogues and convert them into structured memory entries.
 {group_section}
@@ -772,9 +779,7 @@ Output:
     "location": "Starbucks",
     "persons": ["Alice", "Bob"],
     "entities": ["new product"],
-    "topic": "Product discussion meeting arrangement"{"," if is_group else ""}
-    {"\"memory_type\": \"announcement\"," if is_group else ""}
-    {"\"importance_score\": 0.7" if is_group else ""}
+    "topic": "Product discussion meeting arrangement"{group_example_suffix1}
   }},
   {{
     "lossless_restatement": "Bob agreed to attend the meeting and committed to prepare relevant materials.",
@@ -783,9 +788,7 @@ Output:
     "location": null,
     "persons": ["Bob"],
     "entities": [],
-    "topic": "Meeting preparation confirmation"{"," if is_group else ""}
-    {"\"memory_type\": \"conversation\"," if is_group else ""}
-    {"\"importance_score\": 0.4" if is_group else ""}
+    "topic": "Meeting preparation confirmation"{group_example_suffix2}
   }}
 ]
 ```

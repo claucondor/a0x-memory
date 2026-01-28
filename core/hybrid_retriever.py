@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 import dateparser
 import concurrent.futures
 import numpy as np
+from lancedb.rerankers import RRFReranker
 
 
 class HybridRetriever:
@@ -116,37 +117,32 @@ class HybridRetriever:
     def _retrieve_with_planning(self, query: str, enable_reflection: Optional[bool] = None) -> List[MemoryEntry]:
         """
         Execute retrieval with intelligent planning process
-        
+
         Args:
-        - query: Search query  
+        - query: Search query
         - enable_reflection: Override reflection setting for this query
         """
         print(f"\n[Planning] Analyzing information requirements for: {query}")
-        
-        # Step 1: Intelligent analysis of what information is needed
-        information_plan = self._analyze_information_requirements(query)
-        print(f"[Planning] Identified {len(information_plan['required_info'])} information requirements")
-        
-        # Step 2: Generate minimal necessary queries based on the plan
-        search_queries = self._generate_targeted_queries(query, information_plan)
+
+        # Step 1+2: Combined analysis + query generation (single LLM call)
+        information_plan, search_queries = self._plan_and_generate_queries(query)
+        print(f"[Planning] Identified {len(information_plan.get('required_info', []))} information requirements")
         print(f"[Planning] Generated {len(search_queries)} targeted queries")
         
-        # Step 3: Execute searches for all queries (parallel or sequential)
+        # Step 3: Batch-encode queries, then execute searches (parallel or sequential)
+        query_vectors = self.unified_store.embedding_model.encode_query(search_queries)
         if self.enable_parallel_retrieval and len(search_queries) > 1:
-            all_results = self._execute_parallel_searches(search_queries)
+            all_results = self._execute_parallel_searches_with_vectors(search_queries, query_vectors)
         else:
             all_results = []
             for i, search_query in enumerate(search_queries, 1):
                 print(f"[Search {i}] {search_query}")
-                results = self._semantic_search(search_query)
+                results = self.unified_store.search_memories(search_query, top_k=self.semantic_top_k, query_vector=query_vectors[i-1])
                 all_results.extend(results)
         
         # Step 4: Merge and deduplicate results
         merged_results = self._merge_and_deduplicate_entries(all_results)
         print(f"[Planning] Found {len(merged_results)} unique results")
-
-        # Step 4.5: Content similarity dedup
-        merged_results = self._deduplicate_by_content(merged_results, "dm_memories")
 
         # Step 5: Adaptive keyword boost (only when LLM detects exact match terms)
         use_keyword_boost = information_plan.get("use_keyword_boost", False)
@@ -231,8 +227,6 @@ class HybridRetriever:
                 # Merge with existing results
                 all_results = current_results + additional_results
                 current_results = self._merge_and_deduplicate_entries(all_results)
-                # Content similarity dedup
-                current_results = self._deduplicate_by_content(current_results, "dm_memories_reflection")
                 print(f"[Reflection Round {round_num + 1}] Total results: {len(current_results)}")
                 
             else:  # "no_results"
@@ -667,6 +661,36 @@ Return ONLY the JSON, no other text.
         
         return "\n".join(formatted)
     
+    def _execute_parallel_searches_with_vectors(self, search_queries: List[str], query_vectors) -> List[MemoryEntry]:
+        """Execute multiple search queries in parallel using pre-computed vectors."""
+        print(f"[Parallel Search] Executing {len(search_queries)} queries in parallel with pre-computed vectors")
+        all_results = []
+
+        def _search_worker(args):
+            i, query, vector = args
+            print(f"[Search {i}] {query}")
+            return self.unified_store.search_memories(query, top_k=self.semantic_top_k, query_vector=vector)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_retrieval_workers) as executor:
+                tasks = [(i+1, q, query_vectors[i]) for i, q in enumerate(search_queries)]
+                future_to_idx = {executor.submit(_search_worker, t): t[0] for t in tasks}
+                for future in concurrent.futures.as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        results = future.result()
+                        all_results.extend(results)
+                        print(f"[Parallel Search] Query {idx} completed: {len(results)} results")
+                    except Exception as e:
+                        print(f"[Parallel Search] Query {idx} failed: {e}")
+        except Exception as e:
+            print(f"[Parallel Search] Failed: {e}. Falling back to sequential.")
+            for i, query in enumerate(search_queries):
+                results = self.unified_store.search_memories(query, top_k=self.semantic_top_k, query_vector=query_vectors[i])
+                all_results.extend(results)
+
+        return all_results
+
     def _execute_parallel_searches(self, search_queries: List[str]) -> List[MemoryEntry]:
         """
         Execute multiple search queries in parallel using ThreadPoolExecutor
@@ -911,32 +935,129 @@ Return ONLY the JSON, no other text.
             # Fallback to original query
             return [original_query]
     
+    def _plan_and_generate_queries(self, query: str) -> tuple:
+        """
+        Combined planning: analyze information requirements AND generate targeted queries
+        in a single LLM call instead of two sequential calls.
+
+        Returns:
+            Tuple of (information_plan dict, list of search queries)
+        """
+        prompt = f"""
+Analyze the following question and generate targeted search queries to find the answer in a PERSONAL MEMORY STORE (conversations, facts shared by users, user profiles). This is NOT a web search.
+
+Question: {query}
+
+Think step by step:
+1. What type of question is this? (factual, temporal, relational, etc.)
+2. What key entities need to be identified?
+3. What minimal set of search queries would find the relevant memories?
+4. Are there technical terms requiring exact lexical matching?
+
+Return in JSON format:
+```json
+{{
+  "question_type": "type of question",
+  "key_entities": ["entity1", "entity2"],
+  "required_info": [
+    {{
+      "info_type": "what kind of information",
+      "description": "specific information needed",
+      "priority": "high/medium/low"
+    }}
+  ],
+  "exact_match_terms": [],
+  "use_keyword_boost": false,
+  "queries": [
+    "targeted search query 1",
+    "targeted search query 2"
+  ]
+}}
+```
+
+For exact_match_terms, include ONLY terms requiring exact lexical matching (function names, error codes, version numbers, file names).
+Set use_keyword_boost=true ONLY if exact_match_terms is non-empty.
+
+For queries: generate 1-3 focused queries. Always include the original question. Each query should target a distinct information need. Keep queries natural and conversational (these search a memory store, NOT the web).
+
+Return ONLY the JSON, no other text.
+"""
+
+        messages = [
+            {"role": "system", "content": "You are a memory retrieval planner. You must output valid JSON format."},
+            {"role": "user", "content": prompt}
+        ]
+
+        try:
+            response = self.llm_client.chat_completion(
+                messages,
+                temperature=0.2,
+                response_format=None  # Let it return raw JSON
+            )
+            try:
+                result = json.loads(response)
+            except (json.JSONDecodeError, TypeError):
+                result = self.llm_client.extract_json(response)
+
+            queries = result.get("queries", [query])
+            if query not in queries:
+                queries.insert(0, query)
+            queries = queries[:4]
+
+            # Build information_plan from the combined response
+            information_plan = {
+                "question_type": result.get("question_type", "general"),
+                "key_entities": result.get("key_entities", []),
+                "required_info": result.get("required_info", []),
+                "exact_match_terms": result.get("exact_match_terms", []),
+                "use_keyword_boost": result.get("use_keyword_boost", False),
+            }
+
+            return information_plan, queries
+
+        except Exception as e:
+            print(f"Failed combined planning: {e}")
+            return {
+                "question_type": "general",
+                "key_entities": [],
+                "required_info": [{"info_type": "general", "description": "relevant information", "priority": "high"}],
+                "exact_match_terms": [],
+                "use_keyword_boost": False,
+            }, [query]
+
     def _retrieve_with_intelligent_reflection(self, query: str, initial_results: List[MemoryEntry], information_plan: Dict[str, Any]) -> List[MemoryEntry]:
         """
-        Execute intelligent reflection-based additional retrieval
+        Execute intelligent reflection-based additional retrieval.
+        Limited to 1 round max and skips if initial results already have good coverage.
         """
         current_results = initial_results
-        
-        for round_num in range(self.max_reflection_rounds):
+
+        # Skip reflection entirely if we already have a decent number of results
+        if len(current_results) >= 5:
+            print(f"\n[Intelligent Reflection] Skipping - already have {len(current_results)} results")
+            return current_results
+
+        # Only do 1 round of reflection (the second round almost never helps)
+        max_rounds = min(self.max_reflection_rounds, 1)
+
+        for round_num in range(max_rounds):
             print(f"\n[Intelligent Reflection Round {round_num + 1}] Analyzing information completeness...")
-            
-            # Intelligent analysis of information completeness
+
             if not current_results:
                 completeness_status = "no_results"
+                coverage = 0
             else:
-                completeness_status = self._analyze_information_completeness(query, current_results, information_plan)
-            
+                completeness_status, coverage = self._analyze_information_completeness_fast(query, current_results, information_plan)
+
             if completeness_status == "complete":
                 print(f"[Intelligent Reflection Round {round_num + 1}] Information is complete")
                 break
             elif completeness_status == "incomplete":
                 print(f"[Intelligent Reflection Round {round_num + 1}] Information is incomplete, generating targeted additional queries...")
-                
-                # Generate targeted additional queries based on what's missing
+
                 additional_queries = self._generate_missing_info_queries(query, current_results, information_plan)
                 print(f"[Intelligent Reflection Round {round_num + 1}] Generated {len(additional_queries)} targeted queries")
-                
-                # Execute additional searches
+
                 if self.enable_parallel_retrieval and len(additional_queries) > 1:
                     print(f"[Intelligent Reflection Round {round_num + 1}] Executing {len(additional_queries)} queries in parallel")
                     additional_results = self._execute_parallel_additional_searches(additional_queries, round_num + 1)
@@ -946,20 +1067,84 @@ Return ONLY the JSON, no other text.
                         print(f"[Additional Search {i}] {add_query}")
                         results = self._semantic_search(add_query)
                         additional_results.extend(results)
-                
-                # Merge with existing results
+
                 all_results = current_results + additional_results
                 current_results = self._merge_and_deduplicate_entries(all_results)
-                # Content similarity dedup
-                current_results = self._deduplicate_by_content(current_results, "dm_memories_intelligent_reflection")
                 print(f"[Intelligent Reflection Round {round_num + 1}] Total results: {len(current_results)}")
-                
+
             else:  # "no_results"
                 print(f"[Intelligent Reflection Round {round_num + 1}] No results found, cannot continue reflection")
                 break
-        
+
         return current_results
     
+    def _analyze_information_completeness_fast(self, query: str, current_results: List[MemoryEntry], information_plan: Dict[str, Any]) -> tuple:
+        """
+        Fast completeness check. Returns (status, coverage_percentage).
+        If coverage >= 70%, considers it complete.
+        """
+        if not current_results:
+            return ("no_results", 0)
+
+        context_str = self._format_contexts_for_check(current_results)
+        required_info = information_plan.get('required_info', [])
+
+        prompt = f"""
+You are checking if a PERSONAL MEMORY STORE has enough information to answer a question.
+This is NOT a web search - we only have memories from personal conversations.
+
+Question: {query}
+
+Required Information Types: {required_info}
+
+Current Available Information:
+{context_str}
+
+Does the available information contain enough to provide a reasonable answer?
+If the memories mention relevant people, facts, or events - that's sufficient.
+Don't mark as incomplete just because the information isn't encyclopedic.
+
+Return in JSON:
+```json
+{{
+  "assessment": "complete" OR "incomplete",
+  "coverage_percentage": 85,
+  "reasoning": "Brief explanation"
+}}
+```
+
+Return ONLY JSON.
+"""
+
+        messages = [
+            {"role": "system", "content": "You are evaluating memory store completeness. Output valid JSON."},
+            {"role": "user", "content": prompt}
+        ]
+
+        try:
+            response = self.llm_client.chat_completion(
+                messages, temperature=0.1,
+                response_format=INFORMATION_COMPLETENESS_SCHEMA
+            )
+            try:
+                result = json.loads(response)
+            except (json.JSONDecodeError, TypeError):
+                result = self.llm_client.extract_json(response)
+
+            coverage = result.get("coverage_percentage", 0)
+            assessment = result.get("assessment", "incomplete")
+
+            # Override: if coverage >= 70%, consider complete
+            if coverage >= 70:
+                assessment = "complete"
+
+            print(f"[Intelligent Reflection] Coverage: {coverage}% - {result.get('reasoning', '')}")
+            return (assessment, coverage)
+
+        except Exception as e:
+            print(f"Failed to analyze completeness: {e}")
+            return ("incomplete", 0)
+
     def _analyze_information_completeness(self, query: str, current_results: List[MemoryEntry], information_plan: Dict[str, Any]) -> str:
         """
         Analyze if current results provide complete information to answer the query
@@ -1031,33 +1216,36 @@ Return ONLY the JSON, no other text.
         required_info = information_plan.get('required_info', [])
         
         prompt = f"""
-Based on the original question, required information types, and currently available information, generate targeted search queries to find the missing information needed to answer the question completely.
+You are searching a PERSONAL MEMORY STORE containing conversations and facts shared by users. This is NOT a web search engine.
+
+Based on the original question and currently available memories, generate 1-3 additional search queries to find missing information.
 
 Original Question: {original_query}
 
 Required Information Types: {required_info}
 
-Currently Available Information:
+Currently Available Memories:
 {context_str}
 
-Generate 1-3 specific search queries that would help find the missing information. Focus on:
-1. Information gaps identified in the current context
-2. Specific missing details needed to answer the original question
-3. Different search angles that might retrieve the missing information
+IMPORTANT: Generate queries that would match memories from conversations. Use natural language like:
+- "Who mentioned working on X?"
+- "What did users say about Y?"
+- "experiences with Z"
 
-Return your response in JSON format:
+Do NOT generate web-style queries like "site:linkedin.com" or "demographics of X".
+
+Return in JSON:
 ```json
 {{
-  "missing_analysis": "Brief analysis of what specific information is missing",
+  "missing_analysis": "Brief analysis of what's missing",
   "targeted_queries": [
-    "specific query 1 for missing info",
-    "specific query 2 for missing info",
-    ...
+    "natural conversational query 1",
+    "natural conversational query 2"
   ]
 }}
 ```
 
-Return ONLY the JSON, no other text.
+Return ONLY JSON.
 """
         
         messages = [
@@ -1131,11 +1319,9 @@ Return ONLY the JSON, no other text.
         # Group path: intelligent pipeline with multi-table fan-out
         print(f"\n[retrieve_for_context] Intelligent group retrieval for: {query}")
 
-        # Step 1: Planning - analyze info requirements and generate queries
-        information_plan = self._analyze_information_requirements(query)
+        # Step 1: Combined planning + query generation (single LLM call)
+        information_plan, search_queries = self._plan_and_generate_queries(query)
         print(f"[retrieve_for_context] Identified {len(information_plan.get('required_info', []))} info requirements")
-
-        search_queries = self._generate_targeted_queries(query, information_plan)
         print(f"[retrieve_for_context] Generated {len(search_queries)} targeted queries")
 
         use_keyword_boost = information_plan.get("use_keyword_boost", False)
@@ -1143,24 +1329,30 @@ Return ONLY the JSON, no other text.
 
         top_k = self.semantic_top_k
 
-        # Step 2: Fan-out queries to all group tables (parallel)
+        # Step 2: Batch-encode ALL queries at once (1 API call instead of N*4)
+        query_vectors = self.unified_store.embedding_model.encode_query(search_queries)
+        query_vector_map = {sq: query_vectors[i] for i, sq in enumerate(search_queries)}
+        print(f"[retrieve_for_context] Batch-encoded {len(search_queries)} queries (1 API call)")
+
+        # Step 3: Fan-out queries to all group tables (parallel) with pre-computed vectors
         all_group_memories = []
         all_user_memories = []
         all_interaction_memories = []
         all_cross_group_memories = []
 
         def _search_group_for_query(sq: str):
-            """Search all group tables for a single query."""
-            gm = self.unified_store.search_group_memories(group_id, sq, limit=top_k)
-            um = self.unified_store.search_user_memories_in_group(group_id, sq, limit=top_k, exclude_user_id=user_id)
-            im = self.unified_store.search_interactions(group_id, speaker_id=user_id, query=sq, limit=top_k)
+            """Search all group tables for a single query using pre-computed vector."""
+            qv = query_vector_map[sq]
+            gm = self.unified_store.search_group_memories(group_id, sq, limit=top_k, query_vector=qv)
+            um = self.unified_store.search_user_memories_in_group(group_id, sq, limit=top_k, exclude_user_id=user_id, query_vector=qv)
+            im = self.unified_store.search_interactions(group_id, speaker_id=user_id, query=sq, limit=top_k, query_vector=qv)
             cg = []
             if user_id:
-                cg = self.unified_store.search_cross_group(user_id, sq, limit=top_k)
+                cg = self.unified_store.search_cross_group(user_id, sq, limit=top_k, query_vector=qv)
             return gm, um, im, cg
 
         if self.enable_parallel_retrieval and len(search_queries) > 1:
-            print(f"[retrieve_for_context] Parallel fan-out: {len(search_queries)} queries x 4 tables")
+            print(f"[retrieve_for_context] Parallel fan-out: {len(search_queries)} queries x 4 tables (vectors pre-computed)")
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_retrieval_workers) as executor:
                     futures = {executor.submit(_search_group_for_query, sq): sq for sq in search_queries}
@@ -1217,13 +1409,6 @@ Return ONLY the JSON, no other text.
         all_interaction_memories = self._deduplicate_by_id(all_interaction_memories, "memory_id")
         all_cross_group_memories = self._deduplicate_by_id(all_cross_group_memories, "memory_id")
 
-        # Step 4.5: Deduplicate by content similarity
-        all_group_memories = self._deduplicate_by_content(all_group_memories, "group_memories")
-        all_user_memories = self._deduplicate_by_content(all_user_memories, "user_memories")
-        all_interaction_memories = self._deduplicate_by_content(all_interaction_memories, "interaction_memories")
-        if all_cross_group_memories:
-            all_cross_group_memories = self._deduplicate_by_content(all_cross_group_memories, "cross_group_memories")
-
         print(f"[retrieve_for_context] Results (pre-temporal): group={len(all_group_memories)}, user={len(all_user_memories)}, "
               f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}")
 
@@ -1241,13 +1426,13 @@ Return ONLY the JSON, no other text.
         print(f"[retrieve_for_context] Results (pre-rerank): group={len(all_group_memories)}, user={len(all_user_memories)}, "
               f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}")
 
-        # Step 4.7: Rerank with a0x-models cross-encoder
+        # Step 4.7: Rerank by importance score (local, no HTTP)
         rerank_top_k = limit_per_table
-        all_group_memories = self._rerank_with_cross_encoder(query, all_group_memories, top_k=rerank_top_k)
-        all_user_memories = self._rerank_with_cross_encoder(query, all_user_memories, top_k=rerank_top_k)
-        all_interaction_memories = self._rerank_with_cross_encoder(query, all_interaction_memories, top_k=rerank_top_k)
+        all_group_memories = self._rerank_with_cross_encoder(query, all_group_memories, rerank_top_k)
+        all_user_memories = self._rerank_with_cross_encoder(query, all_user_memories, rerank_top_k)
+        all_interaction_memories = self._rerank_with_cross_encoder(query, all_interaction_memories, rerank_top_k)
         if all_cross_group_memories:
-            all_cross_group_memories = self._rerank_with_cross_encoder(query, all_cross_group_memories, top_k=rerank_top_k)
+            all_cross_group_memories = self._rerank_with_cross_encoder(query, all_cross_group_memories, rerank_top_k)
 
         print(f"[retrieve_for_context] Results (post-rerank): group={len(all_group_memories)}, user={len(all_user_memories)}, "
               f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}")
@@ -1456,50 +1641,26 @@ Return ONLY the JSON, no other text.
         top_k: int = 10
     ) -> list:
         """
-        Rerank items using a0x-models /rerank endpoint (cross-encoder/ms-marco-MiniLM-L6-v2).
+        Rerank items using importance_score as a local ranking signal.
 
-        Sends documents to the cross-encoder which scores each (query, document) pair.
-        Returns the top_k most relevant items sorted by reranker score.
+        Previously used HTTP calls to a0x-models /rerank (cross-encoder).
+        Now uses local importance_score sorting to avoid network latency.
+        The main reranking for group queries is done via LanceDB's RRF hybrid search.
+
+        For DM path, the vector similarity ranking from LanceDB (cosine) is already
+        good enough — this just trims to top_k with importance tiebreaking.
         """
         if not items or len(items) <= 1:
             return items
 
-        import requests
-        import os
+        # Sort by importance_score descending (tiebreak preserves vector similarity order)
+        def _get_score(item):
+            if hasattr(item, 'importance_score'):
+                return item.importance_score
+            return 0.5
 
-        a0x_models_url = os.getenv("A0X_MODELS_URL", "https://a0x-models-679925931457.us-central1.run.app")
-
-        # Extract text content from each item
-        documents = []
-        for item in items:
-            if hasattr(item, 'content'):
-                documents.append(item.content)
-            elif hasattr(item, 'lossless_restatement'):
-                documents.append(item.lossless_restatement)
-            else:
-                documents.append(str(item))
-
-        try:
-            response = requests.post(
-                f"{a0x_models_url}/rerank",
-                json={"query": query, "documents": documents, "top_k": top_k},
-                timeout=30
-            )
-            response.raise_for_status()
-            results = response.json().get("results", [])
-
-            # Reorder items by reranker score
-            reranked = []
-            for r in results:
-                idx = r["index"]
-                if idx < len(items):
-                    reranked.append(items[idx])
-
-            return reranked
-
-        except Exception as e:
-            print(f"[rerank] a0x-models rerank failed, keeping original order: {e}")
-            return items[:top_k]
+        sorted_items = sorted(items, key=_get_score, reverse=True)
+        return sorted_items[:top_k]
 
     def _apply_temporal_scoring(
         self,
