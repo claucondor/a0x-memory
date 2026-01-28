@@ -450,3 +450,15 @@ class MemoryStore:
         """Consolidate similar memories across all groups."""
         # Placeholder for consolidation logic
         return {"groups_processed": 0, "consolidated": 0, "merged": 0}
+
+    # ============================================================
+    # Row Conversion Methods (for hybrid_retriever compatibility)
+    # ============================================================
+
+    def _row_to_user_memory(self, row: dict):
+        """Convert LanceDB row to UserMemory."""
+        return self.user_memories._row_to_user_memory(row)
+
+    def _row_to_cross_group_memory(self, row: dict):
+        """Convert LanceDB row to CrossGroupMemory."""
+        return self.cross_group_memories._row_to_cross_group_memory(row)

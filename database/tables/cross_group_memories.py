@@ -124,3 +124,40 @@ class CrossGroupMemoriesTable:
             self.table.optimize()
         except Exception:
             pass
+
+    def search_semantic(self, universal_user_id: str, query_vector, limit: int = 10) -> List[CrossGroupMemory]:
+        """Search cross-group memories by semantic similarity."""
+        try:
+            results = self.table.search(query_vector).where(
+                f"universal_user_id = '{universal_user_id}' AND agent_id = '{self.agent_id}'",
+                prefilter=True
+            ).limit(limit).to_list()
+            return [self._row_to_cross_group_memory(r) for r in results]
+        except Exception as e:
+            print(f"[CrossGroupMemories] Search error: {e}")
+            return []
+
+    def _row_to_cross_group_memory(self, row: dict) -> CrossGroupMemory:
+        """Convert LanceDB row to CrossGroupMemory."""
+        return CrossGroupMemory(
+            memory_id=row["memory_id"],
+            agent_id=row["agent_id"],
+            universal_user_id=row["universal_user_id"],
+            user_identities=list(row.get("user_identities") or []),
+            groups_involved=list(row.get("groups_involved") or []),
+            group_count=row.get("group_count", 1),
+            memory_level=MemoryLevel(row["memory_level"]),
+            memory_type=MemoryType(row["memory_type"]),
+            privacy_scope=PrivacyScope(row["privacy_scope"]),
+            content=row["content"],
+            keywords=list(row.get("keywords") or []),
+            topics=list(row.get("topics") or []),
+            confidence_score=row.get("confidence_score", 0.5),
+            pattern_type=row.get("pattern_type", "unknown"),
+            evidence_count=row.get("evidence_count", 1),
+            first_seen=row["first_seen"],
+            last_seen=row["last_seen"],
+            last_updated=row.get("last_updated"),
+            consolidated_at=row.get("consolidated_at"),
+            source_memory_ids=list(row.get("source_memory_ids") or [])
+        )
