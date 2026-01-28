@@ -173,6 +173,19 @@ class MemoryStore:
         """FTS keyword search on interaction_memories."""
         return self.interaction_memories.search_keyword(group_id, keywords, top_k)
 
+    def search_interactions(
+        self,
+        group_id: str,
+        speaker_id: Optional[str] = None,
+        query: Optional[str] = None,
+        limit: int = 10,
+        query_vector=None
+    ) -> List:
+        """Search interaction memories (compatibility method)."""
+        if query_vector is None and query:
+            query_vector = self.embedding_model.encode_single(query, is_query=True)
+        return self.interaction_memories.search_semantic(group_id, speaker_id, None, query_vector, limit)
+
     # ============================================================
     # Cross-Group Memory Operations
     # ============================================================
@@ -180,6 +193,18 @@ class MemoryStore:
     def add_cross_group_memory(self, memory: CrossGroupMemory) -> CrossGroupMemory:
         """Add a cross-group memory."""
         return self.cross_group_memories.add(memory)
+
+    def search_cross_group(
+        self,
+        universal_user_id: str,
+        query: str,
+        limit: int = 10,
+        query_vector=None
+    ) -> List:
+        """Search cross-group memories for a user."""
+        if query_vector is None:
+            query_vector = self.embedding_model.encode_single(query, is_query=True)
+        return self.cross_group_memories.search_semantic(universal_user_id, query_vector, limit)
 
     # ============================================================
     # Agent Response Operations
@@ -235,6 +260,64 @@ class MemoryStore:
     def add_cross_agent_link(self, link: CrossAgentLink) -> CrossAgentLink:
         """Add a cross-agent link."""
         return self.cross_agent_links.add(link)
+
+    # ============================================================
+    # Unified Search (Multi-table)
+    # ============================================================
+
+    def search_all(
+        self,
+        query: str,
+        context: Dict[str, Any],
+        limit_per_table: int = 5
+    ) -> Dict[str, List[Any]]:
+        """
+        Search across all relevant tables based on context.
+
+        Args:
+            query: Search query
+            context: Dict with group_id, user_id, etc.
+            limit_per_table: Max results per table
+
+        Returns:
+            Dict with results from each table type
+        """
+        results = {
+            "dm_memories": [],
+            "group_memories": [],
+            "user_memories": [],
+            "interaction_memories": [],
+            "cross_group_memories": []
+        }
+
+        group_id = context.get('group_id')
+        user_id = context.get('user_id')
+        is_group = group_id is not None and not str(group_id).startswith('dm_')
+
+        if is_group:
+            # Group context - search group tables
+            results["group_memories"] = self.search_group_memories(
+                group_id, query, limit=limit_per_table
+            )
+            results["user_memories"] = self.search_user_memories_in_group(
+                group_id, query, limit=limit_per_table, exclude_user_id=user_id
+            )
+            results["interaction_memories"] = self.search_interactions(
+                group_id, speaker_id=user_id, query=query, limit=limit_per_table
+            )
+
+            # Cross-group if user_id available
+            if user_id:
+                results["cross_group_memories"] = self.search_cross_group(
+                    user_id, query, limit=limit_per_table
+                )
+        else:
+            # DM context - search memories table
+            results["dm_memories"] = self.search_memories(
+                query, user_id=user_id, top_k=limit_per_table
+            )
+
+        return results
 
     # ============================================================
     # Compatibility Methods (VectorStore)

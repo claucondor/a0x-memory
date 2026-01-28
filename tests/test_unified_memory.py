@@ -14,7 +14,7 @@ import uuid
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from database.legacy.unified_store import UnifiedMemoryStore
+from database import MemoryStore
 from models.memory_entry import MemoryEntry, Dialogue, MemoryType, PrivacyScope
 from models.group_memory import (
     GroupMemory, UserMemory, InteractionMemory,
@@ -24,13 +24,13 @@ from utils.embedding import EmbeddingModel
 
 
 def test_unified_store_initialization():
-    """Test UnifiedMemoryStore initializes all tables correctly."""
+    """Test MemoryStore initializes all tables correctly."""
     print("\n" + "=" * 60)
-    print("TEST: UnifiedMemoryStore Initialization")
+    print("TEST: MemoryStore Initialization")
     print("=" * 60)
 
     agent_id = f"test_agent_{uuid.uuid4().hex[:8]}"
-    store = UnifiedMemoryStore(
+    store = MemoryStore(
         agent_id=agent_id,
         db_base_path="./test_lancedb"
     )
@@ -54,7 +54,7 @@ def test_unified_store_initialization():
     return store
 
 
-def test_dm_memory_flow(store: UnifiedMemoryStore):
+def test_dm_memory_flow(store: MemoryStore):
     """Test DM memory flow (SimpleMem compatible)."""
     print("\n" + "=" * 60)
     print("TEST: DM Memory Flow (SimpleMem Compatible)")
@@ -120,7 +120,7 @@ def test_dm_memory_flow(store: UnifiedMemoryStore):
     print("\nPASSED: DM memory flow works correctly")
 
 
-def test_group_memory_flow(store: UnifiedMemoryStore):
+def test_group_memory_flow(store: MemoryStore):
     """Test group memory flow (new tables)."""
     print("\n" + "=" * 60)
     print("TEST: Group Memory Flow")
@@ -182,7 +182,7 @@ def test_group_memory_flow(store: UnifiedMemoryStore):
     print("\nPASSED: Group memory flow works correctly")
 
 
-def test_user_memory_flow(store: UnifiedMemoryStore):
+def test_user_memory_flow(store: MemoryStore):
     """Test user memory flow within groups."""
     print("\n" + "=" * 60)
     print("TEST: User Memory Flow")
@@ -253,7 +253,7 @@ def test_user_memory_flow(store: UnifiedMemoryStore):
     print("\nPASSED: User memory flow works correctly")
 
 
-def test_interaction_memory_flow(store: UnifiedMemoryStore):
+def test_interaction_memory_flow(store: MemoryStore):
     """Test interaction memory flow."""
     print("\n" + "=" * 60)
     print("TEST: Interaction Memory Flow")
@@ -320,7 +320,7 @@ def test_interaction_memory_flow(store: UnifiedMemoryStore):
     print("\nPASSED: Interaction memory flow works correctly")
 
 
-def test_unified_search(store: UnifiedMemoryStore):
+def test_unified_search(store: MemoryStore):
     """Test unified search across all tables."""
     print("\n" + "=" * 60)
     print("TEST: Unified Search (Multi-Table)")
@@ -370,7 +370,7 @@ def test_unified_search(store: UnifiedMemoryStore):
     print("\nPASSED: Unified search works correctly")
 
 
-def test_backward_compatibility(store: UnifiedMemoryStore):
+def test_backward_compatibility(store: MemoryStore):
     """Test backward compatibility with VectorStore interface."""
     print("\n" + "=" * 60)
     print("TEST: Backward Compatibility (VectorStore Interface)")
@@ -395,7 +395,7 @@ def test_backward_compatibility(store: UnifiedMemoryStore):
     print("\nPASSED: Backward compatibility works correctly")
 
 
-def cleanup(store: UnifiedMemoryStore):
+def cleanup(store: MemoryStore):
     """Clean up test data."""
     print("\n" + "=" * 60)
     print("Cleaning up test data...")

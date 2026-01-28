@@ -26,8 +26,7 @@ from main import SimpleMemSystem
 from models.memory_entry import MemoryEntry
 from models.user_profile import UserProfile
 from models.group_memory import GroupProfile, UserInGroupProfile
-from database.vector_store import VectorStore
-from database.user_profile_store import UserProfileStore
+from database import VectorStore, UserProfileStore
 from database.group_profile_store import GroupProfileStore
 from utils.embedding import EmbeddingModel
 from utils.llm_client import LLMClient

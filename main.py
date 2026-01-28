@@ -13,10 +13,7 @@ from datetime import datetime, timezone
 from models.memory_entry import Dialogue, MemoryEntry, MemoryType, PrivacyScope
 from utils.llm_client import LLMClient
 from utils.embedding import EmbeddingModel
-from database.vector_store import VectorStore
-from database import MemoryStore  # New refactored store
-from database.legacy.unified_store import UnifiedMemoryStore  # Legacy - will be removed
-from database.user_profile_store import UserProfileStore
+from database import MemoryStore, VectorStore, UserProfileStore
 from database.group_profile_store import GroupProfileStore
 from core.memory_builder import MemoryBuilder
 from core.hybrid_retriever import HybridRetriever
@@ -92,7 +89,7 @@ class SimpleMemSystem:
         - max_retrieval_workers: Maximum number of parallel workers for retrieval (None=use config default)
         - agent_id: Agent identifier for multi-tenant isolation (required for unified store)
         - user_id: User identifier for multi-tenant isolation (None=no filtering)
-        - use_unified_store: Use UnifiedMemoryStore instead of VectorStore (default: True)
+        - use_unified_store: Use MemoryStore instead of VectorStore (default: True)
         - enable_firestore: Enable Firestore for immediate context (default: True)
         """
         # Store tenant context
@@ -104,7 +101,7 @@ class SimpleMemSystem:
         print("Initializing SimpleMem System")
         if agent_id or user_id:
             print(f"Tenant: agent={self.agent_id}, user={user_id or 'any'}")
-        print(f"Store: {'UnifiedMemoryStore' if use_unified_store else 'VectorStore'}")
+        print(f"Store: {'MemoryStore' if use_unified_store else 'VectorStore'}")
         print("=" * 60)
 
         # Initialize core components (use shared if provided)
