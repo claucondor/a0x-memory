@@ -446,6 +446,10 @@ class RealisticScenarioTest:
             "group_profiles": {},
             "context": {},
         }
+        # Timing metrics
+        self.ingestion_times = []  # per-message add_dialogue times (seconds)
+        self.search_times = []     # per-query search() times (seconds)
+        self.ask_times = []        # per-query ask() times (seconds)
 
     def run_all(self):
         """Run complete test scenario"""
@@ -488,6 +492,8 @@ class RealisticScenarioTest:
 
             self.msg_count += 1
 
+            t0 = time.time()
+
             if event["type"] == "dm":
                 result = self.system.add_dialogue(
                     speaker=event["username"],
@@ -500,9 +506,11 @@ class RealisticScenarioTest:
                     add_to_firestore=True,
                     use_stateless_processing=True,
                 )
+                elapsed = time.time() - t0
+                self.ingestion_times.append(elapsed)
                 if result.get("processed"):
                     self.batch_count += 1
-                    print(f"  [{self.msg_count}] DM batch from {event['username']} → {result.get('memories_created', 0)} memories")
+                    print(f"  [{self.msg_count}] DM batch from {event['username']} → {result.get('memories_created', 0)} memories ({elapsed:.2f}s)")
 
             elif event["type"] == "group":
                 group_info = group_lookup.get(event["group_name"])
@@ -526,9 +534,11 @@ class RealisticScenarioTest:
                     add_to_firestore=True,
                     use_stateless_processing=True,
                 )
+                elapsed = time.time() - t0
+                self.ingestion_times.append(elapsed)
                 if result.get("processed"):
                     self.batch_count += 1
-                    print(f"  [{self.msg_count}] Group '{event['group_name']}' batch → {result.get('memories_created', 0)} memories")
+                    print(f"  [{self.msg_count}] Group '{event['group_name']}' batch → {result.get('memories_created', 0)} memories ({elapsed:.2f}s)")
 
         print(f"\nIngestion complete: {self.msg_count} messages, {self.batch_count} batches processed")
 
@@ -604,23 +614,39 @@ class RealisticScenarioTest:
                 if q["scope"] == "group":
                     group_info = group_lookup[q["group_name"]]
                     group_id = f"telegram_{group_info['id']}"
+
+                    t0 = time.time()
                     search_results = self.system.search(
                         query=query,
                         group_id=group_id,
                     )
+                    search_elapsed = time.time() - t0
+                    self.search_times.append(search_elapsed)
+
+                    t0 = time.time()
                     answer = self.system.ask(
                         question=query,
-                        group_id=group_id,
-                        include_firestore_context=True,
+                        search_results=search_results,
                     )
+                    ask_elapsed = time.time() - t0
+                    self.ask_times.append(ask_elapsed)
                 else:
+                    t0 = time.time()
                     search_results = self.system.search(
                         query=query,
                     )
+                    search_elapsed = time.time() - t0
+                    self.search_times.append(search_elapsed)
+
+                    t0 = time.time()
                     answer = self.system.ask(
                         question=query,
-                        include_firestore_context=True,
+                        search_results=search_results,
                     )
+                    ask_elapsed = time.time() - t0
+                    self.ask_times.append(ask_elapsed)
+
+                print(f"  search: {search_elapsed:.2f}s | ask: {ask_elapsed:.2f}s")
 
                 # Print raw search results
                 print(f"\n  --- Raw search() results ---")
@@ -691,6 +717,47 @@ class RealisticScenarioTest:
                 print(f"       → {preview}...")
             else:
                 print(f"  [{data.get('scope', '?')}] {query[:50]}... → ERROR")
+
+        # Timing metrics
+        print("\n" + "=" * 70)
+        print("TIMING METRICS")
+        print("=" * 70)
+
+        if self.ingestion_times:
+            ing = sorted(self.ingestion_times)
+            total_ing = sum(ing)
+            avg_ing = total_ing / len(ing)
+            p50_ing = ing[len(ing) // 2]
+            p95_idx = min(int(len(ing) * 0.95), len(ing) - 1)
+            p95_ing = ing[p95_idx]
+            # Separate batch (processed) vs buffer (fast) calls
+            batch_times = [t for t in ing if t > 0.5]  # batch processing > 0.5s
+            buffer_times = [t for t in ing if t <= 0.5]  # buffered messages
+            print(f"\n  Ingestion ({len(ing)} messages):")
+            print(f"    Total time:  {total_ing:.1f}s")
+            print(f"    Average:     {avg_ing:.3f}s/msg")
+            print(f"    Median:      {p50_ing:.3f}s")
+            print(f"    P95:         {p95_ing:.3f}s")
+            print(f"    Min:         {ing[0]:.3f}s")
+            print(f"    Max:         {ing[-1]:.3f}s")
+            if buffer_times:
+                print(f"    Buffer calls ({len(buffer_times)}): avg {sum(buffer_times)/len(buffer_times):.3f}s")
+            if batch_times:
+                print(f"    Batch calls  ({len(batch_times)}): avg {sum(batch_times)/len(batch_times):.3f}s")
+
+        if self.search_times:
+            srch = sorted(self.search_times)
+            print(f"\n  Search ({len(srch)} queries):")
+            print(f"    Average:     {sum(srch)/len(srch):.3f}s")
+            print(f"    Min:         {srch[0]:.3f}s")
+            print(f"    Max:         {srch[-1]:.3f}s")
+
+        if self.ask_times:
+            ask = sorted(self.ask_times)
+            print(f"\n  Ask ({len(ask)} queries):")
+            print(f"    Average:     {sum(ask)/len(ask):.3f}s")
+            print(f"    Min:         {ask[0]:.3f}s")
+            print(f"    Max:         {ask[-1]:.3f}s")
 
         # Token usage and cost
         print("\n" + "=" * 70)
