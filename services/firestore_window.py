@@ -57,10 +57,44 @@ class InMemoryWindowStore:
         message: str,
         username: str,
         platform_identity: Optional[Dict[str, Any]] = None,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> Optional[str]:
-        """Add a message to the in-memory window."""
+        metadata: Optional[Dict[str, Any]] = None,
+        embedding: Optional[List[float]] = None
+    ) -> Dict[str, Any]:
+        """Add a message to the in-memory window with spam detection."""
+        import numpy as np
+
+        result = {
+            'doc_id': None,
+            'is_spam': False,
+            'spam_score': 0.0,
+            'spam_reason': 'ok'
+        }
+
         doc_id = str(uuid.uuid4())[:8]
+        user_id = platform_identity.get('user_id', '') if platform_identity else ''
+
+        # Simple spam detection for in-memory mode
+        if embedding and user_id:
+            messages = self._get_messages(agent_id, group_id)
+            user_recent = [
+                m for m in messages[-10:]
+                if m.get('platform_identity', {}).get('user_id') == user_id
+                and m.get('embedding') is not None
+            ]
+
+            if user_recent:
+                msg_vec = np.array(embedding[:384] if len(embedding) > 384 else embedding)
+                for m in user_recent[-5:]:
+                    recent_vec = np.array(m['embedding'])
+                    similarity = np.dot(msg_vec, recent_vec) / (
+                        np.linalg.norm(msg_vec) * np.linalg.norm(recent_vec) + 1e-8
+                    )
+                    if similarity >= 0.92:
+                        result['is_spam'] = True
+                        result['spam_score'] = similarity
+                        result['spam_reason'] = f"high_similarity:{similarity:.3f}"
+                        print(f"[InMemoryWindow] Spam detected: {result['spam_reason']}")
+                        break
 
         doc_data = {
             'doc_id': doc_id,
@@ -69,17 +103,20 @@ class InMemoryWindowStore:
             'platform_identity': platform_identity or {},
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'processed': False,
-            'metadata': metadata or {}
+            'metadata': metadata or {},
+            'embedding': embedding[:384] if embedding and len(embedding) > 384 else embedding
         }
 
         messages = self._get_messages(agent_id, group_id)
         messages.append(doc_data)
 
-        # Maintain sliding window
-        if len(messages) > config.RECENT_WINDOW_SIZE:
+        # Maintain sliding window (use default for in-memory)
+        window_size = getattr(config, 'RECENT_WINDOW_SIZE', 15)
+        while len(messages) > window_size:
             messages.pop(0)  # Remove oldest
 
-        return doc_id
+        result['doc_id'] = doc_id
+        return result
 
     def get_recent(
         self,
@@ -156,7 +193,9 @@ class FirestoreWindowStore:
     Uses sliding window to maintain only last N messages per group.
     """
 
-    def __init__(self):
+    def __init__(self, threshold_manager=None):
+        self._threshold_manager = threshold_manager
+
         if not FIRESTORE_AVAILABLE:
             print("[FirestoreWindow] Firestore not available - running in local-only mode")
             self._enabled = False
@@ -173,6 +212,11 @@ class FirestoreWindowStore:
             self.db = firestore.client()
             self._enabled = True
             print(f"[FirestoreWindow] Connected to project: {config.FIRESTORE_PROJECT}")
+
+            # Initialize threshold manager for dynamic window + spam detection
+            if not self._threshold_manager:
+                from core.adaptive_threshold import AdaptiveThresholdManager
+                self._threshold_manager = AdaptiveThresholdManager(firestore_client=self.db)
         except Exception as e:
             print(f"[FirestoreWindow] Failed to connect: {e}")
             print("[FirestoreWindow] Running in local-only mode")
@@ -198,10 +242,11 @@ class FirestoreWindowStore:
         message: str,
         username: str,
         platform_identity: Optional[Dict[str, Any]] = None,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> Optional[str]:
+        metadata: Optional[Dict[str, Any]] = None,
+        embedding: Optional[List[float]] = None
+    ) -> Dict[str, Any]:
         """
-        Add a message to the recent window and maintain sliding window.
+        Add a message to the recent window with spam detection and dynamic window.
 
         Args:
             agent_id: Agent ID
@@ -210,17 +255,54 @@ class FirestoreWindowStore:
             username: Sender username
             platform_identity: Platform identity dict
             metadata: Additional metadata (message_id, timestamp, etc.)
+            embedding: Optional message embedding for spam detection
 
         Returns:
-            Document ID if successful, None otherwise
+            Dict with 'doc_id', 'is_spam', 'spam_score', 'spam_reason'
         """
+        result = {
+            'doc_id': None,
+            'is_spam': False,
+            'spam_score': 0.0,
+            'spam_reason': 'ok'
+        }
+
         if not self._enabled:
-            return None
+            return result
 
         try:
             collection = self._get_collection(agent_id, group_id)
             if not collection:
-                return None
+                return result
+
+            user_id = platform_identity.get('user_id', '') if platform_identity else ''
+
+            # Spam detection if embedding provided
+            if embedding and self._threshold_manager and user_id:
+                # Get recent embeddings for spam check
+                recent_embeddings = self._get_recent_embeddings(agent_id, group_id, limit=10)
+
+                is_spam, spam_score, reason = self._threshold_manager.check_spam(
+                    agent_id=agent_id,
+                    group_id=group_id,
+                    user_id=user_id,
+                    message_embedding=embedding,
+                    recent_embeddings=recent_embeddings
+                )
+
+                result['is_spam'] = is_spam
+                result['spam_score'] = spam_score
+                result['spam_reason'] = reason
+
+                if is_spam:
+                    # Update spam score for user
+                    self._threshold_manager.update_spam_score(agent_id, group_id, user_id, True)
+                    print(f"[FirestoreWindow] Spam detected from {username}: {reason}")
+
+                    # Check if user should be blocked
+                    if self._threshold_manager.is_user_blocked(agent_id, group_id, user_id):
+                        print(f"[FirestoreWindow] User {username} blocked due to spam")
+                        return result
 
             # Prepare document data
             doc_data = {
@@ -232,18 +314,70 @@ class FirestoreWindowStore:
                 'metadata': metadata or {}
             }
 
+            # Store embedding if provided (truncated for Firestore size limits)
+            if embedding:
+                # Store first 384 dims (enough for similarity) to save space
+                doc_data['embedding'] = embedding[:384] if len(embedding) > 384 else embedding
+
             # Add new message
             doc_ref = collection.add(doc_data)
             doc_id = doc_ref[1].id
+            result['doc_id'] = doc_id
 
-            # Maintain sliding window - keep only last N messages
-            self._maintain_window_size(collection, config.RECENT_WINDOW_SIZE)
+            # Get dynamic window size
+            window_size = config.RECENT_WINDOW_SIZE
+            if self._threshold_manager:
+                window_size = self._threshold_manager.get_dynamic_window_size(agent_id, group_id)
 
-            return doc_id
+            # Maintain sliding window with dynamic size
+            self._maintain_window_size(collection, window_size)
+
+            return result
 
         except Exception as e:
             print(f"[FirestoreWindow] Error adding message: {e}")
-            return None
+            return result
+
+    def _get_recent_embeddings(
+        self,
+        agent_id: str,
+        group_id: str,
+        limit: int = 10
+    ) -> List[tuple]:
+        """
+        Get recent message embeddings for spam detection.
+
+        Returns:
+            List of (embedding, user_id, timestamp) tuples
+        """
+        if not self._enabled:
+            return []
+
+        try:
+            collection = self._get_collection(agent_id, group_id)
+            if not collection:
+                return []
+
+            # Get recent messages with embeddings
+            msgs = collection.order_by(
+                'timestamp',
+                direction=firestore.Query.DESCENDING
+            ).limit(limit).get()
+
+            results = []
+            for msg in msgs:
+                data = msg.to_dict()
+                embedding = data.get('embedding')
+                user_id = data.get('platform_identity', {}).get('user_id', '')
+                timestamp = data.get('timestamp', '')
+                if embedding:
+                    results.append((embedding, user_id, timestamp))
+
+            return results
+
+        except Exception as e:
+            print(f"[FirestoreWindow] Error getting embeddings: {e}")
+            return []
 
     def _maintain_window_size(self, collection, max_size: int):
         """Maintain sliding window by deleting oldest messages beyond max_size"""

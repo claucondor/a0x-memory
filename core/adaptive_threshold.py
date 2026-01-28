@@ -54,6 +54,17 @@ class ThresholdConfig:
     urgency_trigger_count: int = 3         # N high-importance msgs = urgent
     urgency_batch_size: int = 5            # Smaller batch for urgency
 
+    # Dynamic window size settings
+    min_window_size: int = 10              # Minimum messages in window
+    max_window_size: int = 50              # Maximum messages in window
+    default_window_size: int = 15          # Default window size
+
+    # Spam detection settings
+    spam_similarity_threshold: float = 0.92  # Similarity > this = likely spam
+    spam_check_window: int = 5               # Compare with last N messages from same user
+    spam_score_decay: float = 0.9            # Decay factor for spam score over time
+    spam_block_threshold: float = 3.0        # Block user if spam_score exceeds this
+
 
 # ============================================================
 # In-Memory Metrics Store (for local testing)
@@ -254,6 +265,192 @@ class AdaptiveThresholdManager:
         else:
             # Normal activity or no data: default
             return cfg.default_batch_size
+
+    def get_dynamic_window_size(self, agent_id: str, group_id: str) -> int:
+        """
+        Calculate dynamic window size based on activity.
+
+        High activity → larger window (more context needed)
+        Low activity → smaller window (less storage, sufficient context)
+
+        Returns:
+            int: Window size (number of messages to keep)
+        """
+        metrics = self._get_metrics(agent_id, group_id)
+        cfg = self.threshold_config
+        msgs_per_hour = self._calculate_messages_per_hour(metrics)
+
+        if msgs_per_hour >= cfg.high_activity_threshold:
+            # High activity: larger window for more context
+            activity_ratio = min(msgs_per_hour / cfg.high_activity_threshold, 3.0)
+            window_size = cfg.default_window_size + int(
+                (cfg.max_window_size - cfg.default_window_size) * (activity_ratio - 1) / 2
+            )
+            return min(cfg.max_window_size, window_size)
+
+        elif msgs_per_hour <= cfg.low_activity_threshold and msgs_per_hour > 0:
+            # Low activity: smaller window
+            activity_ratio = cfg.low_activity_threshold / msgs_per_hour
+            window_size = cfg.default_window_size - int(
+                (cfg.default_window_size - cfg.min_window_size) * min(activity_ratio - 1, 2) / 2
+            )
+            return max(cfg.min_window_size, window_size)
+
+        else:
+            # Normal activity or no data: default
+            return cfg.default_window_size
+
+    def check_spam(
+        self,
+        agent_id: str,
+        group_id: str,
+        user_id: str,
+        message_embedding: list,
+        recent_embeddings: list
+    ) -> Tuple[bool, float, str]:
+        """
+        Check if a message is likely spam based on similarity to recent messages.
+
+        Args:
+            agent_id: Agent ID
+            group_id: Group/conversation ID
+            user_id: User who sent the message
+            message_embedding: Embedding vector of the new message
+            recent_embeddings: List of (embedding, user_id, timestamp) tuples from recent messages
+
+        Returns:
+            Tuple of (is_spam: bool, spam_score: float, reason: str)
+        """
+        import numpy as np
+
+        cfg = self.threshold_config
+
+        # Filter to only this user's recent messages
+        user_recent = [
+            (emb, ts) for emb, uid, ts in recent_embeddings
+            if uid == user_id and emb is not None
+        ][-cfg.spam_check_window:]
+
+        if not user_recent:
+            return False, 0.0, "no_history"
+
+        # Calculate similarities with recent messages
+        msg_vec = np.array(message_embedding)
+        similarities = []
+
+        for emb, ts in user_recent:
+            recent_vec = np.array(emb)
+            # Cosine similarity
+            similarity = np.dot(msg_vec, recent_vec) / (
+                np.linalg.norm(msg_vec) * np.linalg.norm(recent_vec) + 1e-8
+            )
+            similarities.append(similarity)
+
+        max_similarity = max(similarities) if similarities else 0.0
+        avg_similarity = sum(similarities) / len(similarities) if similarities else 0.0
+
+        # Spam detection logic
+        is_spam = False
+        reason = "ok"
+        spam_score = 0.0
+
+        # High similarity with any recent message = likely spam
+        if max_similarity >= cfg.spam_similarity_threshold:
+            is_spam = True
+            spam_score = max_similarity
+            reason = f"high_similarity:{max_similarity:.3f}"
+
+        # Multiple similar messages in a row = spam pattern
+        elif avg_similarity >= cfg.spam_similarity_threshold - 0.05:
+            high_sim_count = sum(1 for s in similarities if s >= cfg.spam_similarity_threshold - 0.05)
+            if high_sim_count >= 2:
+                is_spam = True
+                spam_score = avg_similarity
+                reason = f"repeated_pattern:{high_sim_count}_similar"
+
+        return is_spam, spam_score, reason
+
+    def update_spam_score(
+        self,
+        agent_id: str,
+        group_id: str,
+        user_id: str,
+        spam_detected: bool
+    ):
+        """
+        Update spam score for a user in a group.
+
+        Spam score increases when spam is detected, decays over time.
+        Used to track repeat offenders.
+        """
+        doc_id = f"{self._get_doc_id(agent_id, group_id)}_spam_{user_id.replace(':', '_')}"
+        cfg = self.threshold_config
+
+        if self._use_memory:
+            current = self._memory_store.get(doc_id) or {"spam_score": 0.0, "last_update": 0}
+            # Apply time decay
+            time_since = time.time() - current.get("last_update", 0)
+            hours_passed = time_since / 3600
+            decayed_score = current.get("spam_score", 0.0) * (cfg.spam_score_decay ** hours_passed)
+
+            # Update score
+            new_score = decayed_score + (1.0 if spam_detected else -0.1)
+            new_score = max(0.0, new_score)
+
+            self._memory_store.set(doc_id, {
+                "spam_score": new_score,
+                "last_update": time.time(),
+                "total_spam_count": current.get("total_spam_count", 0) + (1 if spam_detected else 0)
+            })
+            return new_score
+
+        try:
+            doc_ref = self._get_db().collection("spam_scores").document(doc_id)
+            doc = doc_ref.get()
+            current = doc.to_dict() if doc.exists else {"spam_score": 0.0, "last_update": time.time()}
+
+            # Apply time decay
+            last_update = current.get("last_update")
+            if hasattr(last_update, 'timestamp'):
+                last_update = last_update.timestamp()
+            time_since = time.time() - (last_update or time.time())
+            hours_passed = time_since / 3600
+            decayed_score = current.get("spam_score", 0.0) * (cfg.spam_score_decay ** hours_passed)
+
+            # Update score
+            new_score = decayed_score + (1.0 if spam_detected else -0.1)
+            new_score = max(0.0, new_score)
+
+            doc_ref.set({
+                "spam_score": new_score,
+                "last_update": firestore.SERVER_TIMESTAMP if firestore else time.time(),
+                "total_spam_count": firestore.Increment(1) if spam_detected and firestore else current.get("total_spam_count", 0) + (1 if spam_detected else 0),
+                "user_id": user_id,
+                "group_id": group_id,
+                "agent_id": agent_id
+            }, merge=True)
+
+            return new_score
+        except Exception as e:
+            print(f"[SpamScore] Error updating: {e}")
+            return 0.0
+
+    def is_user_blocked(self, agent_id: str, group_id: str, user_id: str) -> bool:
+        """Check if a user should be blocked due to high spam score."""
+        doc_id = f"{self._get_doc_id(agent_id, group_id)}_spam_{user_id.replace(':', '_')}"
+        cfg = self.threshold_config
+
+        if self._use_memory:
+            data = self._memory_store.get(doc_id)
+            return data.get("spam_score", 0.0) >= cfg.spam_block_threshold if data else False
+
+        try:
+            doc = self._get_db().collection("spam_scores").document(doc_id).get()
+            if doc.exists:
+                return doc.to_dict().get("spam_score", 0.0) >= cfg.spam_block_threshold
+            return False
+        except:
+            return False
 
     def record_message(
         self,
