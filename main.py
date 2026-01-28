@@ -14,7 +14,8 @@ from models.memory_entry import Dialogue, MemoryEntry, MemoryType, PrivacyScope
 from utils.llm_client import LLMClient
 from utils.embedding import EmbeddingModel
 from database.vector_store import VectorStore
-from database.unified_store import UnifiedMemoryStore
+from database import MemoryStore  # New refactored store
+from database.legacy.unified_store import UnifiedMemoryStore  # Legacy - will be removed
 from database.user_profile_store import UserProfileStore
 from database.group_profile_store import GroupProfileStore
 from core.memory_builder import MemoryBuilder
@@ -118,7 +119,8 @@ class SimpleMemSystem:
 
         # Initialize storage (unified or legacy)
         if use_unified_store:
-            self.unified_store = UnifiedMemoryStore(
+            # Use new refactored MemoryStore
+            self.unified_store = MemoryStore(
                 agent_id=self.agent_id,
                 db_base_path=db_path or config.LANCEDB_PATH,
                 embedding_model=self.embedding_model,

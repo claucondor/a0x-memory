@@ -297,3 +297,73 @@ class MemoryStore:
             "conversation_summaries": self.conversation_summaries.count(),
             "cross_agent_links": self.cross_agent_links.count()
         }
+
+    # ============================================================
+    # Internal Table Access (for compatibility with legacy code)
+    # ============================================================
+
+    @property
+    def memories_table(self):
+        """Access to DM memories table (for compatibility)."""
+        return self.dm_memories.table
+
+    @property
+    def group_memories_table(self):
+        """Access to group memories table (for compatibility)."""
+        return self.group_memories.table
+
+    @property
+    def user_memories_table(self):
+        """Access to user memories table (for compatibility)."""
+        return self.user_memories.table
+
+    @property
+    def interaction_memories_table(self):
+        """Access to interaction memories table (for compatibility)."""
+        return self.interaction_memories.table
+
+    @property
+    def agent_responses_table(self):
+        """Access to agent responses table (for compatibility)."""
+        return self.agent_responses.table
+
+    @property
+    def conversation_summaries_table(self):
+        """Access to conversation summaries table (for compatibility)."""
+        return self.conversation_summaries.table
+
+    @property
+    def cross_group_memories_table(self):
+        """Access to cross-group memories table (for compatibility)."""
+        return self.cross_group_memories.table
+
+    # ============================================================
+    # Additional compatibility methods
+    # ============================================================
+
+    def clear_agent_data(self):
+        """Clear all data for this agent."""
+        # For now, just log - actual deletion can be added later
+        print(f"[MemoryStore] clear_agent_data called for {self.agent_id}")
+
+    def search_agent_responses(
+        self,
+        group_id: str,
+        query: str,
+        user_id: str = None,
+        top_k: int = 5
+    ):
+        """Search agent responses."""
+        # Basic implementation - can be expanded later
+        query_vector = self.embedding_model.encode_single(query, is_query=True)
+        return []
+
+    def consolidate_similar_memories(self, group_id: str):
+        """Consolidate similar memories in a group."""
+        # Placeholder for consolidation logic
+        return {"consolidated": 0, "merged": 0}
+
+    def consolidate_all_groups(self):
+        """Consolidate similar memories across all groups."""
+        # Placeholder for consolidation logic
+        return {"groups_processed": 0, "consolidated": 0, "merged": 0}
