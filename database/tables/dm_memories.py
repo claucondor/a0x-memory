@@ -1,0 +1,218 @@
+"""
+DMMemories table operations (SimpleMem compatible).
+Extracted from unified_store.py.
+"""
+from typing import List, Optional
+
+import pyarrow as pa
+
+from models.memory_entry import MemoryEntry, MemoryType as DM_MemoryType, PrivacyScope as DM_PrivacyScope
+from database.base import LanceDBConnection
+from utils.embedding import EmbeddingModel
+import config
+
+
+class DMMemoriesTable:
+    """CRUD for dm_memories table (memories.lance - SimpleMem compatible)."""
+
+    def __init__(self, agent_id: str, embedding_model: EmbeddingModel = None, storage_options: dict = None):
+        self.agent_id = agent_id
+        self.embedding_model = embedding_model or EmbeddingModel()
+        self.storage_options = storage_options
+        self.db = LanceDBConnection.get_agent_db(agent_id, storage_options=storage_options)
+        self.table = self._init_table()
+        self._fts_initialized = False
+
+    def _init_table(self):
+        """Initialize table with schema."""
+        schema = pa.schema([
+            pa.field("agent_id", pa.string()),
+            pa.field("user_id", pa.string()),
+            pa.field("entry_id", pa.string()),
+            pa.field("lossless_restatement", pa.string()),
+            pa.field("keywords", pa.list_(pa.string())),
+            pa.field("timestamp", pa.string()),
+            pa.field("location", pa.string()),
+            pa.field("persons", pa.list_(pa.string())),
+            pa.field("entities", pa.list_(pa.string())),
+            pa.field("topic", pa.string()),
+            pa.field("group_id", pa.string()),
+            pa.field("username", pa.string()),
+            pa.field("platform", pa.string()),
+            pa.field("memory_type", pa.string()),
+            pa.field("privacy_scope", pa.string()),
+            pa.field("importance_score", pa.float32()),
+            pa.field("vector", pa.list_(pa.float32(), self.embedding_model.dimension))
+        ])
+
+        table_name = "memories"
+        if table_name not in self.db.table_names():
+            table = self.db.create_table(table_name, schema=schema)
+            print(f"[{self.agent_id}] Created {table_name} table")
+        else:
+            table = self.db.open_table(table_name)
+            print(f"[{self.agent_id}] Opened {table_name} ({table.count_rows()} rows)")
+
+        self._create_vector_index(table, "memories")
+        return table
+
+    def _create_vector_index(self, table, table_name: str, min_rows: int = 256):
+        """Create vector index."""
+        try:
+            row_count = table.count_rows()
+            if row_count < min_rows:
+                return
+            table.create_index(
+                metric="cosine",
+                num_partitions=min(row_count // 20, 64),
+                num_sub_vectors=min(self.embedding_model.dimension // 16, 24),
+                replace=True
+            )
+        except Exception:
+            pass
+
+    def _init_fts_index(self):
+        """Initialize FTS index."""
+        if self._fts_initialized:
+            return
+        try:
+            is_cloud_storage = config.LANCEDB_PATH.startswith(("gs://", "s3://", "az://"))
+            if is_cloud_storage:
+                self.table.create_fts_index("lossless_restatement", use_tantivy=False, replace=True)
+            else:
+                self.table.create_fts_index("lossless_restatement", use_tantivy=True, tokenizer_name="en_stem", replace=True)
+            self._fts_initialized = True
+        except Exception:
+            pass
+
+    def add_batch(self, entries: List[MemoryEntry], user_id: str = None):
+        """Add DM memory entries."""
+        if not entries:
+            return
+
+        restatements = [entry.lossless_restatement for entry in entries]
+        vectors = self.embedding_model.encode_documents(restatements)
+
+        data = []
+        for entry, vector in zip(entries, vectors):
+            dm_group_id = entry.group_id or f"dm_{entry.user_id or user_id or 'unknown'}"
+
+            data.append({
+                "agent_id": self.agent_id,
+                "user_id": entry.user_id or user_id or "",
+                "entry_id": entry.entry_id,
+                "lossless_restatement": entry.lossless_restatement,
+                "keywords": entry.keywords,
+                "timestamp": entry.timestamp or "",
+                "location": entry.location or "",
+                "persons": entry.persons,
+                "entities": entry.entities,
+                "topic": entry.topic or "",
+                "group_id": dm_group_id,
+                "username": entry.username or "",
+                "platform": entry.platform or "direct",
+                "memory_type": entry.memory_type.value if isinstance(entry.memory_type, DM_MemoryType) else str(entry.memory_type),
+                "privacy_scope": entry.privacy_scope.value if isinstance(entry.privacy_scope, DM_PrivacyScope) else str(entry.privacy_scope),
+                "importance_score": entry.importance_score,
+                "vector": vector.tolist()
+            })
+
+        self.table.add(data)
+        print(f"[{self.agent_id}] Added {len(entries)} DM memory entries")
+        self._init_fts_index()
+
+    def search_semantic(self, query: str, user_id: str = None, top_k: int = 10, query_vector=None) -> List[MemoryEntry]:
+        """Search DM memories."""
+        if self.table.count_rows() == 0:
+            return []
+
+        if query_vector is None:
+            query_vector = self.embedding_model.encode_single(query, is_query=True)
+        vec = query_vector.tolist() if hasattr(query_vector, 'tolist') else query_vector
+        search = self.table.search(vec).distance_type("cosine")
+
+        conditions = [f"agent_id = '{self.agent_id}'"]
+        if user_id:
+            conditions.append(f"user_id = '{user_id}'")
+
+        where_clause = " AND ".join(conditions)
+        search = search.where(where_clause, prefilter=True)
+
+        search = search.select([
+            "_distance", "entry_id", "lossless_restatement", "keywords", "timestamp",
+            "location", "persons", "entities", "topic", "group_id",
+            "user_id", "username", "platform", "memory_type",
+            "privacy_scope", "importance_score"
+        ])
+
+        results = search.limit(top_k).to_list()
+        return [self._row_to_memory_entry(r) for r in results]
+
+    def search_keyword(self, keywords: List[str], top_k: int = 3, user_id: str = None) -> List[MemoryEntry]:
+        """Keyword search."""
+        if not keywords or self.table.count_rows() == 0:
+            return []
+
+        query = " ".join(keywords)
+        try:
+            search = self.table.search(query)
+            conditions = [f"agent_id = '{self.agent_id}'"]
+            if user_id:
+                conditions.append(f"user_id = '{user_id}'")
+
+            where_clause = " AND ".join(conditions)
+            search = search.where(where_clause, prefilter=True)
+
+            results = search.limit(top_k).to_list()
+            return [self._row_to_memory_entry(r) for r in results]
+        except Exception:
+            return []
+
+    def get_all(self) -> List[MemoryEntry]:
+        """Get all entries."""
+        where_clause = f"agent_id = '{self.agent_id}'"
+        results = self.table.search().where(where_clause, prefilter=True).to_list()
+        return [self._row_to_memory_entry(r) for r in results]
+
+    def _row_to_memory_entry(self, row: dict) -> MemoryEntry:
+        """Convert LanceDB row to MemoryEntry."""
+        memory_type_str = row.get("memory_type", "conversation")
+        try:
+            memory_type = DM_MemoryType(memory_type_str) if memory_type_str else DM_MemoryType.CONVERSATION
+        except ValueError:
+            memory_type = DM_MemoryType.CONVERSATION
+
+        privacy_scope_str = row.get("privacy_scope", "private")
+        try:
+            privacy_scope = DM_PrivacyScope(privacy_scope_str) if privacy_scope_str else DM_PrivacyScope.PRIVATE
+        except ValueError:
+            privacy_scope = DM_PrivacyScope.PRIVATE
+
+        return MemoryEntry(
+            entry_id=row["entry_id"],
+            lossless_restatement=row["lossless_restatement"],
+            keywords=list(row.get("keywords") or []),
+            timestamp=row.get("timestamp") or None,
+            location=row.get("location") or None,
+            persons=list(row.get("persons") or []),
+            entities=list(row.get("entities") or []),
+            topic=row.get("topic") or None,
+            group_id=row.get("group_id") or None,
+            user_id=row.get("user_id") or None,
+            username=row.get("username") or None,
+            platform=row.get("platform") or "direct",
+            memory_type=memory_type,
+            privacy_scope=privacy_scope,
+            importance_score=row.get("importance_score", 0.5)
+        )
+
+    def count(self) -> int:
+        """Count all rows."""
+        return self.table.count_rows()
+
+    def optimize(self):
+        """Compact the table."""
+        try:
+            self.table.optimize()
+        except Exception:
+            pass
