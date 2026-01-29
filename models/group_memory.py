@@ -391,13 +391,16 @@ class AgentResponse(BaseModel):
     response_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     agent_id: str = Field(..., description="Agent this response belongs to")
 
-    # Context
+    # Scope
+    scope: str = Field(default="user", description="global | user | group")
     group_id: Optional[str] = Field(None, description="Group identifier (None for DMs)")
-    user_id: str = Field(..., description="User who triggered this response")
+    user_id: Optional[str] = Field(None, description="User who triggered this response")
 
-    # Content
+    # Trigger (what caused this response)
+    trigger_message: str = Field(..., description="User message that triggered the response")
+
+    # Response
     content: str = Field(..., description="Complete response content")
-    content_hash: str = Field(..., description="SHA256 hash for deduplication")
     summary: Optional[str] = Field(None, description="Short summary for search")
 
     # Classification
@@ -405,17 +408,17 @@ class AgentResponse(BaseModel):
     topics: List[str] = Field(default_factory=list, description="Topics covered")
     keywords: List[str] = Field(default_factory=list, description="Keywords for search")
 
-    # Trigger (what caused this response)
-    trigger_message: str = Field(..., description="User message that triggered the response")
-    trigger_message_id: Optional[str] = Field(None, description="Original message ID")
-
     # Temporal
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     # Metrics
+    importance_score: float = Field(default=0.5, ge=0.0, le=1.0, description="Importance 0-1")
+
+    # Legacy fields for backward compatibility
+    content_hash: Optional[str] = Field(None, description="SHA256 hash for deduplication")
+    trigger_message_id: Optional[str] = Field(None, description="Original message ID")
     token_count: int = Field(default=0, ge=0, description="Tokens in response")
     was_repeated: bool = Field(default=False, description="Whether we detected repetition")
-    importance_score: float = Field(default=0.5, ge=0.0, le=1.0, description="Importance 0-1")
 
     class Config:
         json_schema_extra = {
