@@ -214,6 +214,44 @@ class MemoryStore:
         """Add an agent response."""
         return self.agent_responses.add(response)
 
+    def search_agent_responses_by_trigger(
+        self,
+        query: str,
+        scope: str = None,
+        group_id: str = None,
+        limit: int = 5
+    ) -> List[dict]:
+        """
+        Search for similar questions asked before.
+
+        Uses trigger_vector to find what users asked previously.
+        """
+        query_vector = self.embedding_model.encode_single(query, is_query=True)
+        return self.agent_responses.search_by_trigger(query_vector, scope, group_id, limit)
+
+    def search_agent_responses_by_response(
+        self,
+        query: str,
+        user_id: str = None,
+        group_id: str = None,
+        limit: int = 5
+    ) -> List[dict]:
+        """
+        Search for similar responses given before.
+
+        Uses response_vector to find what the agent said previously.
+        """
+        query_vector = self.embedding_model.encode_single(query, is_query=True)
+        return self.agent_responses.search_by_response(query_vector, user_id, group_id, limit)
+
+    def add_agent_response_with_vectors(self, response: AgentResponse) -> str:
+        """
+        Add response with dual vectors.
+
+        This is the new recommended method for storing agent responses.
+        """
+        return self.agent_responses.add_with_vectors(response)
+
     # ============================================================
     # Conversation Summary Operations
     # ============================================================
