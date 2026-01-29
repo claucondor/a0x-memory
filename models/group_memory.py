@@ -455,6 +455,14 @@ class GroupTone(str, Enum):
     OTHER = "other"
 
 
+class PeriodType(str, Enum):
+    """Summary period granularity"""
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    ERA = "era"
+
+
 class GroupProfile(BaseModel):
     """
     Group profile - cultural and contextual information about a group.
@@ -492,6 +500,18 @@ class GroupProfile(BaseModel):
     # Content preferences
     preferred_content_types: List[str] = Field(default_factory=list, description="Types of content preferred")
 
+    # NEW: Topic evolution (last 12 data points)
+    topic_evolution: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Topic trends: [{period, topics, activity_score}]"
+    )
+
+    # NEW: Current era tracking
+    current_era: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Active era: {started, theme, key_topics}"
+    )
+
     # Metadata
     total_messages_processed: int = Field(default=0, description="Messages used to build profile")
     last_message_timestamp: Optional[str] = Field(None, description="Last message ISO timestamp")
@@ -516,11 +536,83 @@ class GroupProfile(BaseModel):
                 "activity_level": "high",
                 "member_count_estimate": 250,
                 "preferred_content_types": ["yield strategies", "new protocols", "security alerts"],
+                "topic_evolution": [
+                    {"period": "2024-W05", "topics": ["grants", "audits"], "activity_score": 0.8}
+                ],
+                "current_era": {
+                    "started": "2024-01-15",
+                    "theme": "Base ecosystem grants",
+                    "key_topics": ["grants", "audits", "applications"]
+                },
                 "total_messages_processed": 150,
                 "last_message_timestamp": "2025-01-26T10:00:00Z",
                 "created_at": "2025-01-15T10:00:00Z",
                 "updated_at": "2025-01-26T10:00:00Z",
                 "profile_version": 3
+            }
+        }
+
+
+class GroupSummary(BaseModel):
+    """
+    Hierarchical group summary for a specific time period.
+
+    Summaries aggregate upward:
+    - Daily summaries aggregate to weekly
+    - Weekly summaries aggregate to monthly
+    - Monthly summaries detect and form eras
+
+    Decay mechanism:
+    - decay_score starts at 1.0
+    - Decays exponentially based on age and period_type
+    - Old summaries get pruned when decay_score < 0.1
+    """
+    summary_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    agent_id: str = Field(..., description="Agent this summary belongs to")
+    group_id: str = Field(..., description="Group identifier")
+
+    # Period definition
+    period_type: PeriodType = Field(..., description="Granularity: daily, weekly, monthly, era")
+    period_start: str = Field(..., description="Period start ISO date (YYYY-MM-DD)")
+    period_end: str = Field(..., description="Period end ISO date (YYYY-MM-DD)")
+
+    # Content
+    summary: str = Field(..., description="2-5 sentence summary of the period")
+    topics: List[str] = Field(default_factory=list, description="3-7 main topics")
+    highlights: List[str] = Field(default_factory=list, description="2-4 notable events/discussions")
+    active_users: List[str] = Field(default_factory=list, description="Top 5 contributors")
+
+    # Metrics
+    message_count: int = Field(default=0, description="Messages processed in period")
+    activity_score: float = Field(default=0.5, ge=0.0, le=1.0, description="Relative activity level")
+
+    # Decay
+    decay_score: float = Field(default=1.0, ge=0.0, le=1.0, description="1.0=fresh, 0.0=expired")
+
+    # Hierarchy
+    aggregated_from: List[str] = Field(default_factory=list, description="Child summary IDs used")
+
+    # Metadata
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "summary_id": "550e8400-e29b-41d4-a716-446655440008",
+                "agent_id": "71f6f657-6800-0892-875f-f26e8c213756",
+                "group_id": "telegram_group_123",
+                "period_type": "daily",
+                "period_start": "2025-01-27",
+                "period_end": "2025-01-27",
+                "summary": "Group discussed Base chain grant applications and audit processes",
+                "topics": ["grants", "audits", "base chain"],
+                "highlights": ["New grant round announced", "Security audit discussed"],
+                "active_users": ["alice_web3", "bob_builder"],
+                "message_count": 45,
+                "activity_score": 0.7,
+                "decay_score": 1.0,
+                "aggregated_from": [],
+                "created_at": "2025-01-27T23:59:59Z"
             }
         }
 
