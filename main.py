@@ -15,6 +15,8 @@ from utils.llm_client import LLMClient
 from utils.embedding import EmbeddingModel
 from database import MemoryStore, VectorStore, UserProfileStore
 from database.group_profile_store import GroupProfileStore
+from database.group_summary_store import GroupSummaryStore
+from services.summary_aggregator import SummaryAggregator
 from core.memory_builder import MemoryBuilder
 from core.hybrid_retriever import HybridRetriever
 from core.answer_generator import AnswerGenerator
@@ -191,6 +193,17 @@ class SimpleMemSystem:
             db_path=db_path or config.LANCEDB_PATH,
             embedding_model=self.embedding_model,
             agent_id=self.agent_id
+        )
+
+        # Group summary store for hierarchical summaries
+        self.group_summary_store = GroupSummaryStore(
+            db_path=db_path or config.LANCEDB_PATH,
+            embedding_model=self.embedding_model,
+            agent_id=self.agent_id
+        )
+        self.summary_aggregator = SummaryAggregator(
+            summary_store=self.group_summary_store,
+            llm_client=self.llm_client
         )
 
         # Pass profile stores to hybrid_retriever for lightweight entity system
@@ -652,6 +665,26 @@ class SimpleMemSystem:
                     fn()
                 except Exception as e2:
                     print(f"[PostBatch] Sequential task '{name}' failed: {e2}")
+
+        # Generate daily summary if enough messages processed today
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today_messages = [m for m in unprocessed if m.get('timestamp', '').startswith(today)]
+        if len(today_messages) >= 5 and original_group_id is not None:
+            self.summary_aggregator.generate_daily_summary(
+                agent_id=self.agent_id,
+                group_id=original_group_id,
+                date=today,
+                messages=today_messages
+            )
+
+        # Run aggregation cycle periodically (every 10 batches)
+        if hasattr(self, '_batch_count'):
+            self._batch_count += 1
+        else:
+            self._batch_count = 1
+
+        if original_group_id is not None and self._batch_count % 10 == 0:
+            self.summary_aggregator.run_aggregation_cycle(self.agent_id, original_group_id)
 
     def _process_unprocessed_agent_responses(
         self,
