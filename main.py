@@ -944,9 +944,13 @@ class SimpleMemSystem:
     def add_agent_response_to_window(
         self,
         response: str,
-        user_id: str,
+        user_id: str = None,
         group_id: Optional[str] = None,
-        platform: str = "direct"
+        platform: str = "direct",
+        trigger_message: Optional[str] = None,
+        trigger_message_id: Optional[str] = None,
+        timestamp: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> bool:
         """
         Add agent response to Firestore recent window for immediate context.
@@ -959,6 +963,10 @@ class SimpleMemSystem:
             user_id: User who received this response
             group_id: Group ID (None for DMs)
             platform: Platform
+            trigger_message: User message that triggered this response
+            trigger_message_id: ID of the trigger message
+            timestamp: Optional timestamp override
+            metadata: Additional metadata
 
         Returns:
             True if successful, False otherwise
@@ -966,7 +974,24 @@ class SimpleMemSystem:
         if not self.firestore_enabled or not self.firestore:
             return False
 
-        effective_group_id = group_id or f"dm_{user_id}"
+        effective_group_id = group_id or f"dm_{user_id}" if user_id else "dm_unknown"
+
+        # Build metadata with trigger info
+        response_metadata = {
+            "is_agent_response": True,
+            "timestamp": timestamp or datetime.now(timezone.utc).isoformat(),
+            "processed": True  # Already processed, don't re-process
+        }
+
+        # Add trigger info if provided
+        if trigger_message:
+            response_metadata["trigger_message"] = trigger_message
+        if trigger_message_id:
+            response_metadata["trigger_message_id"] = trigger_message_id
+
+        # Merge any additional metadata
+        if metadata:
+            response_metadata.update(metadata)
 
         # Mark as processed=True so it won't be batch processed again
         return self.firestore.add_message(
@@ -979,11 +1004,7 @@ class SimpleMemSystem:
                 "user_id": "agent",
                 "is_agent": True
             },
-            metadata={
-                "is_agent_response": True,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "processed": True  # Already processed, don't re-process
-            }
+            metadata=response_metadata
         ) is not None
 
     def get_firestore_context(self, group_id: Optional[str] = None, limit: int = 10) -> Dict[str, Any]:
