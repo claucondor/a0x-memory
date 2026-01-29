@@ -46,6 +46,28 @@ SUMMARY_CONFIG = {
     }
 }
 
+# DM-specific configuration (lower thresholds for 1-on-1 conversations)
+DM_SUMMARY_CONFIG = {
+    "micro": {
+        "message_threshold": 20,       # Lower than group (50)
+        "aggregate_count": 5,          # 5 micros → 1 chunk
+        "decay_start_messages": 100,
+        "max_messages": 200,
+    },
+    "chunk": {
+        "message_threshold": 100,      # 5 micros
+        "aggregate_count": 5,          # 5 chunks → 1 block
+        "decay_start_messages": 500,
+        "max_messages": 1000,
+    },
+    "block": {
+        "message_threshold": 500,      # 5 chunks
+        "aggregate_count": 5,
+        "decay_start_messages": 2500,
+        "max_messages": 5000,
+    }
+}
+
 
 class GroupSummaryStore:
     """LanceDB storage for volume-based hierarchical group summaries."""
