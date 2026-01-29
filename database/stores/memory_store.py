@@ -436,10 +436,14 @@ class MemoryStore:
         user_id: str = None,
         top_k: int = 5
     ):
-        """Search agent responses."""
-        # Basic implementation - can be expanded later
+        """Search agent responses by semantic similarity."""
         query_vector = self.embedding_model.encode_single(query, is_query=True)
-        return []
+        return self.agent_responses.search_semantic(
+            query_vector=query_vector,
+            group_id=group_id,
+            user_id=user_id,
+            limit=top_k
+        )
 
     def consolidate_similar_memories(self, group_id: str):
         """Consolidate similar memories in a group."""
