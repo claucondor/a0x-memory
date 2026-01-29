@@ -977,7 +977,7 @@ async def get_group_profile(group_id: str, agent_id: Optional[str] = None):
         summary=profile.summary,
         main_topics=profile.main_topics,
         group_purpose=profile.group_purpose,
-        tone=profile.tone.value,
+        tone=profile.tone.value if hasattr(profile.tone, 'value') else profile.tone,
         expertise_level=profile.expertise_level,
         total_messages_processed=profile.total_messages_processed,
         created_at=profile.created_at,
@@ -1146,7 +1146,7 @@ async def get_full_context(
                         summary=gp.summary,
                         main_topics=gp.main_topics,
                         group_purpose=gp.group_purpose,
-                        tone=gp.tone.value,
+                        tone=gp.tone.value if hasattr(gp.tone, 'value') else gp.tone,
                         expertise_level=gp.expertise_level,
                         total_messages_processed=gp.total_messages_processed,
                         created_at=gp.created_at,
@@ -1543,7 +1543,9 @@ async def process_pending_messages(
             "memories_created": result.get("memories_created", 0)
         }
     except Exception as e:
+        import traceback
         print(f"[API] Error processing pending: {e}")
+        traceback.print_exc()
         return {
             "success": False,
             "error": str(e)

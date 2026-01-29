@@ -125,7 +125,7 @@ class InteractionMemoriesTable:
             "last_updated": memory.last_updated,
             "source_message_id": memory.source_message_id or "",
             "source_timestamp": memory.source_timestamp or "",
-            "interaction_type": memory.interaction_type.value,
+            "interaction_type": memory.interaction_type.value if hasattr(memory.interaction_type, 'value') else memory.interaction_type,
             "vector": vector.tolist()
         }
 
@@ -251,7 +251,7 @@ class InteractionMemoriesTable:
                     "last_updated": memory.last_updated,
                     "source_message_id": memory.source_message_id or "",
                     "source_timestamp": memory.source_timestamp or "",
-                    "interaction_type": memory.interaction_type.value,
+                    "interaction_type": memory.interaction_type.value if hasattr(memory.interaction_type, 'value') else memory.interaction_type,
                     "vector": vector.tolist()
                 })
 

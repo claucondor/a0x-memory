@@ -193,7 +193,7 @@ class GroupProfileStore:
             "profile_data": profile.model_dump_json(),
             "summary": profile.summary,
             "main_topics": profile.main_topics,
-            "tone": profile.tone.value,
+            "tone": profile.tone.value if hasattr(profile.tone, 'value') else profile.tone,
             "expertise_level": profile.expertise_level,
             "total_messages": profile.total_messages_processed,
             "created_at": profile.created_at,
