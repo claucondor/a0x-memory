@@ -102,6 +102,39 @@ class AgentResponsesTable:
         self.table.add([data])
         return response.response_id
 
+    def add_with_vectors(self, response: AgentResponse) -> str:
+        """
+        Add response with both trigger and response vectors.
+
+        This is the new recommended method for storing agent responses.
+        """
+        trigger_vector = self.embedding_model.encode_single(response.trigger_message, is_query=False)
+        response_vector = self.embedding_model.encode_single(
+            response.summary or response.content,
+            is_query=False
+        )
+
+        data = {
+            "response_id": response.response_id,
+            "agent_id": response.agent_id,
+            "scope": response.scope,
+            "user_id": response.user_id,
+            "group_id": response.group_id,
+            "trigger_message": response.trigger_message,
+            "trigger_vector": trigger_vector.tolist(),
+            "response_content": response.content,
+            "response_summary": response.summary,
+            "response_vector": response_vector.tolist(),
+            "response_type": response.response_type.value,
+            "topics": response.topics,
+            "keywords": response.keywords,
+            "timestamp": response.timestamp,
+            "importance_score": response.importance_score,
+        }
+
+        self.table.add([data])
+        return response.response_id
+
     def count(self) -> int:
         """Count all rows."""
         return self.table.count_rows()
