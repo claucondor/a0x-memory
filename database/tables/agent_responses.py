@@ -153,3 +153,87 @@ class AgentResponsesTable:
             self.table.optimize()
         except Exception:
             pass
+
+    def search_by_trigger(
+        self,
+        query_vector,
+        scope: str = None,
+        group_id: str = None,
+        limit: int = 5
+    ) -> List[dict]:
+        """
+        Search for similar questions asked before.
+
+        Uses trigger_vector to find similar user questions.
+
+        Args:
+            query_vector: Pre-computed query vector
+            scope: Filter by scope ("global" | "user" | "group")
+            group_id: Include global + this group's responses
+            limit: Max results
+
+        Returns:
+            List of dicts with response data
+        """
+        if self.table.count_rows() == 0:
+            return []
+
+        search = self.table.search(query_vector, vector_column_name="trigger_vector")
+
+        conditions = [f"agent_id = '{self.agent_id}'"]
+        if scope:
+            conditions.append(f"scope = '{scope}'")
+        if group_id:
+            conditions.append(f"(scope = 'global' OR group_id = '{group_id}')")
+
+        where_clause = " AND ".join(conditions)
+        search = search.where(where_clause, prefilter=True)
+
+        try:
+            results = search.limit(limit).to_list()
+            return results
+        except Exception as e:
+            print(f"[AgentResponses] search_by_trigger error: {e}")
+            return []
+
+    def search_by_response(
+        self,
+        query_vector,
+        user_id: str = None,
+        group_id: str = None,
+        limit: int = 5
+    ) -> List[dict]:
+        """
+        Search for similar responses given before.
+
+        Uses response_vector to find similar agent responses.
+
+        Args:
+            query_vector: Pre-computed query vector
+            user_id: Filter by user (what I said to this user)
+            group_id: Filter by group (what I said in this group)
+            limit: Max results
+
+        Returns:
+            List of dicts with response data
+        """
+        if self.table.count_rows() == 0:
+            return []
+
+        search = self.table.search(query_vector, vector_column_name="response_vector")
+
+        conditions = [f"agent_id = '{self.agent_id}'"]
+        if user_id:
+            conditions.append(f"user_id = '{user_id}'")
+        if group_id:
+            conditions.append(f"group_id = '{group_id}'")
+
+        where_clause = " AND ".join(conditions)
+        search = search.where(where_clause, prefilter=True)
+
+        try:
+            results = search.limit(limit).to_list()
+            return results
+        except Exception as e:
+            print(f"[AgentResponses] search_by_response error: {e}")
+            return []
