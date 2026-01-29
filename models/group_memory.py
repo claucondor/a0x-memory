@@ -694,3 +694,60 @@ class UserInGroupProfile(BaseModel):
                 "updated_at": "2025-01-26T10:00:00Z"
             }
         }
+
+
+class FactType(str, Enum):
+    """Type of user fact"""
+    PREFERENCE = "preference"
+    EXPERTISE = "expertise"
+    BEHAVIOR = "behavior"
+    PERSONAL = "personal"
+    INTEREST = "interest"
+    COMMUNICATION = "communication"
+
+
+class UserFact(BaseModel):
+    """
+    A single fact about a user, tracked with evidence.
+
+    Facts are extracted from user messages in groups and DMs.
+    They don't decay over time but have confidence scores.
+    """
+    fact_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    agent_id: str
+    user_id: str
+
+    content: str
+    fact_type: FactType
+    keywords: List[str] = []
+
+    evidence_count: int = 1
+    confidence: float = 0.5
+    sources: List[str] = []
+    source_types: List[str] = []
+
+    first_seen: str
+    last_confirmed: str
+
+    is_consolidated: bool = False
+    consolidated_from: List[str] = []
+    contradicted_by: List[str] = []
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "fact_id": "abc123",
+                "agent_id": "jessexbt",
+                "user_id": "telegram:123456",
+                "content": "Expert in DeFi yield farming",
+                "fact_type": "expertise",
+                "keywords": ["defi", "yield", "farming"],
+                "evidence_count": 8,
+                "confidence": 0.85,
+                "sources": ["group_A", "group_B", "dm_123"],
+                "source_types": ["group", "group", "dm"],
+                "first_seen": "2025-01-15T10:00:00Z",
+                "last_confirmed": "2025-01-28T14:00:00Z",
+                "is_consolidated": False
+            }
+        }
