@@ -97,6 +97,47 @@ class AgentResponsesTable:
         """Count all rows."""
         return self.table.count_rows()
 
+    def search_semantic(
+        self,
+        query_vector,
+        group_id: str = None,
+        user_id: str = None,
+        limit: int = 5
+    ) -> list:
+        """
+        Search agent responses by semantic similarity.
+
+        Args:
+            query_vector: Pre-computed query vector
+            group_id: Filter by group (None = all)
+            user_id: Filter by user (None = all)
+            limit: Max results
+
+        Returns:
+            List of dicts with response data
+        """
+        if self.table.count_rows() == 0:
+            return []
+
+        search = self.table.search(query_vector)
+
+        # Build filter
+        conditions = [f"agent_id = '{self.agent_id}'"]
+        if group_id:
+            conditions.append(f"group_id = '{group_id}'")
+        if user_id:
+            conditions.append(f"user_id = '{user_id}'")
+
+        where_clause = " AND ".join(conditions)
+        search = search.where(where_clause, prefilter=True)
+
+        try:
+            results = search.limit(limit).to_list()
+            return results
+        except Exception as e:
+            print(f"[AgentResponses] Search error: {e}")
+            return []
+
     def optimize(self):
         """Compact the table."""
         try:
