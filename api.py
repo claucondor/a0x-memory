@@ -1571,13 +1571,14 @@ async def get_memory_stats(agent_id: str):
         if hasattr(system.vector_store, 'get_stats'):
             memory_stats = system.vector_store.get_stats()
             stats["memory_breakdown"] = memory_stats
-            # Sum all memory tables for total count
+            # Sum all memory tables for total count (including agent_responses)
             stats["memory_count"] = sum([
                 memory_stats.get("dm_memories", 0),
                 memory_stats.get("group_memories", 0),
                 memory_stats.get("user_memories", 0),
                 memory_stats.get("interaction_memories", 0),
-                memory_stats.get("cross_group_memories", 0)
+                memory_stats.get("cross_group_memories", 0),
+                memory_stats.get("agent_responses", 0)
             ])
         else:
             stats["memory_count"] = system.vector_store.count_entries()
