@@ -18,6 +18,7 @@ from database.group_profile_store import GroupProfileStore
 from core.memory_builder import MemoryBuilder
 from core.hybrid_retriever import HybridRetriever
 from core.answer_generator import AnswerGenerator
+from core.response_extractor import ResponseExtractor
 from services.firestore_window import get_firestore_store, FirestoreWindowStore
 from core.adaptive_threshold import (
     AdaptiveThresholdManager,
@@ -465,6 +466,13 @@ class SimpleMemSystem:
             effective_group_id=effective_group_id
         )
 
+        # Process agent responses to LanceDB
+        self._process_unprocessed_agent_responses(
+            effective_group_id=effective_group_id,
+            original_group_id=original_group_id,
+            platform=platform
+        )
+
         # Compact LanceDB fragments accumulated during this batch
         try:
             self.unified_store.optimize_tables()
@@ -644,6 +652,122 @@ class SimpleMemSystem:
                     fn()
                 except Exception as e2:
                     print(f"[PostBatch] Sequential task '{name}' failed: {e2}")
+
+    def _process_unprocessed_agent_responses(
+        self,
+        effective_group_id: str,
+        original_group_id: Optional[str],
+        platform: str
+    ) -> Dict[str, Any]:
+        """
+        Process unprocessed agent responses from Firestore to LanceDB.
+
+        Extracts metadata using LLM and stores with dual vectors.
+
+        Args:
+            effective_group_id: The group ID used in Firestore
+            original_group_id: The original group ID (None for DMs)
+            platform: The platform
+
+        Returns:
+            Dict with processing results
+        """
+        result = {"processed": 0, "errors": 0}
+
+        if not self.firestore_enabled or not self.firestore:
+            return result
+
+        # Initialize ResponseExtractor
+        if not hasattr(self, 'response_extractor'):
+            self.response_extractor = ResponseExtractor(self.llm_client)
+
+        try:
+            # Get recent messages from Firestore
+            messages = self.firestore.get_recent_messages(
+                self.agent_id,
+                effective_group_id,
+                limit=50
+            )
+
+            # Filter for agent responses that haven't been processed to LanceDB
+            agent_responses = [
+                m for m in messages
+                if m.get('metadata', {}).get('is_agent_response')
+                and not m.get('metadata', {}).get('processed_to_lancedb')
+            ]
+
+            if not agent_responses:
+                return result
+
+            print(f"\n[AgentResponses] Found {len(agent_responses)} unprocessed agent responses")
+
+            from models.group_memory import AgentResponse, ResponseType
+
+            for msg in agent_responses:
+                try:
+                    metadata = msg.get('metadata', {})
+                    platform_identity = msg.get('platform_identity', {})
+
+                    trigger_message = metadata.get('trigger_message', '')
+                    response_content = msg.get('content', '')
+
+                    if not trigger_message or not response_content:
+                        continue
+
+                    # Extract metadata with LLM
+                    extracted = self.response_extractor.extract(
+                        trigger_message=trigger_message,
+                        response_content=response_content
+                    )
+
+                    # Determine scope
+                    # If group-specific and mentions user, use "user"
+                    # If group general, use "group"
+                    # If generic info, use "global"
+                    scope = extracted.get('scope', 'user')
+                    if original_group_id and scope == 'user':
+                        # Check if response addresses a specific user
+                        mentioned_user = platform_identity.get('user_id')
+                        if not mentioned_user:
+                            scope = 'group'
+
+                    # Create AgentResponse
+                    response = AgentResponse(
+                        agent_id=self.agent_id,
+                        scope=scope,
+                        user_id=platform_identity.get('user_id'),
+                        group_id=original_group_id if original_group_id and not original_group_id.startswith('dm_') else None,
+                        trigger_message=trigger_message,
+                        content=response_content,
+                        summary=extracted.get('summary'),
+                        response_type=ResponseType(extracted.get('response_type', 'answer')),
+                        topics=extracted.get('topics', []),
+                        keywords=extracted.get('keywords', []),
+                    )
+
+                    # Store in LanceDB
+                    self.unified_store.add_agent_response_with_vectors(response)
+                    result["processed"] += 1
+
+                    # Mark as processed to LanceDB
+                    self.firestore.mark_processed_to_lancedb(
+                        agent_id=self.agent_id,
+                        group_id=effective_group_id,
+                        doc_id=msg.get('doc_id')
+                    )
+
+                except Exception as e:
+                    print(f"[AgentResponses] Error processing response: {e}")
+                    result["errors"] += 1
+
+            if result["processed"] > 0:
+                print(f"[AgentResponses] Processed {result['processed']} agent responses to LanceDB")
+
+        except Exception as e:
+            print(f"[AgentResponses] Batch processing error: {e}")
+            result["errors"] += 1
+
+        return result
 
     def _get_all_user_messages(self, user_id: str, platform_type: str) -> Optional[List[str]]:
         """

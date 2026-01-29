@@ -527,6 +527,29 @@ class FirestoreWindowStore:
         except Exception as e:
             print(f"[FirestoreWindow] Error marking processed: {e}")
 
+    def mark_processed_to_lancedb(self, agent_id: str, group_id: str, doc_id: str):
+        """
+        Mark a single agent response message as processed to LanceDB.
+
+        Args:
+            agent_id: Agent ID
+            group_id: Group ID
+            doc_id: Document ID to mark as processed to LanceDB
+        """
+        if not self._enabled:
+            return
+
+        try:
+            collection = self._get_collection(agent_id, group_id)
+            if not collection:
+                return
+
+            doc_ref = collection.document(doc_id)
+            doc_ref.update({'metadata.processed_to_lancedb': True})
+
+        except Exception as e:
+            print(f"[FirestoreWindow] Error marking processed_to_lancedb: {e}")
+
     def clear_recent(self, agent_id: str, group_id: str):
         """
         Clear all recent messages for a group (useful for testing).
