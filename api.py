@@ -1667,6 +1667,33 @@ async def get_group_summaries(
     }
 
 
+@app.post("/v1/groups/{group_id}/aggregate")
+async def trigger_aggregation(group_id: str, agent_id: str):
+    """Manually trigger summary aggregation cycle."""
+    memory_id = f"{agent_id}:"
+    system = get_memory_system(memory_id)
+
+    if not hasattr(system, 'summary_aggregator'):
+        raise HTTPException(status_code=501, detail="Summary aggregation not available")
+
+    try:
+        system.summary_aggregator.run_aggregation_cycle(agent_id, group_id)
+
+        # Get updated counts
+        summaries = system.group_summary_store.get_context_summaries(group_id)
+
+        return {
+            "success": True,
+            "counts": {
+                "daily": len(summaries.get("daily", [])),
+                "weekly": len(summaries.get("weekly", [])),
+                "monthly": len(summaries.get("monthly", []))
+            }
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 @app.delete("/v1/memory/reset/{agent_id}")
 async def reset_agent_data(agent_id: str, confirm: bool = False):
     """
