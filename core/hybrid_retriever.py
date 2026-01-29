@@ -1450,6 +1450,56 @@ Return ONLY JSON.
         relevant_profiles = []
         group_context = None
 
+        # Step 6.5: Search agent responses (dual-vector search)
+        agent_context = {
+            "similar_questions": [],
+            "said_to_user": [],
+            "said_in_group": []
+        }
+
+        if hasattr(self.unified_store, 'search_agent_responses_by_trigger'):
+            try:
+                # Search by trigger (similar questions asked before)
+                similar_qs = self.unified_store.search_agent_responses_by_trigger(
+                    query,
+                    group_id=group_id,
+                    limit=3
+                )
+                agent_context["similar_questions"] = similar_qs
+                if similar_qs:
+                    print(f"[retrieve_for_context] Found {len(similar_qs)} similar questions asked before")
+            except Exception as e:
+                print(f"[retrieve_for_context] search_agent_responses_by_trigger failed: {e}")
+
+        if hasattr(self.unified_store, 'search_agent_responses_by_response'):
+            # Search by response (what I said to this user)
+            if user_id:
+                try:
+                    said_to_user = self.unified_store.search_agent_responses_by_response(
+                        query,
+                        user_id=user_id,
+                        limit=3
+                    )
+                    agent_context["said_to_user"] = said_to_user
+                    if said_to_user:
+                        print(f"[retrieve_for_context] Found {len(said_to_user)} responses said to this user")
+                except Exception as e:
+                    print(f"[retrieve_for_context] search_agent_responses_by_response (user) failed: {e}")
+
+            # Search by response (what I said in this group)
+            if group_id:
+                try:
+                    said_in_group = self.unified_store.search_agent_responses_by_response(
+                        query,
+                        group_id=group_id,
+                        limit=3
+                    )
+                    agent_context["said_in_group"] = said_in_group
+                    if said_in_group:
+                        print(f"[retrieve_for_context] Found {len(said_in_group)} responses said in this group")
+                except Exception as e:
+                    print(f"[retrieve_for_context] search_agent_responses_by_response (group) failed: {e}")
+
         if self.user_profile_store:
             try:
                 relevant_profiles = self.user_profile_store.get_relevant_profiles(
@@ -1476,7 +1526,8 @@ Return ONLY JSON.
             "formatted_context": formatted,
             "conversation_summary": conversation_summary,
             "relevant_profiles": relevant_profiles,
-            "group_context": group_context
+            "group_context": group_context,
+            "agent_responses": agent_context
         }
 
     def _apply_group_keyword_boost(
