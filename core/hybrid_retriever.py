@@ -1519,6 +1519,22 @@ Return ONLY JSON.
             except Exception as e:
                 print(f"[retrieve_for_context] Group context lookup failed: {e}")
 
+        # Get hierarchical summaries for context
+        historical_context = ""
+        if self.group_summary_store and group_id:
+            try:
+                summaries = self.group_summary_store.get_context_summaries(
+                    group_id=group_id,
+                    limit_daily=3,   # Last 3 days
+                    limit_weekly=2,  # Last 2 weeks
+                    limit_monthly=1  # Last month
+                )
+                historical_context = self._build_summary_context(summaries)
+                if historical_context:
+                    print(f"[retrieve_for_context] Retrieved hierarchical summaries for {group_id}")
+            except Exception as e:
+                print(f"[retrieve_for_context] Summary lookup failed: {e}")
+
         formatted = self._format_multi_table_context(raw_results, context)
 
         return {
@@ -1527,6 +1543,7 @@ Return ONLY JSON.
             "conversation_summary": conversation_summary,
             "relevant_profiles": relevant_profiles,
             "group_context": group_context,
+            "historical_context": historical_context,
             "agent_responses": agent_context
         }
 
@@ -1906,6 +1923,28 @@ Return ONLY JSON.
             return "[No relevant memories found]"
 
         return "\n\n".join(sections)
+
+    def _build_summary_context(self, summaries: Dict[str, List]) -> str:
+        """Build context string from hierarchical summaries."""
+        parts = []
+
+        if summaries.get("monthly"):
+            s = summaries["monthly"][0]
+            parts.append(f"Last month ({s.period_start[:7]}): {s.summary}")
+
+        if summaries.get("weekly"):
+            for s in summaries["weekly"][:2]:
+                parts.append(f"Week of {s.period_start}: {s.summary}")
+
+        if summaries.get("daily"):
+            recent = summaries["daily"][:3]
+            if recent:
+                parts.append("Recent days: " + " | ".join([
+                    f"{s.period_start[-5:]}: {s.topics[0] if s.topics else 'general'}"
+                    for s in recent
+                ]))
+
+        return "\n".join(parts) if parts else ""
 
     def retrieve_user_profile(
         self,
