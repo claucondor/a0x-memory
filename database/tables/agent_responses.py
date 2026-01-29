@@ -1,8 +1,12 @@
 """
 AgentResponses table operations.
 Extracted from unified_store.py.
+
+Dual-vector schema:
+- trigger_vector: for searching similar questions
+- response_vector: for searching similar responses
 """
-from typing import List
+from typing import List, Optional
 
 import pyarrow as pa
 
@@ -13,7 +17,7 @@ import config
 
 
 class AgentResponsesTable:
-    """CRUD for agent_responses table."""
+    """CRUD for agent_responses table with dual-vector search."""
 
     def __init__(self, agent_id: str, embedding_model: EmbeddingModel = None, storage_options: dict = None):
         self.agent_id = agent_id
@@ -23,25 +27,28 @@ class AgentResponsesTable:
         self.table = self._init_table()
 
     def _init_table(self):
-        """Initialize table with schema."""
+        """Initialize table with dual-vector schema."""
         schema = pa.schema([
             pa.field("response_id", pa.string()),
             pa.field("agent_id", pa.string()),
-            pa.field("group_id", pa.string()),
+            # Scope
+            pa.field("scope", pa.string()),
             pa.field("user_id", pa.string()),
-            pa.field("content", pa.string()),
-            pa.field("content_hash", pa.string()),
-            pa.field("summary", pa.string()),
+            pa.field("group_id", pa.string()),
+            # Trigger (user's message)
+            pa.field("trigger_message", pa.string()),
+            pa.field("trigger_vector", pa.list_(pa.float32(), self.embedding_model.dimension)),
+            # Response
+            pa.field("response_content", pa.string()),
+            pa.field("response_summary", pa.string()),
+            pa.field("response_vector", pa.list_(pa.float32(), self.embedding_model.dimension)),
+            # Classification
             pa.field("response_type", pa.string()),
             pa.field("topics", pa.list_(pa.string())),
             pa.field("keywords", pa.list_(pa.string())),
-            pa.field("trigger_message", pa.string()),
-            pa.field("trigger_message_id", pa.string()),
+            # Metadata
             pa.field("timestamp", pa.string()),
-            pa.field("token_count", pa.int32()),
-            pa.field("was_repeated", pa.bool_()),
             pa.field("importance_score", pa.float32()),
-            pa.field("vector", pa.list_(pa.float32(), self.embedding_model.dimension))
         ])
 
         table_name = "agent_responses"
@@ -52,10 +59,10 @@ class AgentResponsesTable:
             table = self.db.open_table(table_name)
             print(f"[{self.agent_id}] Opened {table_name} ({table.count_rows()} rows)")
 
-        self._create_scalar_index(table, "agent_id")
+        # Scalar indices for filtering
+        self._create_scalar_index(table, "scope")
         self._create_scalar_index(table, "user_id")
         self._create_scalar_index(table, "group_id")
-        self._create_scalar_index(table, "content_hash")
 
         return table
 
@@ -67,27 +74,29 @@ class AgentResponsesTable:
             pass
 
     def add(self, response: AgentResponse) -> str:
-        """Add an agent response."""
-        vector = self.embedding_model.encode_single(response.summary or response.content, is_query=False)
+        """Add an agent response (legacy method for backward compatibility)."""
+        trigger_vector = self.embedding_model.encode_single(response.trigger_message, is_query=False)
+        response_vector = self.embedding_model.encode_single(
+            response.summary or response.content,
+            is_query=False
+        )
 
         data = {
             "response_id": response.response_id,
             "agent_id": response.agent_id,
-            "group_id": response.group_id,
+            "scope": getattr(response, "scope", "user"),
             "user_id": response.user_id,
-            "content": response.content,
-            "content_hash": response.content_hash,
-            "summary": response.summary,
+            "group_id": response.group_id,
+            "trigger_message": response.trigger_message,
+            "trigger_vector": trigger_vector.tolist(),
+            "response_content": response.content,
+            "response_summary": response.summary,
+            "response_vector": response_vector.tolist(),
             "response_type": response.response_type.value,
             "topics": response.topics,
             "keywords": response.keywords,
-            "trigger_message": response.trigger_message,
-            "trigger_message_id": response.trigger_message_id,
             "timestamp": response.timestamp,
-            "token_count": response.token_count,
-            "was_repeated": response.was_repeated,
             "importance_score": response.importance_score,
-            "vector": vector.tolist()
         }
 
         self.table.add([data])
@@ -105,7 +114,7 @@ class AgentResponsesTable:
         limit: int = 5
     ) -> list:
         """
-        Search agent responses by semantic similarity.
+        Search agent responses by semantic similarity (uses response_vector).
 
         Args:
             query_vector: Pre-computed query vector
@@ -119,7 +128,7 @@ class AgentResponsesTable:
         if self.table.count_rows() == 0:
             return []
 
-        search = self.table.search(query_vector)
+        search = self.table.search(query_vector, vector_column_name="response_vector")
 
         # Build filter
         conditions = [f"agent_id = '{self.agent_id}'"]
