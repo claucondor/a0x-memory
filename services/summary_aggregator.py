@@ -1,76 +1,83 @@
 """
-SummaryAggregator - Generates and aggregates hierarchical summaries.
+SummaryAggregator - Generates and aggregates volume-based hierarchical summaries.
+
+Volume-based summarization:
+- Micro: Every ~50 messages (raw messages → summary)
+- Chunk: Every 5 micros (~250 messages, aggregates micros)
+- Block: Every 5 chunks (~1250 messages, aggregates chunks)
 
 Responsibilities:
-- Generate daily summaries from messages
-- Aggregate daily → weekly → monthly
-- Detect era changes
-- Update GroupProfile with topic evolution
+- Generate micro summaries from raw messages
+- Aggregate micros → chunks → blocks
+- Track temporal context (when messages occurred)
+- Update decay based on message volume
 """
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from collections import Counter
 
-from models.group_memory import GroupSummary, PeriodType, GroupProfile
-from database.group_summary_store import GroupSummaryStore, DECAY_CONFIG
+from models.group_memory import GroupSummary, SummaryLevel
+from database.group_summary_store import GroupSummaryStore, SUMMARY_CONFIG
 from utils.llm_client import LLMClient
 
 
-DAILY_SUMMARY_PROMPT = """Summarize this day's group conversation.
+MICRO_SUMMARY_PROMPT = """Summarize this batch of group messages.
 
 Group: {group_id}
-Date: {date}
-Message count: {message_count}
+Messages {msg_start} to {msg_end} ({msg_count} messages)
+Time span: {time_start} to {time_end}
 
 Messages:
 {messages}
 
 Return JSON:
 {{
-  "summary": "2-3 sentences summarizing the day's discussions",
+  "summary": "2-3 sentences summarizing the key discussions",
   "topics": ["topic1", "topic2", ...],  // 3-5 main topics
-  "highlights": ["highlight1", ...],     // 1-3 notable events
+  "highlights": ["highlight1", ...],     // 1-2 notable events
   "active_users": ["user1", ...]         // Top 3-5 contributors
 }}"""
 
 
-WEEKLY_SUMMARY_PROMPT = """Aggregate these daily summaries into a weekly summary.
+CHUNK_SUMMARY_PROMPT = """Aggregate these micro summaries into a chunk summary.
 
 Group: {group_id}
-Week: {week_start} to {week_end}
+Covering messages {msg_start} to {msg_end} ({total_msgs} messages)
+Time span: {time_start} to {time_end} ({duration_hours:.1f} hours)
 
-Daily summaries:
-{daily_summaries}
+Micro summaries:
+{micro_summaries}
 
 Return JSON:
 {{
-  "summary": "3-4 sentences summarizing the week",
-  "topics": ["topic1", ...],        // 5-7 main topics (merged from dailies)
-  "highlights": ["highlight1", ...], // 2-4 key moments of the week
+  "summary": "3-4 sentences summarizing this period",
+  "topics": ["topic1", ...],        // 5-7 main topics (merged from micros)
+  "highlights": ["highlight1", ...], // 2-3 key moments
   "trend": "increasing|stable|decreasing"  // Activity trend
 }}"""
 
 
-MONTHLY_SUMMARY_PROMPT = """Aggregate these weekly summaries into a monthly summary.
+BLOCK_SUMMARY_PROMPT = """Aggregate these chunk summaries into a block summary.
 
 Group: {group_id}
-Month: {month}
+Covering messages {msg_start} to {msg_end} ({total_msgs} messages)
+Time span: {time_start} to {time_end} ({duration_hours:.1f} hours)
 
-Weekly summaries:
-{weekly_summaries}
+Chunk summaries:
+{chunk_summaries}
 
 Return JSON:
 {{
-  "summary": "4-5 sentences summarizing the month",
+  "summary": "4-5 sentences summarizing this larger period",
   "topics": ["topic1", ...],        // Top 7 topics
   "highlights": ["highlight1", ...], // 3-4 significant events
-  "theme": "Brief theme of the month",
-  "is_era_shift": true/false        // Did major focus change?
+  "theme": "Brief theme of this period",
+  "activity_pattern": "Description of activity patterns observed"
 }}"""
 
 
 class SummaryAggregator:
-    """Generates and aggregates hierarchical group summaries."""
+    """Generates and aggregates volume-based hierarchical group summaries."""
 
     def __init__(
         self,
@@ -79,39 +86,60 @@ class SummaryAggregator:
     ):
         self.summary_store = summary_store
         self.llm_client = llm_client or LLMClient(use_streaming=False)
+        self.config = SUMMARY_CONFIG
 
-    def generate_daily_summary(
+    def generate_micro_summary(
         self,
         agent_id: str,
         group_id: str,
-        date: str,  # YYYY-MM-DD
-        messages: List[Dict[str, Any]]
+        messages: List[Dict[str, Any]],
+        message_start_index: int
     ) -> Optional[GroupSummary]:
         """
-        Generate a daily summary from messages.
+        Generate a micro summary from raw messages.
 
         Args:
             agent_id: Agent ID
             group_id: Group ID
-            date: Date string YYYY-MM-DD
             messages: List of message dicts with 'content', 'speaker', 'timestamp'
+            message_start_index: Global index of first message
 
         Returns:
             GroupSummary or None if too few messages
         """
-        if len(messages) < 3:  # Skip days with very low activity
+        if len(messages) < 3:
             return None
+
+        # Extract temporal info
+        timestamps = [m.get('timestamp', '') for m in messages if m.get('timestamp')]
+        time_start = min(timestamps) if timestamps else datetime.now(timezone.utc).isoformat()
+        time_end = max(timestamps) if timestamps else datetime.now(timezone.utc).isoformat()
+
+        # Calculate duration
+        try:
+            t_start = datetime.fromisoformat(time_start.replace('Z', '+00:00'))
+            t_end = datetime.fromisoformat(time_end.replace('Z', '+00:00'))
+            duration_hours = (t_end - t_start).total_seconds() / 3600
+        except:
+            duration_hours = 0.0
+
+        activity_rate = len(messages) / max(duration_hours, 0.1)
 
         # Format messages for prompt
         messages_text = "\n".join([
             f"[{m.get('speaker', 'unknown')}]: {m.get('content', '')[:200]}"
-            for m in messages[:50]  # Limit to 50 messages
+            for m in messages[:50]
         ])
 
-        prompt = DAILY_SUMMARY_PROMPT.format(
+        message_end_index = message_start_index + len(messages) - 1
+
+        prompt = MICRO_SUMMARY_PROMPT.format(
             group_id=group_id,
-            date=date,
-            message_count=len(messages),
+            msg_start=message_start_index,
+            msg_end=message_end_index,
+            msg_count=len(messages),
+            time_start=time_start[:19],
+            time_end=time_end[:19],
             messages=messages_text
         )
 
@@ -122,58 +150,79 @@ class SummaryAggregator:
             )
             data = self.llm_client.extract_json(response)
 
-            # Calculate activity score (relative to expected)
-            expected_daily = 20  # Baseline expectation
-            activity_score = min(1.0, len(messages) / expected_daily)
-
             summary = GroupSummary(
                 agent_id=agent_id,
                 group_id=group_id,
-                period_type=PeriodType.DAILY,
-                period_start=date,
-                period_end=date,
-                summary=data.get("summary", f"Group discussion on {date}"),
-                topics=data.get("topics", [])[:5],
-                highlights=data.get("highlights", [])[:3],
-                active_users=data.get("active_users", [])[:5],
+                level=SummaryLevel.MICRO,
+                message_start=message_start_index,
+                message_end=message_end_index,
                 message_count=len(messages),
-                activity_score=activity_score
+                time_start=time_start,
+                time_end=time_end,
+                duration_hours=duration_hours,
+                activity_rate=activity_rate,
+                summary=data.get("summary", f"Messages {message_start_index}-{message_end_index}"),
+                topics=data.get("topics", [])[:5],
+                highlights=data.get("highlights", [])[:2],
+                active_users=data.get("active_users", [])[:5]
             )
 
             self.summary_store.add_summary(summary)
+            print(f"[SummaryAggregator] Created micro summary: msgs {message_start_index}-{message_end_index}")
             return summary
 
         except Exception as e:
-            print(f"[SummaryAggregator] Daily summary generation failed: {e}")
+            print(f"[SummaryAggregator] Micro summary generation failed: {e}")
             return None
 
-    def aggregate_to_weekly(
+    def aggregate_to_chunk(
         self,
         agent_id: str,
         group_id: str,
-        week_start: str,  # YYYY-MM-DD (Monday)
-        daily_summaries: List[GroupSummary]
+        micro_summaries: List[GroupSummary]
     ) -> Optional[GroupSummary]:
-        """Aggregate daily summaries into a weekly summary."""
-        if len(daily_summaries) < 2:
+        """Aggregate micro summaries into a chunk summary."""
+        if len(micro_summaries) < 2:
             return None
 
-        # Format daily summaries for prompt
-        daily_text = "\n\n".join([
-            f"**{s.period_start}** ({s.message_count} msgs, activity: {s.activity_score:.1f})\n"
-            f"Summary: {s.summary}\n"
-            f"Topics: {', '.join(s.topics)}\n"
-            f"Highlights: {', '.join(s.highlights)}"
-            for s in sorted(daily_summaries, key=lambda x: x.period_start)
+        # Sort by message_start
+        micros = sorted(micro_summaries, key=lambda x: x.message_start)
+
+        # Calculate ranges
+        msg_start = micros[0].message_start
+        msg_end = micros[-1].message_end
+        total_msgs = sum(m.message_count for m in micros)
+        time_start = micros[0].time_start
+        time_end = micros[-1].time_end
+
+        # Calculate duration
+        try:
+            t_start = datetime.fromisoformat(time_start.replace('Z', '+00:00'))
+            t_end = datetime.fromisoformat(time_end.replace('Z', '+00:00'))
+            duration_hours = (t_end - t_start).total_seconds() / 3600
+        except:
+            duration_hours = sum(m.duration_hours for m in micros)
+
+        activity_rate = total_msgs / max(duration_hours, 0.1)
+
+        # Format micro summaries for prompt
+        micro_text = "\n\n".join([
+            f"**Messages {m.message_start}-{m.message_end}** ({m.message_count} msgs, {m.activity_rate:.1f} msg/hr)\n"
+            f"Summary: {m.summary}\n"
+            f"Topics: {', '.join(m.topics)}\n"
+            f"Highlights: {', '.join(m.highlights)}"
+            for m in micros
         ])
 
-        week_end = (datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d")
-
-        prompt = WEEKLY_SUMMARY_PROMPT.format(
+        prompt = CHUNK_SUMMARY_PROMPT.format(
             group_id=group_id,
-            week_start=week_start,
-            week_end=week_end,
-            daily_summaries=daily_text
+            msg_start=msg_start,
+            msg_end=msg_end,
+            total_msgs=total_msgs,
+            time_start=time_start[:19],
+            time_end=time_end[:19],
+            duration_hours=duration_hours,
+            micro_summaries=micro_text
         )
 
         try:
@@ -183,65 +232,84 @@ class SummaryAggregator:
             )
             data = self.llm_client.extract_json(response)
 
-            # Aggregate metrics
-            total_messages = sum(s.message_count for s in daily_summaries)
-            avg_activity = sum(s.activity_score for s in daily_summaries) / len(daily_summaries)
-
             summary = GroupSummary(
                 agent_id=agent_id,
                 group_id=group_id,
-                period_type=PeriodType.WEEKLY,
-                period_start=week_start,
-                period_end=week_end,
-                summary=data.get("summary", f"Week of {week_start}"),
+                level=SummaryLevel.CHUNK,
+                message_start=msg_start,
+                message_end=msg_end,
+                message_count=total_msgs,
+                time_start=time_start,
+                time_end=time_end,
+                duration_hours=duration_hours,
+                activity_rate=activity_rate,
+                summary=data.get("summary", f"Chunk: msgs {msg_start}-{msg_end}"),
                 topics=data.get("topics", [])[:7],
-                highlights=data.get("highlights", [])[:4],
-                active_users=self._merge_active_users(daily_summaries),
-                message_count=total_messages,
-                activity_score=avg_activity,
-                aggregated_from=[s.summary_id for s in daily_summaries]
+                highlights=data.get("highlights", [])[:3],
+                active_users=self._merge_active_users(micros),
+                aggregated_from=[m.summary_id for m in micros]
             )
 
             self.summary_store.add_summary(summary)
+
+            # Mark micros as aggregated
+            self.summary_store.mark_as_aggregated([m.summary_id for m in micros])
+
+            print(f"[SummaryAggregator] Created chunk summary: msgs {msg_start}-{msg_end}")
             return summary
 
         except Exception as e:
-            print(f"[SummaryAggregator] Weekly aggregation failed: {e}")
+            print(f"[SummaryAggregator] Chunk aggregation failed: {e}")
             return None
 
-    def aggregate_to_monthly(
+    def aggregate_to_block(
         self,
         agent_id: str,
         group_id: str,
-        month: str,  # YYYY-MM
-        weekly_summaries: List[GroupSummary]
+        chunk_summaries: List[GroupSummary]
     ) -> Optional[GroupSummary]:
-        """Aggregate weekly summaries into a monthly summary."""
-        if len(weekly_summaries) < 2:
+        """Aggregate chunk summaries into a block summary."""
+        if len(chunk_summaries) < 2:
             return None
 
-        # Format weekly summaries
-        weekly_text = "\n\n".join([
-            f"**Week {s.period_start}**\n"
-            f"Summary: {s.summary}\n"
-            f"Topics: {', '.join(s.topics)}\n"
-            f"Activity: {s.activity_score:.1f}, Messages: {s.message_count}"
-            for s in sorted(weekly_summaries, key=lambda x: x.period_start)
+        # Sort by message_start
+        chunks = sorted(chunk_summaries, key=lambda x: x.message_start)
+
+        # Calculate ranges
+        msg_start = chunks[0].message_start
+        msg_end = chunks[-1].message_end
+        total_msgs = sum(c.message_count for c in chunks)
+        time_start = chunks[0].time_start
+        time_end = chunks[-1].time_end
+
+        # Calculate duration
+        try:
+            t_start = datetime.fromisoformat(time_start.replace('Z', '+00:00'))
+            t_end = datetime.fromisoformat(time_end.replace('Z', '+00:00'))
+            duration_hours = (t_end - t_start).total_seconds() / 3600
+        except:
+            duration_hours = sum(c.duration_hours for c in chunks)
+
+        activity_rate = total_msgs / max(duration_hours, 0.1)
+
+        # Format chunk summaries for prompt
+        chunk_text = "\n\n".join([
+            f"**Messages {c.message_start}-{c.message_end}** ({c.message_count} msgs, {c.duration_hours:.1f}h)\n"
+            f"Summary: {c.summary}\n"
+            f"Topics: {', '.join(c.topics)}\n"
+            f"Activity: {c.activity_rate:.1f} msgs/hr"
+            for c in chunks
         ])
 
-        # Calculate month boundaries
-        year, mon = int(month[:4]), int(month[5:7])
-        month_start = f"{month}-01"
-        if mon == 12:
-            month_end = f"{year + 1}-01-01"
-        else:
-            month_end = f"{year}-{mon + 1:02d}-01"
-        month_end = (datetime.strptime(month_end, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-
-        prompt = MONTHLY_SUMMARY_PROMPT.format(
+        prompt = BLOCK_SUMMARY_PROMPT.format(
             group_id=group_id,
-            month=month,
-            weekly_summaries=weekly_text
+            msg_start=msg_start,
+            msg_end=msg_end,
+            total_msgs=total_msgs,
+            time_start=time_start[:19],
+            time_end=time_end[:19],
+            duration_hours=duration_hours,
+            chunk_summaries=chunk_text
         )
 
         try:
@@ -251,34 +319,34 @@ class SummaryAggregator:
             )
             data = self.llm_client.extract_json(response)
 
-            total_messages = sum(s.message_count for s in weekly_summaries)
-            avg_activity = sum(s.activity_score for s in weekly_summaries) / len(weekly_summaries)
-
             summary = GroupSummary(
                 agent_id=agent_id,
                 group_id=group_id,
-                period_type=PeriodType.MONTHLY,
-                period_start=month_start,
-                period_end=month_end,
-                summary=data.get("summary", f"Month of {month}"),
+                level=SummaryLevel.BLOCK,
+                message_start=msg_start,
+                message_end=msg_end,
+                message_count=total_msgs,
+                time_start=time_start,
+                time_end=time_end,
+                duration_hours=duration_hours,
+                activity_rate=activity_rate,
+                summary=data.get("summary", f"Block: msgs {msg_start}-{msg_end}"),
                 topics=data.get("topics", [])[:7],
                 highlights=data.get("highlights", [])[:4],
-                active_users=self._merge_active_users(weekly_summaries),
-                message_count=total_messages,
-                activity_score=avg_activity,
-                aggregated_from=[s.summary_id for s in weekly_summaries]
+                active_users=self._merge_active_users(chunks),
+                aggregated_from=[c.summary_id for c in chunks]
             )
 
             self.summary_store.add_summary(summary)
 
-            # Check for era shift
-            if data.get("is_era_shift"):
-                self._handle_era_shift(agent_id, group_id, summary, data.get("theme", ""))
+            # Mark chunks as aggregated
+            self.summary_store.mark_as_aggregated([c.summary_id for c in chunks])
 
+            print(f"[SummaryAggregator] Created block summary: msgs {msg_start}-{msg_end}")
             return summary
 
         except Exception as e:
-            print(f"[SummaryAggregator] Monthly aggregation failed: {e}")
+            print(f"[SummaryAggregator] Block aggregation failed: {e}")
             return None
 
     def _merge_active_users(self, summaries: List[GroupSummary]) -> List[str]:
@@ -289,65 +357,71 @@ class SummaryAggregator:
                 counter[user] += 1
         return [user for user, _ in counter.most_common(5)]
 
-    def _handle_era_shift(
+    def check_and_aggregate(
         self,
         agent_id: str,
         group_id: str,
-        monthly_summary: GroupSummary,
-        theme: str
+        current_message_count: int
     ):
-        """Handle era shift detection - to be implemented with GroupProfile update."""
-        print(f"[SummaryAggregator] Era shift detected for {group_id}: {theme}")
-        # TODO: Create era summary and update GroupProfile.current_era
-
-    def run_aggregation_cycle(self, agent_id: str, group_id: str):
         """
-        Run full aggregation cycle:
-        1. Update decay scores
-        2. Aggregate pending dailies to weekly
-        3. Aggregate pending weeklies to monthly
-        4. Prune expired summaries
+        Check if aggregation is needed and perform it.
+
+        Call this after adding new messages to check if:
+        1. We have enough micros for a chunk
+        2. We have enough chunks for a block
+
+        Args:
+            agent_id: Agent ID
+            group_id: Group ID
+            current_message_count: Total messages in the group now
         """
-        # Update decay scores
-        self.summary_store.update_decay_scores(group_id)
+        # Update decay scores first
+        self.summary_store.update_decay_scores(group_id, current_message_count)
 
-        # Get dailies ready for weekly aggregation
-        pending_dailies = self.summary_store.get_summaries_to_aggregate(group_id, "daily")
-        if pending_dailies:
-            # Group by week
-            by_week = self._group_by_week(pending_dailies)
-            for week_start, dailies in by_week.items():
-                self.aggregate_to_weekly(agent_id, group_id, week_start, dailies)
+        # Check if we have enough micros for a chunk
+        pending_micros = self.summary_store.get_summaries_to_aggregate(group_id, "micro")
+        micro_threshold = self.config["micro"]["aggregate_count"]
 
-        # Get weeklies ready for monthly aggregation
-        pending_weeklies = self.summary_store.get_summaries_to_aggregate(group_id, "weekly")
-        if pending_weeklies:
-            by_month = self._group_by_month(pending_weeklies)
-            for month, weeklies in by_month.items():
-                self.aggregate_to_monthly(agent_id, group_id, month, weeklies)
+        if len(pending_micros) >= micro_threshold:
+            # Take the oldest N micros for aggregation
+            micros_to_aggregate = sorted(pending_micros, key=lambda x: x.message_start)[:micro_threshold]
+            self.aggregate_to_chunk(agent_id, group_id, micros_to_aggregate)
 
-        # Prune expired
+        # Check if we have enough chunks for a block
+        pending_chunks = self.summary_store.get_summaries_to_aggregate(group_id, "chunk")
+        chunk_threshold = self.config["chunk"]["aggregate_count"]
+
+        if len(pending_chunks) >= chunk_threshold:
+            chunks_to_aggregate = sorted(pending_chunks, key=lambda x: x.message_start)[:chunk_threshold]
+            self.aggregate_to_block(agent_id, group_id, chunks_to_aggregate)
+
+        # Prune expired summaries
         self.summary_store.prune_expired(group_id)
 
-    def _group_by_week(self, summaries: List[GroupSummary]) -> Dict[str, List[GroupSummary]]:
-        """Group summaries by ISO week (Monday start)."""
-        result = {}
-        for s in summaries:
-            date = datetime.strptime(s.period_start, "%Y-%m-%d")
-            # Get Monday of that week
-            monday = date - timedelta(days=date.weekday())
-            week_key = monday.strftime("%Y-%m-%d")
-            if week_key not in result:
-                result[week_key] = []
-            result[week_key].append(s)
-        return result
+    def should_generate_micro(self, group_id: str, total_messages: int) -> bool:
+        """
+        Check if we should generate a new micro summary.
 
-    def _group_by_month(self, summaries: List[GroupSummary]) -> Dict[str, List[GroupSummary]]:
-        """Group summaries by month (YYYY-MM)."""
-        result = {}
-        for s in summaries:
-            month_key = s.period_start[:7]  # YYYY-MM
-            if month_key not in result:
-                result[month_key] = []
-            result[month_key].append(s)
-        return result
+        Returns True if there are enough unsummarized messages.
+        """
+        last_summarized = self.summary_store.get_last_message_index(group_id)
+        unsummarized_count = total_messages - last_summarized - 1
+
+        return unsummarized_count >= self.config["micro"]["message_threshold"]
+
+    def get_unsummarized_range(self, group_id: str, total_messages: int) -> tuple:
+        """
+        Get the range of messages that need to be summarized.
+
+        Returns:
+            (start_index, end_index) or (None, None) if nothing to summarize
+        """
+        last_summarized = self.summary_store.get_last_message_index(group_id)
+        start_index = last_summarized + 1
+
+        threshold = self.config["micro"]["message_threshold"]
+        if total_messages - start_index < threshold:
+            return (None, None)
+
+        end_index = start_index + threshold - 1
+        return (start_index, end_index)
