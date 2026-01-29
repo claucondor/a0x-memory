@@ -1604,6 +1604,120 @@ async def get_memory_stats(agent_id: str):
     return stats
 
 
+@app.delete("/v1/memory/reset/{agent_id}")
+async def reset_agent_data(agent_id: str, confirm: bool = False):
+    """
+    Delete ALL data for an agent (Firestore + LanceDB).
+
+    USE WITH CAUTION - this is irreversible!
+
+    Args:
+        agent_id: Agent ID to reset
+        confirm: Must be True to actually delete
+
+    Returns:
+        Summary of deleted data
+    """
+    if not confirm:
+        return {
+            "error": "Must pass confirm=true to delete data",
+            "warning": "This will delete ALL data for this agent from Firestore and LanceDB",
+            "usage": f"DELETE /v1/memory/reset/{agent_id}?confirm=true"
+        }
+
+    result = {
+        "agent_id": agent_id,
+        "firestore_deleted": 0,
+        "lancedb_deleted": {}
+    }
+
+    memory_id = f"{agent_id}:"
+
+    # 1. Delete Firestore data
+    try:
+        from services.firestore_window import get_firestore_store
+        firestore = get_firestore_store()
+        if firestore and firestore._enabled:
+            # Get all groups for this agent
+            db = firestore.db
+            agent_ref = db.collection(f"{config.FIRESTORE_COLLECTION_PREFIX}").document(agent_id)
+            groups_ref = agent_ref.collection("groups")
+
+            # Delete all documents in all group subcollections
+            groups = groups_ref.stream()
+            for group_doc in groups:
+                group_id = group_doc.id
+                messages_ref = groups_ref.document(group_id).collection("recent_messages")
+
+                # Delete all messages in batch
+                batch = db.batch()
+                count = 0
+                for msg_doc in messages_ref.stream():
+                    batch.delete(msg_doc.reference)
+                    count += 1
+                    if count % 500 == 0:  # Firestore batch limit
+                        batch.commit()
+                        batch = db.batch()
+
+                if count % 500 != 0:
+                    batch.commit()
+
+                result["firestore_deleted"] += count
+
+                # Delete the group document itself
+                groups_ref.document(group_id).delete()
+
+            print(f"[Reset] Deleted {result['firestore_deleted']} Firestore messages for {agent_id}")
+    except Exception as e:
+        print(f"[Reset] Firestore error: {e}")
+        result["firestore_error"] = str(e)
+
+    # 2. Delete LanceDB data
+    try:
+        system = get_memory_system(memory_id)
+
+        # Get current counts before deletion
+        if hasattr(system.vector_store, 'get_stats'):
+            before_stats = system.vector_store.get_stats()
+        else:
+            before_stats = {}
+
+        # Delete from each table by dropping and recreating
+        tables_to_clear = [
+            ("dm_memories", system.vector_store.dm_memories if hasattr(system.vector_store, 'dm_memories') else None),
+            ("group_memories", system.vector_store.group_memories if hasattr(system.vector_store, 'group_memories') else None),
+            ("user_memories", system.vector_store.user_memories if hasattr(system.vector_store, 'user_memories') else None),
+            ("interaction_memories", system.vector_store.interaction_memories if hasattr(system.vector_store, 'interaction_memories') else None),
+            ("cross_group_memories", system.vector_store.cross_group_memories if hasattr(system.vector_store, 'cross_group_memories') else None),
+            ("agent_responses", system.vector_store.agent_responses if hasattr(system.vector_store, 'agent_responses') else None),
+            ("conversation_summaries", system.vector_store.conversation_summaries if hasattr(system.vector_store, 'conversation_summaries') else None),
+        ]
+
+        for table_name, table_obj in tables_to_clear:
+            if table_obj and hasattr(table_obj, 'table'):
+                try:
+                    count_before = table_obj.table.count_rows()
+                    if count_before > 0:
+                        # Delete all rows for this agent
+                        table_obj.table.delete(f"agent_id = '{agent_id}'")
+                        result["lancedb_deleted"][table_name] = count_before
+                except Exception as e:
+                    print(f"[Reset] Error clearing {table_name}: {e}")
+
+        # Clear from cache so next request creates fresh system
+        cache_key = agent_id or "default"
+        if cache_key in _system_cache:
+            del _system_cache[cache_key]
+
+        print(f"[Reset] Deleted LanceDB data for {agent_id}: {result['lancedb_deleted']}")
+    except Exception as e:
+        print(f"[Reset] LanceDB error: {e}")
+        result["lancedb_error"] = str(e)
+
+    result["success"] = True
+    return result
+
+
 # ============================================================================
 # Run Server
 # ============================================================================
