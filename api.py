@@ -180,6 +180,8 @@ class UserInGroupProfileResponse(BaseModel):
 class AgentResponseRequest(BaseModel):
     """Request to add agent response for immediate context"""
     response: str
+    trigger_message: Optional[str] = None  # User message that triggered this response
+    trigger_message_id: Optional[str] = None  # ID of the trigger message
     timestamp: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
 
@@ -1195,6 +1197,8 @@ async def add_agent_response(memory_id: str, request: AgentResponseRequest):
     try:
         system.add_agent_response_to_window(
             response=request.response,
+            trigger_message=request.trigger_message,
+            trigger_message_id=request.trigger_message_id,
             timestamp=request.timestamp,
             metadata=request.metadata
         )
@@ -1558,11 +1562,25 @@ async def get_memory_stats(agent_id: str):
         "agent_id": agent_id,
         "memory_count": 0,
         "user_profile_count": 0,
-        "group_profile_count": 0
+        "group_profile_count": 0,
+        "memory_breakdown": {}
     }
 
     try:
-        stats["memory_count"] = system.vector_store.count_entries()
+        # Get stats from all tables
+        if hasattr(system.vector_store, 'get_stats'):
+            memory_stats = system.vector_store.get_stats()
+            stats["memory_breakdown"] = memory_stats
+            # Sum all memory tables for total count
+            stats["memory_count"] = sum([
+                memory_stats.get("dm_memories", 0),
+                memory_stats.get("group_memories", 0),
+                memory_stats.get("user_memories", 0),
+                memory_stats.get("interaction_memories", 0),
+                memory_stats.get("cross_group_memories", 0)
+            ])
+        else:
+            stats["memory_count"] = system.vector_store.count_entries()
     except:
         pass
 
