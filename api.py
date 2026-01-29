@@ -1694,6 +1694,122 @@ async def trigger_aggregation(group_id: str, agent_id: str):
         return {"success": False, "error": str(e)}
 
 
+@app.get("/v1/facts/{universal_user_id}")
+async def get_user_facts(
+    universal_user_id: str,
+    agent_id: str,
+    query: Optional[str] = None
+):
+    """Get user facts by universal_user_id (e.g., telegram:123456789)."""
+    memory_id = f"{agent_id}:"
+    system = get_memory_system(memory_id)
+
+    try:
+        from models.group_memory import FactType
+
+        if query:
+            facts = system.fact_extractor.get_user_context(universal_user_id, query=query)
+        else:
+            facts = system.fact_extractor.get_user_context(universal_user_id)
+
+        return {
+            "user_id": universal_user_id,
+            "facts": facts.get("facts", []),
+            "total_facts": facts.get("total_facts", 0)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/facts/{universal_user_id}/by-type")
+async def get_facts_by_type(
+    universal_user_id: str,
+    agent_id: str,
+    fact_type: Optional[str] = None,
+    min_confidence: float = 0.3
+):
+    """Get user facts filtered by type."""
+    memory_id = f"{agent_id}:"
+    system = get_memory_system(memory_id)
+
+    try:
+        facts = system.user_fact_store.get_user_facts(
+            universal_user_id,
+            min_confidence=min_confidence
+        )
+
+        if fact_type:
+            facts = [f for f in facts if f.fact_type.value == fact_type]
+
+        return {
+            "user_id": universal_user_id,
+            "fact_type": fact_type,
+            "min_confidence": min_confidence,
+            "facts": [
+                {
+                    "fact_id": f.fact_id,
+                    "content": f.content,
+                    "fact_type": f.fact_type.value,
+                    "confidence": f.confidence,
+                    "evidence_count": f.evidence_count,
+                    "sources": f.sources,
+                    "source_types": f.source_types,
+                    "first_seen": f.first_seen,
+                    "last_confirmed": f.last_confirmed
+                }
+                for f in facts
+            ],
+            "total_facts": len(facts)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/dm/{user_id}/summaries")
+async def get_dm_summaries(
+    user_id: str,
+    agent_id: str,
+    limit: int = 5
+):
+    """Get DM conversation summaries for a user."""
+    memory_id = f"{agent_id}:"
+    system = get_memory_system(memory_id)
+
+    dm_id = f"dm_{user_id}"
+
+    try:
+        summaries = system.dm_summary_store.get_context_summaries(
+            dm_id,
+            limit_micro=limit,
+            limit_chunk=limit,
+            limit_block=limit
+        )
+
+        all_summaries = []
+        for level, level_summaries in summaries.items():
+            for s in level_summaries:
+                all_summaries.append({
+                    "summary_id": s.summary_id,
+                    "level": s.level.value if hasattr(s.level, 'value') else s.level,
+                    "message_start": s.message_start,
+                    "message_end": s.message_end,
+                    "message_count": s.message_count,
+                    "summary": s.summary,
+                    "topics": s.topics,
+                    "time_start": s.time_start,
+                    "time_end": s.time_end,
+                    "decay_score": s.decay_score
+                })
+
+        return {
+            "user_id": user_id,
+            "dm_id": dm_id,
+            "summaries": sorted(all_summaries, key=lambda x: x["message_end"], reverse=True)[:limit]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/v1/memory/reset/{agent_id}")
 async def reset_agent_data(agent_id: str, confirm: bool = False):
     """

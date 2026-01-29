@@ -16,7 +16,11 @@ from utils.embedding import EmbeddingModel
 from database import MemoryStore, VectorStore, UserProfileStore
 from database.group_profile_store import GroupProfileStore
 from database.group_summary_store import GroupSummaryStore
+from database.dm_summary_store import DMSummaryStore
+from database.user_fact_store import UserFactStore
 from services.summary_aggregator import SummaryAggregator
+from services.dm_summary_aggregator import DMSummaryAggregator
+from services.fact_extractor import FactExtractor
 from core.memory_builder import MemoryBuilder
 from core.hybrid_retriever import HybridRetriever
 from core.answer_generator import AnswerGenerator
@@ -203,6 +207,28 @@ class SimpleMemSystem:
         )
         self.summary_aggregator = SummaryAggregator(
             summary_store=self.group_summary_store,
+            llm_client=self.llm_client
+        )
+
+        # DM summary store for 1-on-1 conversations
+        self.dm_summary_store = DMSummaryStore(
+            db_path=db_path or config.LANCEDB_PATH,
+            embedding_model=self.embedding_model,
+            agent_id=self.agent_id
+        )
+        self.dm_summary_aggregator = DMSummaryAggregator(
+            summary_store=self.dm_summary_store,
+            llm_client=self.llm_client
+        )
+
+        # User fact store for evidence-based user profiles
+        self.user_fact_store = UserFactStore(
+            db_path=db_path or config.LANCEDB_PATH,
+            embedding_model=self.embedding_model,
+            agent_id=self.agent_id
+        )
+        self.fact_extractor = FactExtractor(
+            fact_store=self.user_fact_store,
             llm_client=self.llm_client
         )
 
@@ -638,6 +664,36 @@ class SimpleMemSystem:
                     return f"user_profile:{uid}"
 
                 tasks.append((f"user_profile:{_uid}", task_user_profile))
+
+        # Tasks: fact extraction for each user
+        for uid, data in user_data.items():
+            if not data['messages']:
+                continue
+
+            universal_user_id = data['universal_user_id']
+            context_type = "dm" if original_group_id is None else "group"
+            context_id = effective_group_id
+
+            _uid = universal_user_id
+            _msgs = [{"content": m, "speaker": data['username']} for m in data['messages']]
+            _ctx_type = context_type
+            _ctx_id = context_id
+            def task_fact_extraction(uid=_uid, msgs=_msgs, ctx_type=_ctx_type, ctx_id=_ctx_id):
+                try:
+                    print(f"\n[FactExtractor] Extracting facts for {uid} from {ctx_type}")
+                    self.fact_extractor.extract_from_messages(
+                        agent_id=self.agent_id,
+                        user_id=uid,
+                        messages=msgs,
+                        context_type=ctx_type,
+                        context_id=ctx_id
+                    )
+                    return f"fact_extraction:{uid}"
+                except Exception as e:
+                    print(f"[FactExtractor] Error extracting facts for {uid}: {e}")
+                    return f"fact_extraction:{uid}:error"
+
+            tasks.append((f"fact_extraction:{_uid}", task_fact_extraction))
 
         # ============================================================
         # Execute all tasks in parallel
@@ -1284,6 +1340,8 @@ class SimpleMemSystem:
             "interaction_memories": [],
             "cross_group_memories": [],
             "agent_responses": [],
+            "user_facts": [],
+            "dm_summaries": [],
             "relevant_profiles": [],
             "group_context": None,
             "formatted_context": "",
@@ -1333,7 +1391,33 @@ class SimpleMemSystem:
             except Exception as e:
                 print(f"[search] Agent responses search failed: {e}")
 
-        # 4. Build formatted context
+        # 4. User facts (evidence-based profile)
+        if effective_user_id:
+            try:
+                facts = self.fact_extractor.get_user_context(effective_user_id, query=query)
+                if facts.get("facts"):
+                    result["user_facts"] = facts["facts"]
+                    print(f"[search] User facts: {len(facts['facts'])}")
+            except Exception as e:
+                print(f"[search] User facts retrieval failed: {e}")
+
+        # 5. DM summaries (for 1-on-1 conversations)
+        if group_id is None and effective_user_id:
+            dm_id = f"dm_{effective_user_id}"
+            try:
+                summaries = self.dm_summary_store.get_context_summaries(
+                    dm_id, limit_micro=3, limit_chunk=2, limit_block=1
+                )
+                all_summaries = []
+                for level, level_summaries in summaries.items():
+                    all_summaries.extend(level_summaries)
+                if all_summaries:
+                    result["dm_summaries"] = all_summaries
+                    print(f"[search] DM summaries: {len(all_summaries)}")
+            except Exception as e:
+                print(f"[search] DM summaries retrieval failed: {e}")
+
+        # 6. Build formatted context
         sections = []
 
         if result["recent_messages"]:
@@ -1360,6 +1444,22 @@ class SimpleMemSystem:
                 resp_lines.append(f"- Q: {trigger[:80]}" if trigger else "")
                 resp_lines.append(f"  A: {summary}")
             sections.append("\n".join(resp_lines))
+
+        # User facts section
+        if result["user_facts"]:
+            fact_lines = ["## Known Facts About User"]
+            for fact in result["user_facts"][:5]:
+                fact_lines.append(f"- [{fact.get('type', 'fact')}] {fact.get('content')} (confidence: {fact.get('confidence', 0):.2f})")
+            sections.append("\n".join(fact_lines))
+
+        # DM summaries section
+        if result["dm_summaries"]:
+            summary_lines = ["## Conversation Summaries"]
+            for s in result["dm_summaries"][:3]:
+                level = s.get("level", "micro")
+                summary = s.get("summary", "")[:200]
+                summary_lines.append(f"- [{level.upper()}] {summary}")
+            sections.append("\n".join(summary_lines))
 
         result["formatted_context"] = "\n\n".join(sections) if sections else ""
 
