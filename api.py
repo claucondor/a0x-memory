@@ -186,6 +186,19 @@ class AgentResponseRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class GroupSummaryResponse(BaseModel):
+    """Group summary response"""
+    summary_id: str
+    period_type: str
+    period_start: str
+    period_end: str
+    summary: str
+    topics: List[str]
+    message_count: int
+    activity_score: float
+    decay_score: float
+
+
 class ContextResponse(BaseModel):
     """Full context response with everything"""
     memory_id: str
@@ -1604,6 +1617,54 @@ async def get_memory_stats(agent_id: str):
         print(f"[Stats] Error counting group profiles: {e}")
 
     return stats
+
+
+@app.get("/v1/groups/{group_id}/summaries")
+async def get_group_summaries(
+    group_id: str,
+    agent_id: str,
+    period_type: Optional[str] = None,
+    limit: int = 10
+):
+    """Get hierarchical summaries for a group."""
+    memory_id = f"{agent_id}:"
+    system = get_memory_system(memory_id)
+
+    if not hasattr(system, 'group_summary_store'):
+        raise HTTPException(status_code=501, detail="Group summaries not available")
+
+    if period_type:
+        summaries = system.group_summary_store.get_summaries_for_period(
+            group_id, period_type
+        )
+    else:
+        summaries_dict = system.group_summary_store.get_context_summaries(
+            group_id,
+            limit_daily=limit,
+            limit_weekly=limit,
+            limit_monthly=limit
+        )
+        summaries = []
+        for period_summaries in summaries_dict.values():
+            summaries.extend(period_summaries)
+
+    return {
+        "group_id": group_id,
+        "summaries": [
+            GroupSummaryResponse(
+                summary_id=s.summary_id,
+                period_type=s.period_type.value,
+                period_start=s.period_start,
+                period_end=s.period_end,
+                summary=s.summary,
+                topics=s.topics,
+                message_count=s.message_count,
+                activity_score=s.activity_score,
+                decay_score=s.decay_score
+            )
+            for s in sorted(summaries, key=lambda x: x.period_end, reverse=True)[:limit]
+        ]
+    }
 
 
 @app.delete("/v1/memory/reset/{agent_id}")
