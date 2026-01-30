@@ -85,7 +85,13 @@ embedding_cache/
 CLAUDE_*.md
 CLAUDE.md
 ROADMAP.md
-docs/
+
+# Plan files (internal)
+PLAN_*.md
+
+# Test/dev files
+test_prompt.py
+scripts/
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -95,5 +101,3 @@ docs/
 *.pt
 *.pth
 *.onnx
-PLAN_INCREMENTAL_PROFILES.md
-PLAN_ARCHITECTURE_REFACTOR.md
