@@ -50,13 +50,17 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
         response_format: Optional[Dict[str, str]] = None,
-        max_retries: int = 3
+        max_retries: int = 3,
+        model: Optional[str] = None
     ) -> str:
         """
-        Standard chat completion with optional thinking mode and retry mechanism
+        Standard chat completion with optional thinking mode and retry mechanism.
+
+        Args:
+            model: Override model for this call (uses self.model if not provided)
         """
         kwargs = {
-            "model": self.model,
+            "model": model or self.model,
             "messages": messages,
             "temperature": temperature,
         }

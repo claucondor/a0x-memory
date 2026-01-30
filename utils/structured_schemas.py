@@ -36,9 +36,10 @@ DM_MEMORY_ENTRIES_SCHEMA = {
                             "entities": {"type": "array", "items": {"type": "string"}},
                             "topic": {"type": "string"},
                             "memory_type": {"type": "string", "enum": ["expertise", "preference", "fact", "announcement", "conversation"]},
-                            "importance_score": {"type": "number"}
+                            "importance_score": {"type": "number", "minimum": 0, "maximum": 1},
+                            "is_shareable": {"type": "boolean"}
                         },
-                        "required": ["lossless_restatement", "keywords", "timestamp", "location", "persons", "entities", "topic", "memory_type", "importance_score"],
+                        "required": ["lossless_restatement", "keywords", "timestamp", "location", "persons", "entities", "topic", "memory_type", "importance_score", "is_shareable"],
                         "additionalProperties": False
                     }
                 }
@@ -68,9 +69,10 @@ GROUP_MEMORIES_SCHEMA = {
                             "speaker": {"type": "string"},
                             "keywords": {"type": "array", "items": {"type": "string"}},
                             "topics": {"type": "array", "items": {"type": "string"}},
-                            "importance_score": {"type": "number"}
+                            "importance_score": {"type": "number", "minimum": 0, "maximum": 1},
+                            "is_shareable": {"type": "boolean"}
                         },
-                        "required": ["content", "memory_type", "speaker", "keywords", "topics", "importance_score"],
+                        "required": ["content", "memory_type", "speaker", "keywords", "topics", "importance_score", "is_shareable"],
                         "additionalProperties": False
                     }
                 },
@@ -85,9 +87,10 @@ GROUP_MEMORIES_SCHEMA = {
                             "memory_type": {"type": "string", "enum": ["expertise", "preference", "fact"]},
                             "keywords": {"type": "array", "items": {"type": "string"}},
                             "topics": {"type": "array", "items": {"type": "string"}},
-                            "importance_score": {"type": "number"}
+                            "importance_score": {"type": "number", "minimum": 0, "maximum": 1},
+                            "is_shareable": {"type": "boolean"}
                         },
-                        "required": ["content", "user_id", "username", "memory_type", "keywords", "topics", "importance_score"],
+                        "required": ["content", "user_id", "username", "memory_type", "keywords", "topics", "importance_score", "is_shareable"],
                         "additionalProperties": False
                     }
                 },
@@ -102,9 +105,10 @@ GROUP_MEMORIES_SCHEMA = {
                             "interaction_type": {"type": "string", "enum": ["question", "answer", "discussion", "help"]},
                             "keywords": {"type": "array", "items": {"type": "string"}},
                             "topics": {"type": "array", "items": {"type": "string"}},
-                            "importance_score": {"type": "number"}
+                            "importance_score": {"type": "number", "minimum": 0, "maximum": 1},
+                            "is_shareable": {"type": "boolean"}
                         },
-                        "required": ["content", "speaker_id", "listener_id", "interaction_type", "keywords", "topics", "importance_score"],
+                        "required": ["content", "speaker_id", "listener_id", "interaction_type", "keywords", "topics", "importance_score", "is_shareable"],
                         "additionalProperties": False
                     }
                 }
@@ -384,7 +388,7 @@ AGENT_RESPONSE_METADATA_SCHEMA = {
                 "response_type": {"type": "string", "enum": ["greeting", "answer", "clarification", "recommendation", "question", "acknowledgment", "other"]},
                 "topics": {"type": "array", "items": {"type": "string"}},
                 "keywords": {"type": "array", "items": {"type": "string"}},
-                "importance_score": {"type": "number"}
+                "importance_score": {"type": "number", "minimum": 0, "maximum": 1}
             },
             "required": ["reasoning", "summary", "response_type", "topics", "keywords", "importance_score"],
             "additionalProperties": False
