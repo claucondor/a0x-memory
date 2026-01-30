@@ -232,6 +232,11 @@ class SimpleMemSystem:
             llm_client=self.llm_client
         )
 
+        # Adaptive threshold manager for spam detection
+        self.threshold_manager = AdaptiveThresholdManager(
+            firestore_client=self.firestore.db if self.firestore else None
+        )
+
         # Pass profile stores to hybrid_retriever for lightweight entity system
         self.hybrid_retriever.user_profile_store = self.user_profile_store
         self.hybrid_retriever.group_profile_store = self.group_profile_store
@@ -343,8 +348,11 @@ class SimpleMemSystem:
                 doc_id = add_result.get('doc_id')
                 result["added"] = doc_id is not None
                 result["is_spam"] = add_result.get('is_spam', False)
+                result["is_blocked"] = add_result.get('is_blocked', False)
                 result["spam_score"] = add_result.get('spam_score', 0.0)
-                if add_result.get('is_spam'):
+                if add_result.get('is_blocked'):
+                    print(f"[Blocked] User {username} is blocked due to spam")
+                elif add_result.get('is_spam'):
                     print(f"[Spam] Detected spam from {username}: {add_result.get('spam_reason')}")
             else:
                 # Backwards compatibility
@@ -722,25 +730,110 @@ class SimpleMemSystem:
                 except Exception as e2:
                     print(f"[PostBatch] Sequential task '{name}' failed: {e2}")
 
-        # Generate daily summary if enough messages processed today
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        today_messages = [m for m in unprocessed if m.get('timestamp', '').startswith(today)]
-        if len(today_messages) >= 5 and original_group_id is not None:
-            self.summary_aggregator.generate_daily_summary(
-                agent_id=self.agent_id,
-                group_id=original_group_id,
-                date=today,
-                messages=today_messages
+        # Generate micro summaries if threshold reached
+        # Groups use summary_aggregator, DMs use dm_summary_aggregator
+        try:
+            self._generate_micro_if_needed(
+                unprocessed=unprocessed,
+                original_group_id=original_group_id,
+                effective_group_id=effective_group_id
             )
+        except Exception as e:
+            print(f"[PostBatch] Micro summary generation failed: {e}")
 
-        # Run aggregation cycle periodically (every 10 batches)
-        if hasattr(self, '_batch_count'):
-            self._batch_count += 1
+    def _generate_micro_if_needed(
+        self,
+        unprocessed: List[Dict],
+        original_group_id: Optional[str],
+        effective_group_id: str
+    ):
+        """
+        Generate micro summary if message threshold is reached.
+
+        For groups: uses summary_aggregator (threshold: 50 messages)
+        For DMs: uses dm_summary_aggregator (threshold: 20 messages)
+
+        Micro summaries are later consolidated into chunks/blocks/eras
+        by the a0x-memory-jobs service.
+        """
+        print(f"[MicroCheck] Checking micro generation for {effective_group_id} ({len(unprocessed)} messages)")
+        is_dm = original_group_id is None
+
+        if is_dm:
+            # DM - use dm_summary_aggregator
+            user_id = effective_group_id.replace("dm_", "") if effective_group_id.startswith("dm_") else effective_group_id
+
+            # Get total message count from adaptive threshold metrics
+            try:
+                metrics = self.threshold_manager.get_metrics_debug(self.agent_id, effective_group_id)
+                total_from_metrics = metrics.get("message_count", 0)
+            except:
+                total_from_metrics = 0
+
+            # Also check last summarized index
+            last_index = self.dm_summary_store.get_last_message_index(effective_group_id)
+            # Use the higher of: metrics count or last_index+batch
+            total_messages = max(total_from_metrics, last_index + 1 + len(unprocessed))
+            print(f"[MicroCheck] DM metrics_count={total_from_metrics}, last_index={last_index}, total={total_messages}, threshold=20")
+
+            should_gen = self.dm_summary_aggregator.should_generate_micro(user_id, total_messages)
+            print(f"[MicroCheck] should_generate_micro={should_gen}")
+            if should_gen:
+                # Convert messages to expected format
+                messages = [
+                    {
+                        "speaker": m.get('username', 'unknown'),
+                        "content": m.get('content', ''),
+                        "timestamp": m.get('timestamp', '')
+                    }
+                    for m in unprocessed
+                ]
+
+                # Get the starting index for this micro
+                start_index = last_index + 1
+
+                summary = self.dm_summary_aggregator.generate_micro_summary(
+                    agent_id=self.agent_id,
+                    user_id=user_id,  # user_id without dm_ prefix (e.g., "telegram:1001")
+                    messages=messages,
+                    message_start_index=start_index
+                )
+
+                if summary:
+                    print(f"[Micro] Created DM micro summary for {effective_group_id}: msgs {summary.message_start}-{summary.message_end}")
         else:
-            self._batch_count = 1
+            # Group - use summary_aggregator
+            try:
+                metrics = self.threshold_manager.get_metrics_debug(self.agent_id, original_group_id)
+                total_from_metrics = metrics.get("message_count", 0)
+            except:
+                total_from_metrics = 0
 
-        if original_group_id is not None and self._batch_count % 10 == 0:
-            self.summary_aggregator.run_aggregation_cycle(self.agent_id, original_group_id)
+            last_index = self.group_summary_store.get_last_message_index(original_group_id)
+            total_messages = max(total_from_metrics, last_index + 1 + len(unprocessed))
+            print(f"[MicroCheck] Group metrics_count={total_from_metrics}, last_index={last_index}, total={total_messages}, threshold=50")
+
+            if self.summary_aggregator.should_generate_micro(original_group_id, total_messages):
+                messages = [
+                    {
+                        "speaker": m.get('username', 'unknown'),
+                        "content": m.get('content', ''),
+                        "timestamp": m.get('timestamp', '')
+                    }
+                    for m in unprocessed
+                ]
+
+                start_index = last_index + 1
+
+                summary = self.summary_aggregator.generate_micro_summary(
+                    agent_id=self.agent_id,
+                    group_id=original_group_id,
+                    messages=messages,
+                    message_start_index=start_index
+                )
+
+                if summary:
+                    print(f"[Micro] Created group micro summary for {original_group_id}: msgs {summary.message_start}-{summary.message_end}")
 
     def _process_unprocessed_agent_responses(
         self,
@@ -1339,6 +1432,7 @@ class SimpleMemSystem:
             "user_memories": [],
             "interaction_memories": [],
             "cross_group_memories": [],
+            "speaker_dm_memories": [],
             "agent_responses": [],
             "user_facts": [],
             "dm_summaries": [],
@@ -1370,6 +1464,7 @@ class SimpleMemSystem:
             result["user_memories"] = retrieval.get("user_memories", [])
             result["interaction_memories"] = retrieval.get("interaction_memories", [])
             result["cross_group_memories"] = retrieval.get("cross_group_memories", [])
+            result["speaker_dm_memories"] = retrieval.get("speaker_dm_memories", [])
             # Include profiles and group context from lightweight entity system
             result["relevant_profiles"] = retrieval.get("relevant_profiles", [])
             result["group_context"] = retrieval.get("group_context")
@@ -1426,8 +1521,8 @@ class SimpleMemSystem:
         # Memory context from retrieval
         if self.use_unified_store and hasattr(self.hybrid_retriever, 'retrieve_for_context'):
             memory_fmt = self.hybrid_retriever._format_multi_table_context(
-                {k: result[k] for k in ["dm_memories", "group_memories", "user_memories",
-                                         "interaction_memories", "cross_group_memories"]},
+                {k: result.get(k, []) for k in ["dm_memories", "group_memories", "user_memories",
+                                         "interaction_memories", "cross_group_memories", "speaker_dm_memories"]},
                 context,
             )
             if memory_fmt and memory_fmt != "[No relevant memories found]":
