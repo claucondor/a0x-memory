@@ -88,6 +88,8 @@ ROADMAP.md
 
 # Plan files (internal)
 PLAN_*.md
+docs/AGENT_RESPONSE_MEMORY_PLAN.md
+docs/VM_OPTIMIZATION_PLAN.md
 
 # Test/dev files
 test_prompt.py
