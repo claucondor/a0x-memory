@@ -19,6 +19,7 @@ from collections import Counter
 from models.group_memory import GroupSummary, SummaryLevel
 from database.group_summary_store import GroupSummaryStore, SUMMARY_CONFIG
 from utils.llm_client import LLMClient
+import config
 
 
 MICRO_SUMMARY_PROMPT = """Summarize this batch of group messages.
@@ -146,7 +147,9 @@ class SummaryAggregator:
         try:
             response = self.llm_client.chat_completion(
                 [{"role": "user", "content": prompt}],
-                temperature=0.3
+                temperature=0.3,
+                response_format={"type": "json_object"},
+                model=config.LLM_MODEL_SMART
             )
             data = self.llm_client.extract_json(response)
 
@@ -228,7 +231,9 @@ class SummaryAggregator:
         try:
             response = self.llm_client.chat_completion(
                 [{"role": "user", "content": prompt}],
-                temperature=0.3
+                temperature=0.3,
+                response_format={"type": "json_object"},
+                model=config.LLM_MODEL_SMART
             )
             data = self.llm_client.extract_json(response)
 
@@ -315,7 +320,9 @@ class SummaryAggregator:
         try:
             response = self.llm_client.chat_completion(
                 [{"role": "user", "content": prompt}],
-                temperature=0.3
+                temperature=0.3,
+                response_format={"type": "json_object"},
+                model=config.LLM_MODEL_SMART
             )
             data = self.llm_client.extract_json(response)
 

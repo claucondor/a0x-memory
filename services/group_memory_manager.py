@@ -568,40 +568,121 @@ class GroupMemoryManager:
         metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Process a direct message using the existing VectorStore.
+        Process a direct message by treating it as a virtual group.
 
-        This maintains backward compatibility with the existing system.
+        This enables DMs to contribute to cross-group patterns:
+        - DM with User X is treated as group_id="dm_{user_id}"
+        - Memories from DMs are stored as UserMemory with is_shareable flag
+        - Shareable DM memories can be combined with group memories for cross-group
+
+        Args:
+            message: Message content
+            platform_identity: Platform identity dict
+            metadata: Optional metadata (message_id, timestamp, etc.)
+
+        Returns:
+            Dict with created memory info
         """
         user_id = self.get_user_id(platform_identity)
+        dm_group_id = f"dm_{user_id}"  # Treat DM as virtual group
 
-        # Get or create VectorStore for this user
-        if user_id not in self._vector_stores:
-            self._vector_stores[user_id] = VectorStore(
+        # Get username from platform_identity
+        username = platform_identity.get('username') or 'unknown'
+
+        # ==========================================================================
+        # FIRESTORE WINDOW - Store DM messages too
+        # ==========================================================================
+        if self.firestore.is_enabled():
+            self.firestore.add_message(
                 agent_id=self.agent_id,
-                user_id=user_id,
-                embedding_model=self.embedding_model
+                group_id=dm_group_id,
+                message=message,
+                username=username,
+                platform_identity=platform_identity,
+                metadata=metadata or {}
             )
 
-        vector_store = self._vector_stores[user_id]
+            # Check if we have enough unprocessed messages
+            unprocessed = self.firestore.get_unprocessed(
+                agent_id=self.agent_id,
+                group_id=dm_group_id,
+                min_count=config.RECENT_BATCH_TRIGGER
+            )
 
-        # Create memory entry - use message as lossless_restatement for DMs
-        # In production, this should use LLM for proper restatement
-        entry = MemoryEntry(
-            lossless_restatement=message,  # Required field
-            keywords=self._extract_keywords(message),
-            timestamp=datetime.now(timezone.utc).isoformat()
-        )
+            if unprocessed:
+                self._process_batch_async(unprocessed, dm_group_id)
 
-        # Add to vector store
-        vector_store.add_entries([entry])
-
-        return {
-            "group_id": None,
+        result = {
+            "group_id": dm_group_id,
             "user_id": user_id,
             "created_memories": {
-                "vector_store": [1]  # Count of entries added
+                "group": [],
+                "user": [],
+                "interaction": []
             }
         }
+
+        # ==========================================================================
+        # LLM-BASED MESSAGE ANALYSIS
+        # ==========================================================================
+        analyzer = get_message_analyzer()
+
+        # Analyze the message to decide what memories to create
+        analysis = analyzer.analyze_message(
+            message=message,
+            username=username,
+            group_context=f"Direct Message with {username}",
+            recent_messages=None
+        )
+
+        # If LLM says we shouldn't remember this message, skip it
+        if not analysis.get("should_remember", True):
+            return result
+
+        # Accumulate memories for batch insertion
+        user_memories = []
+
+        # Create user memories based on LLM analysis
+        for mem_data in analysis.get("memories", []):
+            mem_type = mem_data.get("type", "conversation")
+
+            # Map LLM types to MemoryType enum
+            type_mapping = {
+                "expertise": MemoryType.EXPERTISE,
+                "preference": MemoryType.PREFERENCE,
+                "fact": MemoryType.FACT,
+                "announcement": MemoryType.ANNOUNCEMENT,
+                "need": MemoryType.PREFERENCE,
+                "conversation": MemoryType.CONVERSATION
+            }
+
+            memory_type = type_mapping.get(mem_type, MemoryType.CONVERSATION)
+
+            # For DMs, all memories become UserMemory in the virtual DM group
+            user_memory = UserMemory(
+                agent_id=self.agent_id,
+                group_id=dm_group_id,  # Virtual group ID for DM
+                user_id=user_id,
+                username=username,
+                platform=platform_identity.get('platform', 'unknown'),
+                memory_type=memory_type,
+                content=mem_data.get("content", message),
+                topics=mem_data.get("topics", []),
+                keywords=mem_data.get("keywords", []),
+                importance_score=mem_data.get("importance", 0.5),
+                privacy_scope=PrivacyScope.PROTECTED,
+                is_shareable=False,  # DMs default to not shareable (privacy by default)
+                source_message_id=metadata.get('message_id') if metadata else None,
+                source_timestamp=metadata.get('timestamp') if metadata else None
+            )
+            user_memories.append(user_memory)
+
+        # Batch insert all memories
+        if user_memories:
+            self.group_store.add_user_memories_batch(user_memories)
+            result["created_memories"]["user"] = user_memories
+
+        return result
 
     # ==========================================================================
     # CONTEXT RETRIEVAL

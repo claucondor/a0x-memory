@@ -3,11 +3,13 @@ FactExtractor - Extracts user facts from messages.
 
 Works on both group messages and DM messages.
 Identifies preferences, expertise, behaviors, etc.
+
+Also auto-creates facts from shareable memories.
 """
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from datetime import datetime, timezone
 
-from models.group_memory import UserFact, FactType
+from models.group_memory import UserFact, FactType, UserMemory, GroupMemory, InteractionMemory
 from database.user_fact_store import UserFactStore
 from utils.llm_client import LLMClient
 
@@ -195,3 +197,119 @@ class FactExtractor:
             "high_confidence_count": context["high_confidence_facts"],
             "facts_by_type": list(context["facts_by_type"].keys())
         }
+
+    def extract_from_shareable_memory(
+        self,
+        memory: Union[UserMemory, GroupMemory, InteractionMemory],
+        agent_id: str,
+        user_id: str = None
+    ) -> Optional[UserFact]:
+        """
+        Convert a shareable memory to a global UserFact.
+
+        When a memory is marked as is_shareable=true, it represents information
+        about the user that can be shared across contexts. This method converts
+        such memories into UserFacts for cross-context availability.
+
+        Args:
+            memory: The shareable memory to convert
+            agent_id: Agent ID
+            user_id: Optional user ID (inferred from memory if not provided)
+
+        Returns:
+            Created UserFact or None if memory is not shareable
+        """
+        # Check if memory is shareable
+        if not getattr(memory, 'is_shareable', False):
+            return None
+
+        # Infer user_id from memory if not provided
+        if not user_id:
+            user_id = getattr(memory, 'user_id', None)
+
+        if not user_id:
+            print(f"[FactExtractor] Cannot extract fact: no user_id in memory")
+            return None
+
+        # Infer fact type from memory
+        fact_type = self._infer_fact_type_from_memory(memory)
+
+        # Get source type
+        group_id = getattr(memory, 'group_id', '')
+        if group_id and group_id.startswith('dm_'):
+            source_type = "dm"
+        else:
+            source_type = "group"
+
+        # Determine confidence based on memory importance
+        importance_score = getattr(memory, 'importance_score', 0.5)
+        confidence = 0.5 + (importance_score * 0.3)  # Map 0-1 to 0.5-0.8
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        fact = UserFact(
+            fact_id=f"shareable_{memory.memory_id}",
+            agent_id=agent_id,
+            user_id=user_id,
+            content=memory.content,
+            fact_type=fact_type,
+            keywords=getattr(memory, 'keywords', []),
+            evidence_count=1,
+            confidence=confidence,
+            sources=[group_id] if group_id else ["unknown"],
+            source_types=[source_type],
+            first_seen=now,
+            last_confirmed=now
+        )
+
+        # Add to fact store
+        try:
+            fact_id = self.fact_store.add_fact(fact)
+            print(f"[FactExtractor] Auto-created fact from shareable memory: {fact.content[:50]}...")
+            return fact
+        except Exception as e:
+            print(f"[FactExtractor] Failed to auto-create fact: {e}")
+            return None
+
+    def _infer_fact_type_from_memory(
+        self,
+        memory: Union[UserMemory, GroupMemory, InteractionMemory]
+    ) -> FactType:
+        """
+        Infer the most appropriate FactType from a memory's type and content.
+
+        Args:
+            memory: The memory to analyze
+
+        Returns:
+            Inferred FactType
+        """
+        memory_type = getattr(memory, 'memory_type', None)
+
+        # Direct mapping for known types
+        if memory_type:
+            memory_type_str = memory_type.value if hasattr(memory_type, 'value') else memory_type
+            type_mapping = {
+                "expertise": FactType.EXPERTISE,
+                "preference": FactType.PREFERENCE,
+                "fact": FactType.PERSONAL,
+                "announcement": FactType.PERSONAL,
+                "conversation": FactType.PERSONAL,
+                "interaction": FactType.COMMUNICATION
+            }
+            if memory_type_str in type_mapping:
+                return type_mapping[memory_type_str]
+
+        # Fallback: analyze content keywords
+        content = memory.content.lower()
+
+        if any(word in content for word in ["expert", "skilled", "proficient", "experience", "specialist"]):
+            return FactType.EXPERTISE
+        elif any(word in content for word in ["prefer", "like", "enjoy", "love", "hate"]):
+            return FactType.PREFERENCE
+        elif any(word in content for word in ["project", "work", "job", "company"]):
+            return FactType.PERSONAL
+        elif any(word in content for word in ["said", "asked", "replied", "discussed"]):
+            return FactType.COMMUNICATION
+        else:
+            return FactType.PERSONAL

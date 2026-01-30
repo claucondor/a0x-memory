@@ -13,24 +13,26 @@ from collections import Counter
 from models.group_memory import GroupSummary, SummaryLevel
 from database.dm_summary_store import DMSummaryStore, DM_SUMMARY_CONFIG
 from utils.llm_client import LLMClient
+import config
 
 
-DM_MICRO_PROMPT = """Summarize this 1-on-1 conversation segment.
+DM_MICRO_PROMPT = """Analyze this 1-on-1 DM conversation and output ONLY valid JSON.
 
 User: {user_id}
 Messages {msg_start} to {msg_end} ({msg_count} messages)
-Time span: {time_start} to {time_end}
+Time: {time_start} to {time_end}
 
-Conversation:
+<conversation>
 {messages}
+</conversation>
 
-Return JSON:
+Output ONLY this JSON structure, no other text:
 {{
   "summary": "2-3 sentences summarizing the conversation",
-  "topics": ["topic1", "topic2", ...],
-  "user_requests": ["what the user asked for"],
-  "agent_actions": ["what the agent did/provided"],
-  "user_sentiment": "positive|neutral|negative|mixed"
+  "topics": ["topic1", "topic2"],
+  "user_requests": ["what user asked"],
+  "agent_actions": ["what agent provided"],
+  "user_sentiment": "positive"
 }}"""
 
 
@@ -145,7 +147,9 @@ class DMSummaryAggregator:
         try:
             response = self.llm_client.chat_completion(
                 [{"role": "user", "content": prompt}],
-                temperature=0.3
+                temperature=0.3,
+                response_format={"type": "json_object"},
+                model=config.LLM_MODEL_SMART
             )
             data = self.llm_client.extract_json(response)
 
@@ -229,7 +233,9 @@ class DMSummaryAggregator:
         try:
             response = self.llm_client.chat_completion(
                 [{"role": "user", "content": prompt}],
-                temperature=0.3
+                temperature=0.3,
+                response_format={"type": "json_object"},
+                model=config.LLM_MODEL_SMART
             )
             data = self.llm_client.extract_json(response)
 
@@ -318,7 +324,9 @@ class DMSummaryAggregator:
         try:
             response = self.llm_client.chat_completion(
                 [{"role": "user", "content": prompt}],
-                temperature=0.3
+                temperature=0.3,
+                response_format={"type": "json_object"},
+                model=config.LLM_MODEL_SMART
             )
             data = self.llm_client.extract_json(response)
 

@@ -66,6 +66,7 @@ class InMemoryWindowStore:
         result = {
             'doc_id': None,
             'is_spam': False,
+            'is_blocked': False,
             'spam_score': 0.0,
             'spam_reason': 'ok'
         }
@@ -103,6 +104,8 @@ class InMemoryWindowStore:
             'platform_identity': platform_identity or {},
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'processed': False,
+            'is_spam': result['is_spam'],  # Track spam status
+            'spam_score': result['spam_score'],
             'metadata': metadata or {},
             'embedding': embedding[:384] if embedding and len(embedding) > 384 else embedding
         }
@@ -110,10 +113,29 @@ class InMemoryWindowStore:
         messages = self._get_messages(agent_id, group_id)
         messages.append(doc_data)
 
-        # Maintain sliding window (use default for in-memory)
+        # Smart window maintenance: prioritize keeping unprocessed non-spam
         window_size = getattr(config, 'RECENT_WINDOW_SIZE', 15)
         while len(messages) > window_size:
-            messages.pop(0)  # Remove oldest
+            # Priority 1: Remove oldest processed messages
+            processed_idx = next(
+                (i for i, m in enumerate(messages) if m.get('processed', False)),
+                None
+            )
+            if processed_idx is not None:
+                messages.pop(processed_idx)
+                continue
+
+            # Priority 2: Remove oldest spam messages (keep for context but expendable)
+            spam_idx = next(
+                (i for i, m in enumerate(messages) if m.get('is_spam', False)),
+                None
+            )
+            if spam_idx is not None:
+                messages.pop(spam_idx)
+                continue
+
+            # Priority 3: Remove oldest message (last resort)
+            messages.pop(0)
 
         result['doc_id'] = doc_id
         return result
@@ -143,9 +165,17 @@ class InMemoryWindowStore:
         group_id: str,
         min_count: int = 10
     ) -> List[Dict[str, Any]]:
-        """Get unprocessed messages for batch processing."""
+        """Get unprocessed non-spam messages for batch processing."""
         messages = self._get_messages(agent_id, group_id)
-        unprocessed = [m for m in messages if not m.get('processed', False)]
+        # Filter: unprocessed AND not spam
+        unprocessed = [
+            m for m in messages
+            if not m.get('processed', False) and not m.get('is_spam', False)
+        ]
+
+        spam_count = len([m for m in messages if m.get('is_spam', False) and not m.get('processed', False)])
+        if spam_count > 0:
+            print(f"[InMemoryWindow] Filtered out {spam_count} spam messages from batch")
 
         if len(unprocessed) >= min_count:
             return [
@@ -263,6 +293,7 @@ class FirestoreWindowStore:
         result = {
             'doc_id': None,
             'is_spam': False,
+            'is_blocked': False,
             'spam_score': 0.0,
             'spam_reason': 'ok'
         }
@@ -302,6 +333,7 @@ class FirestoreWindowStore:
                     # Check if user should be blocked
                     if self._threshold_manager.is_user_blocked(agent_id, group_id, user_id):
                         print(f"[FirestoreWindow] User {username} blocked due to spam")
+                        result['is_blocked'] = True
                         return result
 
             # Prepare document data
@@ -311,6 +343,8 @@ class FirestoreWindowStore:
                 'platform_identity': platform_identity or {},
                 'timestamp': datetime.now(timezone.utc).isoformat(),
                 'processed': False,  # Mark for batch processing
+                'is_spam': result['is_spam'],  # Track spam status
+                'spam_score': result['spam_score'],
                 'metadata': metadata or {}
             }
 
@@ -380,22 +414,60 @@ class FirestoreWindowStore:
             return []
 
     def _maintain_window_size(self, collection, max_size: int):
-        """Maintain sliding window by deleting oldest messages beyond max_size"""
+        """
+        Smart window maintenance: prioritize keeping unprocessed non-spam messages.
+        Delete order: 1) processed, 2) spam, 3) oldest
+        """
         try:
-            # Get all messages ordered by timestamp DESC (newest first)
-            all_msgs = collection.order_by(
-                'timestamp',
-                direction=firestore.Query.DESCENDING
-            ).limit(max_size + 1).get()
+            # Get all messages
+            all_msgs = list(collection.get())
 
-            messages = list(all_msgs)
+            if len(all_msgs) <= max_size:
+                return
 
-            # If we have more than max_size, delete the oldest
-            if len(messages) > max_size:
-                # The last one in DESC order is the oldest
-                oldest = messages[-1]
-                collection.document(oldest.id).delete()
-                print(f"[FirestoreWindow] Slid window - deleted oldest message")
+            # Categorize messages
+            to_delete = []
+            processed = []
+            spam = []
+            unprocessed_clean = []
+
+            for msg in all_msgs:
+                data = msg.to_dict()
+                if data.get('processed', False):
+                    processed.append((msg.id, data.get('timestamp', '')))
+                elif data.get('is_spam', False):
+                    spam.append((msg.id, data.get('timestamp', '')))
+                else:
+                    unprocessed_clean.append((msg.id, data.get('timestamp', '')))
+
+            # Sort each category by timestamp (oldest first)
+            processed.sort(key=lambda x: x[1])
+            spam.sort(key=lambda x: x[1])
+            unprocessed_clean.sort(key=lambda x: x[1])
+
+            # Calculate how many to delete
+            excess = len(all_msgs) - max_size
+
+            # Priority 1: Delete oldest processed
+            while excess > 0 and processed:
+                to_delete.append(processed.pop(0)[0])
+                excess -= 1
+
+            # Priority 2: Delete oldest spam
+            while excess > 0 and spam:
+                to_delete.append(spam.pop(0)[0])
+                excess -= 1
+
+            # Priority 3: Delete oldest unprocessed (last resort)
+            while excess > 0 and unprocessed_clean:
+                to_delete.append(unprocessed_clean.pop(0)[0])
+                excess -= 1
+
+            # Batch delete
+            if to_delete:
+                for doc_id in to_delete:
+                    collection.document(doc_id).delete()
+                print(f"[FirestoreWindow] Smart window cleanup: deleted {len(to_delete)} messages")
 
         except Exception as e:
             print(f"[FirestoreWindow] Error maintaining window: {e}")
@@ -477,10 +549,23 @@ class FirestoreWindowStore:
             ).get()
             messages = list(msgs)
 
-            # Only return if we have enough for a batch
-            if len(messages) >= min_count:
+            # Filter out spam messages - don't process spam into memories
+            non_spam_messages = []
+            spam_count = 0
+            for m in messages:
+                data = m.to_dict()
+                if not data.get('is_spam', False):
+                    non_spam_messages.append(m)
+                else:
+                    spam_count += 1
+
+            if spam_count > 0:
+                print(f"[FirestoreWindow] Filtered out {spam_count} spam messages from batch")
+
+            # Only return if we have enough non-spam messages for a batch
+            if len(non_spam_messages) >= min_count:
                 results = []
-                for m in messages:
+                for m in non_spam_messages:
                     data = m.to_dict()
                     results.append({
                         'doc_id': m.id,
