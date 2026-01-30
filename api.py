@@ -254,6 +254,7 @@ class ContextQueryRequest(BaseModel):
     include_recent: bool = True
     recent_limit: int = 10
     memory_limit: int = 5
+    involved_users: Optional[List[str]] = None  # Users mentioned/involved in the query (e.g., ["telegram:88001"])
 
 
 class UnifiedContextResponse(BaseModel):
@@ -1344,6 +1345,7 @@ async def add_passive_memory(request: PassiveMemoryRequest, background_tasks: Ba
         "processed": False,  # Always False now - processing is async
         "memories_created": 0,  # Will be created in background
         "is_spam": result.get("is_spam", False),
+        "is_blocked": result.get("is_blocked", False),
         "spam_score": result.get("spam_score", 0.0)
     }
 
@@ -1479,7 +1481,8 @@ async def get_memory_context(request: ContextQueryRequest):
                 context = {
                     'group_id': identity['group_id'],
                     'user_id': identity['user_id'],
-                    'platform': identity['platform']
+                    'platform': identity['platform'],
+                    'involved_users': request.involved_users or []
                 }
                 results = await asyncio.to_thread(
                     system.hybrid_retriever.retrieve_for_context,
@@ -1487,7 +1490,7 @@ async def get_memory_context(request: ContextQueryRequest):
                     context,
                     limit_per_table=request.memory_limit
                 )
-                # Combine all memory types from the results
+                # Combine all memory types from the results (excluding speaker_dm which goes separately)
                 all_memories = []
                 all_memories.extend(results.get("individual_memories", []))
                 all_memories.extend(results.get("group_memories", []))
@@ -1497,6 +1500,11 @@ async def get_memory_context(request: ContextQueryRequest):
                 response["relevant_memories"] = all_memories[:request.memory_limit]
                 response["group_profile"] = results.get("group_context")
                 response["user_profile"] = results.get("relevant_profiles")
+
+                # Use the retriever's formatter which includes speaker DM memories section
+                response["formatted_context"] = system.hybrid_retriever._format_multi_table_context(
+                    results, context
+                )
             else:
                 # DM context - use basic retrieve
                 memories = await asyncio.to_thread(
@@ -1508,21 +1516,22 @@ async def get_memory_context(request: ContextQueryRequest):
         except Exception as e:
             print(f"[API] Warning: Could not search memories: {e}")
 
-    # Build formatted context
-    context_parts = []
-    if response["recent_messages"]:
-        context_parts.append("Recent messages:")
-        for msg in response["recent_messages"]:
-            username = msg.get('username', 'unknown')
-            content = msg.get('content', '')
-            context_parts.append(f"  {username}: {content}")
+    # Build formatted context only if not already set by retriever
+    if not response["formatted_context"]:
+        context_parts = []
+        if response["recent_messages"]:
+            context_parts.append("Recent messages:")
+            for msg in response["recent_messages"]:
+                username = msg.get('username', 'unknown')
+                content = msg.get('content', '')
+                context_parts.append(f"  {username}: {content}")
 
-    if response["relevant_memories"]:
-        context_parts.append("\nRelevant memories:")
-        for mem in response["relevant_memories"]:
-            context_parts.append(f"  - {mem}")
+        if response["relevant_memories"]:
+            context_parts.append("\nRelevant memories:")
+            for mem in response["relevant_memories"]:
+                context_parts.append(f"  - {mem}")
 
-    response["formatted_context"] = "\n".join(context_parts)
+        response["formatted_context"] = "\n".join(context_parts)
 
     return response
 
@@ -1623,30 +1632,34 @@ async def get_memory_stats(agent_id: str):
 async def get_group_summaries(
     group_id: str,
     agent_id: str,
-    period_type: Optional[str] = None,
-    limit: int = 10
+    level: Optional[str] = None,
+    limit_micro: int = 5,
+    limit_chunk: int = 3,
+    limit_block: int = 2
 ):
-    """Get hierarchical summaries for a group."""
+    """Get hierarchical summaries for a group (micro/chunk/block levels)."""
     memory_id = f"{agent_id}:"
     system = get_memory_system(memory_id)
 
     if not hasattr(system, 'group_summary_store'):
         raise HTTPException(status_code=501, detail="Group summaries not available")
 
-    if period_type:
-        summaries = system.group_summary_store.get_summaries_for_period(
-            group_id, period_type
+    if level:
+        # Get summaries for a specific level
+        summaries = system.group_summary_store.get_summaries_by_level(
+            group_id, level
         )
     else:
+        # Get summaries at all levels
         summaries_dict = system.group_summary_store.get_context_summaries(
             group_id,
-            limit_daily=limit,
-            limit_weekly=limit,
-            limit_monthly=limit
+            limit_micro=limit_micro,
+            limit_chunk=limit_chunk,
+            limit_block=limit_block
         )
         summaries = []
-        for period_summaries in summaries_dict.values():
-            summaries.extend(period_summaries)
+        for level_summaries in summaries_dict.values():
+            summaries.extend(level_summaries)
 
     return {
         "group_id": group_id,
@@ -1662,32 +1675,37 @@ async def get_group_summaries(
                 activity_score=s.activity_score,
                 decay_score=s.decay_score
             )
-            for s in sorted(summaries, key=lambda x: x.period_end, reverse=True)[:limit]
+            for s in sorted(summaries, key=lambda x: x.period_end, reverse=True)
         ]
     }
 
 
 @app.post("/v1/groups/{group_id}/aggregate")
 async def trigger_aggregation(group_id: str, agent_id: str):
-    """Manually trigger summary aggregation cycle."""
+    """
+    Get summary counts for a group.
+
+    Note: Aggregation (micros → chunks → blocks → eras) is now handled by
+    the a0x-memory-jobs service running on Cloud Run with Cloud Scheduler.
+    This endpoint returns current summary counts only.
+    """
     memory_id = f"{agent_id}:"
     system = get_memory_system(memory_id)
 
-    if not hasattr(system, 'summary_aggregator'):
-        raise HTTPException(status_code=501, detail="Summary aggregation not available")
+    if not hasattr(system, 'group_summary_store'):
+        raise HTTPException(status_code=501, detail="Summary store not available")
 
     try:
-        system.summary_aggregator.run_aggregation_cycle(agent_id, group_id)
-
-        # Get updated counts
+        # Get current summary counts
         summaries = system.group_summary_store.get_context_summaries(group_id)
 
         return {
             "success": True,
+            "message": "Use a0x-memory-jobs service for aggregation",
             "counts": {
-                "daily": len(summaries.get("daily", [])),
-                "weekly": len(summaries.get("weekly", [])),
-                "monthly": len(summaries.get("monthly", []))
+                "micro": len(summaries.get("micro", [])),
+                "chunk": len(summaries.get("chunk", [])),
+                "block": len(summaries.get("block", []))
             }
         }
     except Exception as e:
@@ -1705,17 +1723,26 @@ async def get_user_facts(
     system = get_memory_system(memory_id)
 
     try:
-        from models.group_memory import FactType
-
         if query:
-            facts = system.fact_extractor.get_user_context(universal_user_id, query=query)
+            context = system.fact_extractor.get_user_context(universal_user_id, query=query)
         else:
-            facts = system.fact_extractor.get_user_context(universal_user_id)
+            context = system.fact_extractor.get_user_context(universal_user_id)
+
+        # Flatten facts_by_type into a single list for the API response
+        facts_list = []
+        for fact_type, type_facts in context.get("facts_by_type", {}).items():
+            for f in type_facts:
+                facts_list.append({
+                    "type": fact_type,
+                    **f
+                })
 
         return {
             "user_id": universal_user_id,
-            "facts": facts.get("facts", []),
-            "total_facts": facts.get("total_facts", 0)
+            "facts": facts_list,
+            "facts_by_type": context.get("facts_by_type", {}),
+            "total_facts": context.get("total_facts", 0),
+            "high_confidence_facts": context.get("high_confidence_facts", 0)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1922,6 +1949,128 @@ async def reset_agent_data(agent_id: str, confirm: bool = False):
 
     result["success"] = True
     return result
+
+
+# ============================================================================
+# Spam Admin Endpoints
+# ============================================================================
+
+@app.get("/v1/spam/user/{user_id}/status")
+async def get_user_spam_status(
+    user_id: str,
+    agent_id: str,
+    group_id: str = None
+):
+    """
+    Get spam status for a user.
+
+    Args:
+        user_id: Universal user ID (e.g., telegram:123456)
+        agent_id: Agent ID
+        group_id: Optional group ID (defaults to DM)
+
+    Returns:
+        Spam info including score, blocked status, history
+    """
+    memory_id = f"{agent_id}:"
+    system = get_memory_system(memory_id)
+
+    # Default to DM if no group specified
+    effective_group_id = group_id or f"dm_{user_id}"
+
+    if not hasattr(system, 'threshold_manager') or not system.threshold_manager:
+        return {"error": "Threshold manager not available", "user_id": user_id}
+
+    info = system.threshold_manager.get_user_spam_info(
+        agent_id=agent_id,
+        group_id=effective_group_id,
+        user_id=user_id
+    )
+
+    return info
+
+
+@app.post("/v1/spam/user/{user_id}/unblock")
+async def unblock_user(
+    user_id: str,
+    agent_id: str,
+    group_id: str = None
+):
+    """
+    Manually unblock a user by resetting their spam score.
+
+    Args:
+        user_id: Universal user ID (e.g., telegram:123456)
+        agent_id: Agent ID
+        group_id: Optional group ID (defaults to DM)
+
+    Returns:
+        Result of unblock operation
+    """
+    memory_id = f"{agent_id}:"
+    system = get_memory_system(memory_id)
+
+    effective_group_id = group_id or f"dm_{user_id}"
+
+    if not hasattr(system, 'threshold_manager') or not system.threshold_manager:
+        return {"error": "Threshold manager not available", "success": False}
+
+    # Get current status first
+    before = system.threshold_manager.get_user_spam_info(
+        agent_id=agent_id,
+        group_id=effective_group_id,
+        user_id=user_id
+    )
+
+    # Unblock
+    result = system.threshold_manager.unblock_user(
+        agent_id=agent_id,
+        group_id=effective_group_id,
+        user_id=user_id
+    )
+
+    return {
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "group_id": effective_group_id,
+        "was_blocked": before.get("is_blocked", False),
+        "previous_spam_score": before.get("spam_score", 0.0),
+        **result
+    }
+
+
+@app.get("/v1/spam/blocked")
+async def get_blocked_users(
+    agent_id: str,
+    group_id: str = None
+):
+    """
+    Get all blocked users for an agent.
+
+    Args:
+        agent_id: Agent ID
+        group_id: Optional group ID to filter by
+
+    Returns:
+        List of blocked users with spam info
+    """
+    memory_id = f"{agent_id}:"
+    system = get_memory_system(memory_id)
+
+    if not hasattr(system, 'threshold_manager') or not system.threshold_manager:
+        return {"error": "Threshold manager not available", "blocked_users": []}
+
+    blocked = system.threshold_manager.get_blocked_users(
+        agent_id=agent_id,
+        group_id=group_id
+    )
+
+    return {
+        "agent_id": agent_id,
+        "group_id": group_id,
+        "blocked_count": len(blocked),
+        "blocked_users": blocked
+    }
 
 
 # ============================================================================
