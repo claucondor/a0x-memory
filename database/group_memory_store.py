@@ -105,6 +105,7 @@ class GroupMemoryStore:
             pa.field("memory_level", pa.string()),
             pa.field("memory_type", pa.string()),
             pa.field("privacy_scope", pa.string()),
+            pa.field("is_shareable", pa.bool_()),
             pa.field("content", pa.string()),
             pa.field("speaker", pa.string()),
             pa.field("keywords", pa.list_(pa.string())),
@@ -141,6 +142,7 @@ class GroupMemoryStore:
             pa.field("memory_level", pa.string()),
             pa.field("memory_type", pa.string()),
             pa.field("privacy_scope", pa.string()),
+            pa.field("is_shareable", pa.bool_()),
             pa.field("content", pa.string()),
             pa.field("keywords", pa.list_(pa.string())),
             pa.field("topics", pa.list_(pa.string())),
@@ -181,6 +183,7 @@ class GroupMemoryStore:
             pa.field("memory_level", pa.string()),
             pa.field("memory_type", pa.string()),
             pa.field("privacy_scope", pa.string()),
+            pa.field("is_shareable", pa.bool_()),
             pa.field("content", pa.string()),
             pa.field("keywords", pa.list_(pa.string())),
             pa.field("topics", pa.list_(pa.string())),
@@ -305,6 +308,7 @@ class GroupMemoryStore:
             "memory_level": memory.memory_level.value,
             "memory_type": memory.memory_type.value,
             "privacy_scope": memory.privacy_scope.value,
+            "is_shareable": memory.is_shareable,
             "content": memory.content,
             "speaker": memory.speaker or "",
             "keywords": memory.keywords,
@@ -334,6 +338,7 @@ class GroupMemoryStore:
             "memory_level": memory.memory_level.value,
             "memory_type": memory.memory_type.value,
             "privacy_scope": memory.privacy_scope.value,
+            "is_shareable": memory.is_shareable,
             "content": memory.content,
             "keywords": memory.keywords,
             "topics": memory.topics,
@@ -366,6 +371,7 @@ class GroupMemoryStore:
             "memory_level": memory.memory_level.value,
             "memory_type": memory.memory_type.value,
             "privacy_scope": memory.privacy_scope.value,
+            "is_shareable": memory.is_shareable,
             "content": memory.content,
             "keywords": memory.keywords,
             "topics": memory.topics,
@@ -440,6 +446,7 @@ class GroupMemoryStore:
                 "memory_level": memory.memory_level.value,
                 "memory_type": memory.memory_type.value,
                 "privacy_scope": memory.privacy_scope.value,
+                "is_shareable": memory.is_shareable,
                 "content": memory.content,
                 "speaker": memory.speaker or "",
                 "keywords": memory.keywords,
@@ -480,6 +487,7 @@ class GroupMemoryStore:
                 "memory_level": memory.memory_level.value,
                 "memory_type": memory.memory_type.value,
                 "privacy_scope": memory.privacy_scope.value,
+                "is_shareable": memory.is_shareable,
                 "content": memory.content,
                 "keywords": memory.keywords,
                 "topics": memory.topics,
@@ -523,6 +531,7 @@ class GroupMemoryStore:
                 "memory_level": memory.memory_level.value,
                 "memory_type": memory.memory_type.value,
                 "privacy_scope": memory.privacy_scope.value,
+                "is_shareable": memory.is_shareable,
                 "content": memory.content,
                 "keywords": memory.keywords,
                 "topics": memory.topics,
@@ -756,7 +765,10 @@ class GroupMemoryStore:
         min_evidence: int = 2
     ) -> List[CrossGroupMemory]:
         """
-        Detect patterns across multiple groups for consolidation.
+        Detect patterns across multiple groups AND DMs for consolidation.
+
+        DMs are treated as "virtual groups" with group_id="dm_{user_id}".
+        Only shareable memories (is_shareable=true) contribute to cross-group patterns.
 
         Args:
             user_id: User to analyze
@@ -766,8 +778,7 @@ class GroupMemoryStore:
         Returns:
             List of consolidated cross-group memories
         """
-        # Get all user memories across groups
-        universal_id = f"telegram:{user_id}"
+        # Get all user memories across groups (including DMs as virtual groups)
         user_memories = self.user_memories_table.search().where(
             f"user_id = '{user_id}'", prefilter=True
         ).to_list()
@@ -775,16 +786,26 @@ class GroupMemoryStore:
         if not user_memories:
             return []
 
-        # Group memories by topic and memory type
-        patterns = self._analyze_patterns(user_memories)
+        # Filter to ONLY shareable memories for cross-group
+        shareable_memories = [m for m in user_memories if m.get("is_shareable", False)]
 
-        # Filter by min_groups
+        if not shareable_memories:
+            print(f"[detect_cross_group_patterns] No shareable memories found for user {user_id}")
+            return []
+
+        print(f"[detect_cross_group_patterns] Found {len(shareable_memories)} shareable memories out of {len(user_memories)} total")
+
+        # Group memories by topic and memory type
+        patterns = self._analyze_patterns(shareable_memories)
+
+        # Filter by min_groups (now includes dm_* as valid groups)
         consolidated = []
         for pattern_key, pattern_data in patterns.items():
             if len(pattern_data["groups"]) >= min_groups and pattern_data["total_evidence"] >= min_evidence:
                 cross_group_memory = self.consolidate_cross_group_memory(pattern_data)
                 if cross_group_memory:
                     consolidated.append(cross_group_memory)
+                    print(f"[detect_cross_group_patterns] Created cross-group memory: {cross_group_memory.content[:50]}... (groups: {len(cross_group_memory.groups_involved)})")
 
         return consolidated
 
@@ -1000,6 +1021,7 @@ class GroupMemoryStore:
             memory_level=MemoryLevel(row["memory_level"]),
             memory_type=MemoryType(row["memory_type"]),
             privacy_scope=PrivacyScope(row["privacy_scope"]),
+            is_shareable=row.get("is_shareable", False),
             content=row["content"],
             speaker=row["speaker"] or None,
             keywords=list(row.get("keywords") or []),
@@ -1023,6 +1045,7 @@ class GroupMemoryStore:
             memory_level=MemoryLevel(row["memory_level"]),
             memory_type=MemoryType(row["memory_type"]),
             privacy_scope=PrivacyScope(row["privacy_scope"]),
+            is_shareable=row.get("is_shareable", False),
             content=row["content"],
             keywords=list(row.get("keywords") or []),
             topics=list(row.get("topics") or []),
@@ -1049,6 +1072,7 @@ class GroupMemoryStore:
             memory_level=MemoryLevel(row["memory_level"]),
             memory_type=MemoryType(row["memory_type"]),
             privacy_scope=PrivacyScope(row["privacy_scope"]),
+            is_shareable=row.get("is_shareable", False),
             content=row["content"],
             keywords=list(row.get("keywords") or []),
             topics=list(row.get("topics") or []),

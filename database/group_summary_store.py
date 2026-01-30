@@ -170,6 +170,7 @@ class GroupSummaryStore:
         }
 
         self.table.add([data])
+        print(f"[SummaryStore] Added {level} summary for {summary.group_id}: {summary.summary_id}")
         return summary.summary_id
 
     def get_summaries_by_level(

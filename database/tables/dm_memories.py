@@ -42,6 +42,7 @@ class DMMemoriesTable:
             pa.field("memory_type", pa.string()),
             pa.field("privacy_scope", pa.string()),
             pa.field("importance_score", pa.float32()),
+            pa.field("is_shareable", pa.bool_()),
             pa.field("vector", pa.list_(pa.float32(), self.embedding_model.dimension))
         ])
 
@@ -114,6 +115,7 @@ class DMMemoriesTable:
                 "memory_type": entry.memory_type.value if isinstance(entry.memory_type, DM_MemoryType) else str(entry.memory_type),
                 "privacy_scope": entry.privacy_scope.value if isinstance(entry.privacy_scope, DM_PrivacyScope) else str(entry.privacy_scope),
                 "importance_score": entry.importance_score,
+                "is_shareable": entry.is_shareable,
                 "vector": vector.tolist()
             })
 
@@ -142,7 +144,7 @@ class DMMemoriesTable:
             "_distance", "entry_id", "lossless_restatement", "keywords", "timestamp",
             "location", "persons", "entities", "topic", "group_id",
             "user_id", "username", "platform", "memory_type",
-            "privacy_scope", "importance_score"
+            "privacy_scope", "importance_score", "is_shareable"
         ])
 
         results = search.limit(top_k).to_list()
@@ -203,7 +205,8 @@ class DMMemoriesTable:
             platform=row.get("platform") or "direct",
             memory_type=memory_type,
             privacy_scope=privacy_scope,
-            importance_score=row.get("importance_score", 0.5)
+            importance_score=row.get("importance_score", 0.5),
+            is_shareable=row.get("is_shareable", False)
         )
 
     def count(self) -> int:

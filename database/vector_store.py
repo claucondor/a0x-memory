@@ -86,6 +86,7 @@ class VectorStore:
             pa.field("memory_type", pa.string()),     # conversation, expertise, etc.
             pa.field("privacy_scope", pa.string()),   # private, group_only, public
             pa.field("importance_score", pa.float32()), # 0.0 - 1.0
+            pa.field("is_shareable", pa.bool_()),     # Can be shared to other contexts
 
             # ─── VECTOR ───
             pa.field("vector", pa.list_(pa.float32(), self.embedding_model.dimension))
@@ -170,7 +171,8 @@ class VectorStore:
                     # Classification (NEW)
                     memory_type=memory_type,
                     privacy_scope=privacy_scope,
-                    importance_score=r.get("importance_score", 0.5)
+                    importance_score=r.get("importance_score", 0.5),
+                    is_shareable=r.get("is_shareable", False)
                 ))
             except Exception as e:
                 print(f"Warning: Failed to parse result: {e}")
@@ -212,6 +214,7 @@ class VectorStore:
                 "memory_type": entry.memory_type.value if isinstance(entry.memory_type, MemoryType) else str(entry.memory_type),
                 "privacy_scope": entry.privacy_scope.value if isinstance(entry.privacy_scope, PrivacyScope) else str(entry.privacy_scope),
                 "importance_score": entry.importance_score,
+                "is_shareable": entry.is_shareable,
                 # Vector
                 "vector": vector.tolist()
             })
