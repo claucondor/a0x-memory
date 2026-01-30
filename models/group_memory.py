@@ -57,6 +57,9 @@ class GroupMemory(BaseModel):
     memory_type: MemoryType = Field(..., description="Type of memory content")
     privacy_scope: PrivacyScope = Field(default=PrivacyScope.PUBLIC)
 
+    # Shareability - can this memory be shared across contexts?
+    is_shareable: bool = Field(default=False, description="Can this memory be shared to other contexts (DM, other groups)?")
+
     # Content
     content: str = Field(..., description="Memory content")
     speaker: Optional[str] = Field(None, description="Who spoke/created this")
@@ -83,6 +86,7 @@ class GroupMemory(BaseModel):
                 "memory_level": "group",
                 "memory_type": "announcement",
                 "privacy_scope": "public",
+                "is_shareable": False,
                 "content": "Group decided to hold weekly DeFi discussions on Fridays",
                 "speaker": "admin_user",
                 "keywords": ["defi", "weekly", "friday", "discussion"],
@@ -117,6 +121,9 @@ class UserMemory(BaseModel):
     memory_level: MemoryLevel = Field(default=MemoryLevel.INDIVIDUAL)
     memory_type: MemoryType = Field(..., description="Type of memory content")
     privacy_scope: PrivacyScope = Field(default=PrivacyScope.PROTECTED)
+
+    # Shareability - can this memory be shared across contexts?
+    is_shareable: bool = Field(default=False, description="Can this memory be shared to other contexts (DM, other groups)?")
 
     # Content
     content: str = Field(..., description="Memory content")
@@ -186,6 +193,9 @@ class InteractionMemory(BaseModel):
     memory_level: MemoryLevel = Field(default=MemoryLevel.INDIVIDUAL)
     memory_type: MemoryType = Field(default=MemoryType.INTERACTION)
     privacy_scope: PrivacyScope = Field(default=PrivacyScope.PROTECTED)
+
+    # Shareability - can this memory be shared across contexts?
+    is_shareable: bool = Field(default=False, description="Can this memory be shared to other contexts (DM, other groups)?")
 
     # Content
     content: str = Field(..., description="Interaction content")
@@ -460,6 +470,7 @@ class SummaryLevel(str, Enum):
     MICRO = "micro"    # Every ~50 messages
     CHUNK = "chunk"    # Every 5 micros (~250 messages)
     BLOCK = "block"    # Every 5 chunks (~1250 messages)
+    ERA = "era"        # Every 5 blocks (~6250 messages) - long-term archive
 
 
 class GroupProfile(BaseModel):

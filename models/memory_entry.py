@@ -111,6 +111,10 @@ class MemoryEntry(BaseModel):
         le=1.0,
         description="Importance score 0-1 (higher = more important)"
     )
+    is_shareable: bool = Field(
+        default=False,
+        description="Can this memory be shared to other contexts (groups, cross-context)?"
+    )
 
     class Config:
         json_schema_extra = {
