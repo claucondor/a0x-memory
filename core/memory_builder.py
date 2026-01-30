@@ -443,6 +443,21 @@ Participants: {', '.join(group_context.get('usernames', []))}
    - memory_type: "interaction"
    - Examples: "Alice helped Bob debug his smart contract", "Carol asked David about yield farming"
 
+[Privacy & Shareability Assessment]
+For each memory, you MUST decide if it can be shared across contexts (DMs, other groups):
+
+**is_shareable = TRUE** if:
+- Public information about user (job, skills, projects, expertise)
+- General preferences (not sensitive/personal)
+- Public opinions on topics
+- Examples: "User is a Solidity developer", "User likes technical discussions"
+
+**is_shareable = FALSE** if:
+- Private/sensitive personal information
+- Context-specific conversations
+- Personal matters not meant for other contexts
+- Examples: "User is having a bad day", "User's salary", "Private family matters"
+
 [Output Format]
 Return a JSON object with three arrays:
 
@@ -455,7 +470,8 @@ Return a JSON object with three arrays:
       "speaker": "username who shared this or null",
       "keywords": ["keyword1", "keyword2"],
       "topics": ["topic1", "topic2"],
-      "importance_score": 0.0 to 1.0
+      "importance_score": 0.0 to 1.0,
+      "is_shareable": true|false
     }}
   ],
   "user_memories": [
@@ -466,7 +482,8 @@ Return a JSON object with three arrays:
       "memory_type": "expertise|preference|fact",
       "keywords": ["keyword1", "keyword2"],
       "topics": ["topic1", "topic2"],
-      "importance_score": 0.0 to 1.0
+      "importance_score": 0.0 to 1.0,
+      "is_shareable": true|false
     }}
   ],
   "interaction_memories": [
@@ -477,7 +494,8 @@ Return a JSON object with three arrays:
       "interaction_type": "question|answer|discussion|help",
       "keywords": ["keyword1", "keyword2"],
       "topics": ["topic1", "topic2"],
-      "importance_score": 0.0 to 1.0
+      "importance_score": 0.0 to 1.0,
+      "is_shareable": true|false
     }}
   ]
 }}
@@ -494,6 +512,7 @@ Return a JSON object with three arrays:
 2. Each memory must be self-contained and understandable without context
 3. Skip trivial greetings and filler
 4. Focus on information that would be useful to remember
+5. **Always include is_shareable field** - default to FALSE for sensitive information
 
 Return ONLY the JSON object.
 """
@@ -535,6 +554,7 @@ Return ONLY the JSON object.
                     memory_level=MemoryLevel.GROUP,
                     memory_type=memory_type,
                     privacy_scope=GroupPrivacyScope.PUBLIC,
+                    is_shareable=item.get('is_shareable', False),
                     content=item['content'],
                     speaker=item.get('speaker'),
                     keywords=item.get('keywords', []),
@@ -575,6 +595,7 @@ Return ONLY the JSON object.
                     memory_level=MemoryLevel.INDIVIDUAL,
                     memory_type=memory_type,
                     privacy_scope=GroupPrivacyScope.PROTECTED,
+                    is_shareable=item.get('is_shareable', False),
                     content=item['content'],
                     keywords=item.get('keywords', []),
                     topics=item.get('topics', []),
@@ -602,6 +623,7 @@ Return ONLY the JSON object.
                     memory_level=MemoryLevel.INDIVIDUAL,
                     memory_type=GroupMemoryType.INTERACTION,
                     privacy_scope=GroupPrivacyScope.PROTECTED,
+                    is_shareable=item.get('is_shareable', False),
                     content=item['content'],
                     keywords=item.get('keywords', []),
                     topics=item.get('topics', []),
@@ -715,6 +737,24 @@ Return a JSON array, each element is a memory entry:
 ```
 """
         else:
+            # DM prompt with privacy awareness
+            classification_section = """
+5. **Memory Classification** (IMPORTANT for privacy):
+   - memory_type: Classify each memory as one of:
+     * "expertise" - User demonstrates skill/knowledge (e.g., "I've been building smart contracts for 3 years")
+     * "preference" - User expresses preference/interest (e.g., "I prefer using Hardhat over Foundry")
+     * "fact" - Factual information about user (e.g., "My wallet is 0x123...")
+     * "announcement" - Important updates or news
+     * "conversation" - General conversation (default)
+   - importance_score: 0.0 to 1.0 (how important/memorable is this information?)
+     * 0.8-1.0: Critical info (wallet addresses, expertise, important facts)
+     * 0.5-0.7: Useful info (preferences, opinions)
+     * 0.2-0.4: Nice to know (casual conversation)
+     * 0.0-0.2: Trivial (greetings, filler)
+   - is_shareable: Can this info be shared to other contexts (groups, etc.)?
+     * TRUE for: public info (job, skills, projects), general preferences, public opinions
+     * FALSE for: personal/sensitive info, private matters, context-specific conversations
+"""
             output_format = """
 [Output Format]
 Return a JSON array, each element is a memory entry:
@@ -728,7 +768,10 @@ Return a JSON array, each element is a memory entry:
     "location": "location name or null",
     "persons": ["name1", "name2", ...],
     "entities": ["entity1", "entity2", ...],
-    "topic": "topic phrase"
+    "topic": "topic phrase",
+    "memory_type": "expertise|preference|fact|announcement|conversation",
+    "importance_score": 0.0 to 1.0,
+    "is_shareable": true|false
   },
   ...
 ]
@@ -739,8 +782,9 @@ Return a JSON array, each element is a memory entry:
             group_example_suffix1 = ',\n    "memory_type": "announcement",\n    "importance_score": 0.7'
             group_example_suffix2 = ',\n    "memory_type": "conversation",\n    "importance_score": 0.4'
         else:
-            group_example_suffix1 = ""
-            group_example_suffix2 = ""
+            # DM examples MUST include is_shareable to teach the LLM
+            group_example_suffix1 = ',\n    "memory_type": "fact",\n    "importance_score": 0.7,\n    "is_shareable": true'
+            group_example_suffix2 = ',\n    "memory_type": "conversation",\n    "importance_score": 0.4,\n    "is_shareable": false'
 
         return f"""
 Your task is to extract all valuable information from the following dialogues and convert them into structured memory entries.
@@ -867,7 +911,8 @@ Now process the above dialogues. Return ONLY a JSON object with an "entries" key
                 # Classification (from LLM or defaults)
                 memory_type=memory_type,
                 privacy_scope=privacy_scope,
-                importance_score=item.get("importance_score", 0.5)
+                importance_score=item.get("importance_score", 0.5),
+                is_shareable=item.get("is_shareable", False)
             )
             entries.append(entry)
 

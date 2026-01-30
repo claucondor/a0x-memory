@@ -68,7 +68,8 @@ class HybridRetriever:
         max_retrieval_workers: int = 3,
         cc_alpha: float = None,
         user_profile_store=None,  # UserProfileStore for entity lookups
-        group_profile_store=None  # GroupProfileStore for group context
+        group_profile_store=None,  # GroupProfileStore for group context
+        group_summary_store=None  # GroupSummaryStore for hierarchical summaries
     ):
         self.llm_client = llm_client
         self.unified_store = unified_store
@@ -79,6 +80,7 @@ class HybridRetriever:
         # Profile stores for lightweight entity system
         self.user_profile_store = user_profile_store
         self.group_profile_store = group_profile_store
+        self.group_summary_store = group_summary_store
 
         self.semantic_top_k = semantic_top_k or config.SEMANTIC_TOP_K
         self.keyword_top_k = keyword_top_k or config.KEYWORD_TOP_K
@@ -1283,10 +1285,14 @@ Return ONLY JSON.
         limit_per_table: int = 5
     ) -> Dict[str, Any]:
         """
-        Retrieve from all relevant tables using the intelligent planning pipeline.
+        Retrieve from all relevant tables using context-aware access control.
 
         This is the main entry point for group/multi-table retrieval.
         Uses planning + multi-query fan-out + optional BM25 keyword boost.
+
+        Context-Aware Access:
+        - DM: Returns DM memories + shareable group memories + cross-group + user facts
+        - Group: Returns ONLY that group's memories + speaker's facts
 
         Args:
             query: Search query
@@ -1303,20 +1309,240 @@ Return ONLY JSON.
         # Fetch conversation summary
         conversation_summary = self._fetch_conversation_summary(group_id, user_id)
 
-        # DM path: delegate to self.retrieve() which already has the full pipeline
+        # DM path: use context-aware retrieval
         if not is_group or not self._supports_multi_table:
-            results = self.retrieve(query)
+            results = self._retrieve_for_dm(query, user_id, context, limit_per_table)
             return {
-                "dm_memories": results,
-                "group_memories": [],
-                "user_memories": [],
-                "interaction_memories": [],
-                "cross_group_memories": [],
+                **results,
                 "conversation_summary": conversation_summary,
-                "formatted_context": self._format_dm_context(results)
             }
 
         # Group path: intelligent pipeline with multi-table fan-out
+        print(f"\n[retrieve_for_context] Intelligent group retrieval for: {query}")
+        involved_users = context.get('involved_users', [])
+        return self._retrieve_for_group(query, group_id, user_id, context, limit_per_table, conversation_summary, involved_users)
+
+    def _retrieve_for_dm(
+        self,
+        query: str,
+        user_id: str,
+        context: Dict[str, Any],
+        limit: int
+    ) -> Dict[str, Any]:
+        """
+        Context-aware retrieval for DM conversations.
+
+        Access Rules for DM with User X:
+        - SEES: DM history with X, shareable group memories from X, cross-group memories, user facts
+        - NOT: DMs of other users, non-shareable group memories
+
+        Args:
+            query: Search query
+            user_id: User ID (format: platform:user_id)
+            context: Full context dict
+            limit: Max results per source
+
+        Returns:
+            Dict with dm_memories, shareable_context, cross_group_memories, user_facts, formatted_context
+        """
+        print(f"\n[retrieve_for_context] DM retrieval for user {user_id}: {query}")
+
+        # Step 1: Combined planning + query generation
+        information_plan, search_queries = self._plan_and_generate_queries(query)
+        print(f"[DM Retrieval] Generated {len(search_queries)} targeted queries")
+
+        top_k = self.semantic_top_k
+
+        # Step 2: Batch-encode queries
+        query_vectors = self.unified_store.embedding_model.encode_query(search_queries)
+        query_vector_map = {sq: query_vectors[i] for i, sq in enumerate(search_queries)}
+
+        # Step 3: Search ONLY shareable user memories (from groups) for this user
+        shareable_group_memories = []
+        if self.enable_parallel_retrieval and len(search_queries) > 1:
+            print(f"[DM Retrieval] Parallel search for shareable user memories")
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_retrieval_workers) as executor:
+                    futures = {
+                        executor.submit(self._search_shareable_user_memories, sq, user_id, query_vector_map[sq], top_k): sq
+                        for sq in search_queries
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            results = future.result()
+                            shareable_group_memories.extend(results)
+                        except Exception as e:
+                            print(f"[DM Retrieval] Query failed: {e}")
+            except Exception as e:
+                print(f"[DM Retrieval] Parallel execution failed: {e}")
+                for sq in search_queries:
+                    results = self._search_shareable_user_memories(sq, user_id, query_vector_map[sq], top_k)
+                    shareable_group_memories.extend(results)
+        else:
+            for sq in search_queries:
+                results = self._search_shareable_user_memories(sq, user_id, query_vector_map[sq], top_k)
+                shareable_group_memories.extend(results)
+
+        # Deduplicate
+        shareable_group_memories = self._deduplicate_by_id(shareable_group_memories, "memory_id")
+        print(f"[DM Retrieval] Found {len(shareable_group_memories)} shareable user memories")
+
+        # Step 4: Search cross-group memories for this user
+        cross_group_memories = []
+        if user_id:
+            universal_id = f"telegram:{user_id}"  # Assuming telegram for now
+            for sq in search_queries:
+                qv = query_vector_map[sq]
+                try:
+                    cg = self.unified_store.search_cross_group(universal_id, sq, limit=top_k, query_vector=qv)
+                    cross_group_memories.extend(cg)
+                except Exception as e:
+                    print(f"[DM Retrieval] Cross-group search failed: {e}")
+
+        cross_group_memories = self._deduplicate_by_id(cross_group_memories, "memory_id")
+
+        # Step 5: Apply temporal scoring
+        if shareable_group_memories:
+            shareable_group_memories = self._apply_temporal_scoring(shareable_group_memories)
+        if cross_group_memories:
+            cross_group_memories = self._apply_temporal_scoring(cross_group_memories)
+
+        # Step 6: Rerank and limit
+        shareable_group_memories = self._rerank_with_cross_encoder(query, shareable_group_memories, limit)
+        if cross_group_memories:
+            cross_group_memories = self._rerank_with_cross_encoder(query, cross_group_memories, limit)
+
+        print(f"[DM Retrieval] Results: shareable={len(shareable_group_memories)}, cross_group={len(cross_group_memories)}")
+
+        # Step 7: Get user facts (if fact store is available)
+        user_facts = []
+        if hasattr(self.unified_store, 'fact_store') and self.unified_store.fact_store:
+            try:
+                user_facts = self.unified_store.fact_store.get_user_facts(user_id, min_confidence=0.3)
+                print(f"[DM Retrieval] Found {len(user_facts)} user facts")
+            except Exception as e:
+                print(f"[DM Retrieval] Fact store lookup failed: {e}")
+
+        # Step 8: Format results
+        raw_results = {
+            "dm_memories": [],  # No DM memories in unified store yet
+            "group_memories": [],
+            "user_memories": shareable_group_memories,
+            "interaction_memories": [],
+            "cross_group_memories": cross_group_memories
+        }
+
+        formatted = self._format_dm_context_with_shareable(raw_results, context, user_facts)
+
+        return {
+            **raw_results,
+            "formatted_context": formatted,
+            "user_facts": user_facts,
+        }
+
+    def _search_shareable_user_memories(
+        self,
+        query: str,
+        user_id: str,
+        query_vector,
+        limit: int
+    ) -> List[Any]:
+        """Search for shareable user memories across ALL groups for a specific user."""
+        if not hasattr(self.unified_store, 'user_memories_table'):
+            return []
+
+        try:
+            # Search all user memories for this user, filtered by is_shareable=true
+            results = (
+                self.unified_store.user_memories_table.search(query_vector.tolist())
+                .where(f"user_id = '{user_id}' AND is_shareable = true", prefilter=True)
+                .limit(limit)
+                .to_list()
+            )
+
+            return [
+                self.unified_store._row_to_user_memory(r)
+                for r in results
+            ]
+        except Exception as e:
+            print(f"[_search_shareable_user_memories] Error: {e}")
+            return []
+
+    def _search_shareable_dm_memories(
+        self,
+        query: str,
+        user_id: str,
+        query_vector,
+        limit: int
+    ) -> List[Any]:
+        """Search for shareable DM memories for a specific user (is_shareable=true).
+
+        DM memories are stored in the dm_memories table (MemoryStore.dm_memories).
+        We filter by user_id and is_shareable=true to get cross-context memories.
+        """
+        # DM memories are in the MemoryStore.dm_memories table
+        if not hasattr(self.unified_store, 'dm_memories'):
+            return []
+
+        try:
+            dm_table = self.unified_store.dm_memories
+            agent_id = self.unified_store.agent_id
+
+            # Build filter: DM memories with is_shareable=true for this user
+            filter_parts = [
+                f"agent_id = '{agent_id}'",
+                f"user_id = '{user_id}'",
+                "is_shareable = true"
+            ]
+            filter_clause = " AND ".join(filter_parts)
+
+            vec = query_vector.tolist() if hasattr(query_vector, 'tolist') else query_vector
+            results = (
+                dm_table.table.search(vec)
+                .where(filter_clause, prefilter=True)
+                .limit(limit)
+                .to_list()
+            )
+
+            shareable_count = len(results)
+            print(f"[retrieve_for_context] Found {shareable_count} shareable DM memories for speaker")
+
+            return [dm_table._row_to_memory_entry(r) for r in results]
+        except Exception as e:
+            print(f"[_search_shareable_dm_memories] Error: {e}")
+            return []
+
+    def _retrieve_for_group(
+        self,
+        query: str,
+        group_id: str,
+        user_id: str,
+        context: Dict[str, Any],
+        limit_per_table: int,
+        conversation_summary: str,
+        involved_users: List[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Context-aware retrieval for group conversations.
+
+        Access Rules for Group A when SPEAKER talks:
+        - SEES: Group A's memories, Group A's user memories, Group A's interactions
+        - SEES: SPEAKER's shareable DM memories (is_shareable=true)
+        - SEES: Profiles of involved_users
+        - NOT: DMs of other users, memories from other groups
+
+        Args:
+            query: Search query
+            group_id: Group ID
+            user_id: Current user ID (SPEAKER)
+            context: Full context dict
+            limit_per_table: Max results per table
+            conversation_summary: Pre-fetched conversation summary
+            involved_users: List of user IDs mentioned/involved in the query
+
+        Returns:
+            Dict with results from each table type and formatted context string
+        """
         print(f"\n[retrieve_for_context] Intelligent group retrieval for: {query}")
 
         # Step 1: Combined planning + query generation (single LLM call)
@@ -1339,17 +1565,21 @@ Return ONLY JSON.
         all_user_memories = []
         all_interaction_memories = []
         all_cross_group_memories = []
+        all_speaker_dm_memories = []
 
         def _search_group_for_query(sq: str):
-            """Search all group tables for a single query using pre-computed vector."""
+            """Search all group tables + speaker DM for a single query using pre-computed vector."""
             qv = query_vector_map[sq]
             gm = self.unified_store.search_group_memories(group_id, sq, limit=top_k, query_vector=qv)
             um = self.unified_store.search_user_memories_in_group(group_id, sq, limit=top_k, exclude_user_id=user_id, query_vector=qv)
             im = self.unified_store.search_interactions(group_id, speaker_id=user_id, query=sq, limit=top_k, query_vector=qv)
             cg = []
+            dm = []
             if user_id:
                 cg = self.unified_store.search_cross_group(user_id, sq, limit=top_k, query_vector=qv)
-            return gm, um, im, cg
+                # Search speaker's shareable DM memories in parallel
+                dm = self._search_shareable_dm_memories(sq, user_id, qv, top_k)
+            return gm, um, im, cg, dm
 
         if self.enable_parallel_retrieval and len(search_queries) > 1:
             print(f"[retrieve_for_context] Parallel fan-out: {len(search_queries)} queries x 4 tables (vectors pre-computed)")
@@ -1358,29 +1588,32 @@ Return ONLY JSON.
                     futures = {executor.submit(_search_group_for_query, sq): sq for sq in search_queries}
                     for future in concurrent.futures.as_completed(futures):
                         try:
-                            gm, um, im, cg = future.result()
+                            gm, um, im, cg, dm = future.result()
                             all_group_memories.extend(gm)
                             all_user_memories.extend(um)
                             all_interaction_memories.extend(im)
                             all_cross_group_memories.extend(cg)
+                            all_speaker_dm_memories.extend(dm)
                         except Exception as e:
                             print(f"[retrieve_for_context] Query failed: {e}")
             except Exception as e:
                 print(f"[retrieve_for_context] Parallel execution failed, falling back to sequential: {e}")
                 for sq in search_queries:
-                    gm, um, im, cg = _search_group_for_query(sq)
+                    gm, um, im, cg, dm = _search_group_for_query(sq)
                     all_group_memories.extend(gm)
                     all_user_memories.extend(um)
                     all_interaction_memories.extend(im)
                     all_cross_group_memories.extend(cg)
+                    all_speaker_dm_memories.extend(dm)
         else:
             for sq in search_queries:
                 print(f"[retrieve_for_context] Searching: {sq}")
-                gm, um, im, cg = _search_group_for_query(sq)
+                gm, um, im, cg, dm = _search_group_for_query(sq)
                 all_group_memories.extend(gm)
                 all_user_memories.extend(um)
                 all_interaction_memories.extend(im)
                 all_cross_group_memories.extend(cg)
+                all_speaker_dm_memories.extend(dm)
 
         # Step 3: BM25 keyword boost for group tables
         if use_keyword_boost and exact_match_terms:
@@ -1403,14 +1636,17 @@ Return ONLY JSON.
                 id_attr="memory_id"
             )
 
-        # Step 4: Deduplicate within each table
+        # Step 4: Deduplicate within each table (speaker DM search was done in parallel above)
         all_group_memories = self._deduplicate_by_id(all_group_memories, "memory_id")
         all_user_memories = self._deduplicate_by_id(all_user_memories, "memory_id")
         all_interaction_memories = self._deduplicate_by_id(all_interaction_memories, "memory_id")
         all_cross_group_memories = self._deduplicate_by_id(all_cross_group_memories, "memory_id")
+        all_speaker_dm_memories = self._deduplicate_by_id(all_speaker_dm_memories, "entry_id")
+
+        print(f"[retrieve_for_context] Found {len(all_speaker_dm_memories)} shareable DM memories for speaker")
 
         print(f"[retrieve_for_context] Results (pre-temporal): group={len(all_group_memories)}, user={len(all_user_memories)}, "
-              f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}")
+              f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}, speaker_dm={len(all_speaker_dm_memories)}")
 
         # Step 4.6: Apply temporal scoring (recency boost + decay)
         # This is done BEFORE reranking so the cross-encoder sees temporally-adjusted scores
@@ -1422,9 +1658,11 @@ Return ONLY JSON.
             all_interaction_memories = self._apply_temporal_scoring(all_interaction_memories)
         if all_cross_group_memories:
             all_cross_group_memories = self._apply_temporal_scoring(all_cross_group_memories)
+        if all_speaker_dm_memories:
+            all_speaker_dm_memories = self._apply_temporal_scoring(all_speaker_dm_memories)
 
         print(f"[retrieve_for_context] Results (pre-rerank): group={len(all_group_memories)}, user={len(all_user_memories)}, "
-              f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}")
+              f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}, speaker_dm={len(all_speaker_dm_memories)}")
 
         # Step 4.7: Rerank by importance score (local, no HTTP)
         rerank_top_k = limit_per_table
@@ -1433,9 +1671,11 @@ Return ONLY JSON.
         all_interaction_memories = self._rerank_with_cross_encoder(query, all_interaction_memories, rerank_top_k)
         if all_cross_group_memories:
             all_cross_group_memories = self._rerank_with_cross_encoder(query, all_cross_group_memories, rerank_top_k)
+        if all_speaker_dm_memories:
+            all_speaker_dm_memories = self._rerank_with_cross_encoder(query, all_speaker_dm_memories, rerank_top_k)
 
         print(f"[retrieve_for_context] Results (post-rerank): group={len(all_group_memories)}, user={len(all_user_memories)}, "
-              f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}")
+              f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}, speaker_dm={len(all_speaker_dm_memories)}")
 
         # Step 5: Format using existing method
         raw_results = {
@@ -1443,7 +1683,8 @@ Return ONLY JSON.
             "group_memories": all_group_memories,
             "user_memories": all_user_memories,
             "interaction_memories": all_interaction_memories,
-            "cross_group_memories": all_cross_group_memories
+            "cross_group_memories": all_cross_group_memories,
+            "speaker_dm_memories": all_speaker_dm_memories  # Speaker's shareable DM memories
         }
 
         # Step 6: Fetch relevant profiles and group context (lightweight entity system)
@@ -1502,13 +1743,26 @@ Return ONLY JSON.
 
         if self.user_profile_store:
             try:
-                relevant_profiles = self.user_profile_store.get_relevant_profiles(
-                    query=query,
-                    group_id=group_id,
-                    top_k=5
-                )
-                if relevant_profiles:
-                    print(f"[retrieve_for_context] Found {len(relevant_profiles)} relevant user profiles")
+                # Use involved_users if provided, otherwise fall back to query-based lookup
+                if involved_users:
+                    # Lookup profiles for specific users (no embedding needed)
+                    for uid in involved_users:
+                        try:
+                            profile = self.user_profile_store.get_profile_by_universal_id(uid)
+                            if profile:
+                                relevant_profiles.append(profile)
+                        except Exception as e:
+                            print(f"[retrieve_for_context] Profile lookup failed for {uid}: {e}")
+                    print(f"[retrieve_for_context] Loaded {len(relevant_profiles)} profiles for involved_users")
+                else:
+                    # Fall back to semantic profile search
+                    relevant_profiles = self.user_profile_store.get_relevant_profiles(
+                        query=query,
+                        group_id=group_id,
+                        top_k=5
+                    )
+                    if relevant_profiles:
+                        print(f"[retrieve_for_context] Found {len(relevant_profiles)} relevant user profiles")
             except Exception as e:
                 print(f"[retrieve_for_context] Profile lookup failed: {e}")
 
@@ -1855,6 +2109,80 @@ Return ONLY JSON.
 
         return "\n".join(formatted)
 
+    def _format_dm_context_with_shareable(
+        self,
+        results: Dict[str, List[Any]],
+        context: Dict[str, Any],
+        user_facts: List[Any] = None
+    ) -> str:
+        """
+        Format DM context with shareable group memories and user facts.
+
+        Access-aware formatting for DM conversations:
+        - Shows: shareable user memories from groups, cross-group patterns, user facts
+        - Hides: non-shareable memories, other users' private data
+        """
+        sections = []
+        user_id = context.get('user_id')
+
+        # User memories from groups (only shareable ones)
+        user_mems = results.get("user_memories", [])
+        if user_mems:
+            user_lines = ["## About You (from Groups)"]
+            for i, mem in enumerate(user_mems, 1):
+                username = mem.username or mem.user_id
+                source_info = f"from group context" if mem.group_id else ""
+                line = f"{i}. {mem.content}"
+                if username:
+                    line = f"{i}. [{username}] {mem.content}"
+                if source_info:
+                    line += f" ({source_info})"
+                user_lines.append(line)
+            sections.append("\n".join(user_lines))
+
+        # Cross-group memories
+        cross_mems = results.get("cross_group_memories", [])
+        if cross_mems:
+            cross_lines = ["## Your Profile (Across All Groups)"]
+            for i, mem in enumerate(cross_mems, 1):
+                groups = ", ".join(mem.groups_involved[:3])
+                if len(mem.groups_involved) > 3:
+                    groups += f" (+{len(mem.groups_involved) - 3} more)"
+                line = f"{i}. {mem.content}"
+                line += f" (seen in: {groups})"
+                if mem.confidence_score:
+                    line += f" [confidence: {mem.confidence_score:.0%}]"
+                cross_lines.append(line)
+            sections.append("\n".join(cross_lines))
+
+        # User facts
+        if user_facts:
+            fact_lines = ["## Facts About You"]
+            # Group by fact type
+            facts_by_type = {}
+            for fact in user_facts:
+                ft = fact.fact_type.value if hasattr(fact.fact_type, 'value') else fact.fact_type
+                if ft not in facts_by_type:
+                    facts_by_type[ft] = []
+                facts_by_type[ft].append(fact)
+
+            for fact_type, facts in facts_by_type.items():
+                type_header = f"### {fact_type.title()}"
+                fact_lines.append(type_header)
+                for fact in facts[:5]:  # Limit to 5 per type
+                    line = f"- {fact.content}"
+                    if fact.confidence:
+                        line += f" [{fact.confidence:.0%}]"
+                    fact_lines.append(line)
+                if len(facts) > 5:
+                    fact_lines.append(f"- ... and {len(facts) - 5} more")
+            sections.append("\n".join(fact_lines))
+
+        if not sections:
+            return "[No relevant memories found. Start a conversation and I'll remember things about you!]"
+
+        return "\n\n".join(sections)
+
     def _format_multi_table_context(
         self,
         results: Dict[str, List[Any]],
@@ -1919,30 +2247,49 @@ Return ONLY JSON.
                 cross_lines.append(line)
             sections.append("\n".join(cross_lines))
 
+        # Speaker's shareable DM memories (what the current speaker shared privately)
+        speaker_dm_mems = results.get("speaker_dm_memories", [])
+        if speaker_dm_mems:
+            speaker_dm_lines = ["## Speaker's Personal Context (shareable)"]
+            for i, entry in enumerate(speaker_dm_mems, 1):
+                content = getattr(entry, 'lossless_restatement', None) or getattr(entry, 'content', str(entry))
+                line = f"{i}. {content}"
+                timestamp = getattr(entry, 'timestamp', None)
+                if timestamp:
+                    line += f" ({timestamp})"
+                speaker_dm_lines.append(line)
+            sections.append("\n".join(speaker_dm_lines))
+
         if not sections:
             return "[No relevant memories found]"
 
         return "\n\n".join(sections)
 
     def _build_summary_context(self, summaries: Dict[str, List]) -> str:
-        """Build context string from hierarchical summaries."""
+        """Build context string from hierarchical summaries (micro/chunk/block)."""
         parts = []
 
-        if summaries.get("monthly"):
-            s = summaries["monthly"][0]
-            parts.append(f"Last month ({s.period_start[:7]}): {s.summary}")
+        # Block summaries (highest level - ~1250 messages each)
+        if summaries.get("block"):
+            for s in summaries["block"][:2]:
+                topics_str = ", ".join(s.topics[:3]) if s.topics else "general discussion"
+                parts.append(f"[Historical] Messages {s.message_start}-{s.message_end}: {s.summary} (Topics: {topics_str})")
 
-        if summaries.get("weekly"):
-            for s in summaries["weekly"][:2]:
-                parts.append(f"Week of {s.period_start}: {s.summary}")
+        # Chunk summaries (mid level - ~250 messages each)
+        if summaries.get("chunk"):
+            for s in summaries["chunk"][:3]:
+                topics_str = ", ".join(s.topics[:3]) if s.topics else "general"
+                parts.append(f"[Recent period] Messages {s.message_start}-{s.message_end}: {s.summary}")
 
-        if summaries.get("daily"):
-            recent = summaries["daily"][:3]
-            if recent:
-                parts.append("Recent days: " + " | ".join([
-                    f"{s.period_start[-5:]}: {s.topics[0] if s.topics else 'general'}"
-                    for s in recent
-                ]))
+        # Micro summaries (lowest level - ~50 messages each)
+        if summaries.get("micro"):
+            micro_summaries = summaries["micro"][:5]
+            if micro_summaries:
+                micro_parts = []
+                for s in micro_summaries:
+                    topic = s.topics[0] if s.topics else "discussion"
+                    micro_parts.append(f"msgs {s.message_start}-{s.message_end}: {topic}")
+                parts.append(f"[Latest activity] {' | '.join(micro_parts)}")
 
         return "\n".join(parts) if parts else ""
 

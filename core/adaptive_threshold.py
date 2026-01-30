@@ -452,6 +452,125 @@ class AdaptiveThresholdManager:
         except:
             return False
 
+    def get_user_spam_info(self, agent_id: str, group_id: str, user_id: str) -> dict:
+        """Get spam information for a user."""
+        doc_id = f"{self._get_doc_id(agent_id, group_id)}_spam_{user_id.replace(':', '_')}"
+        cfg = self.threshold_config
+
+        default_info = {
+            "user_id": user_id,
+            "agent_id": agent_id,
+            "group_id": group_id,
+            "spam_score": 0.0,
+            "is_blocked": False,
+            "block_threshold": cfg.spam_block_threshold,
+            "total_spam_count": 0,
+            "last_update": None
+        }
+
+        if self._use_memory:
+            data = self._memory_store.get(doc_id)
+            if data:
+                spam_score = data.get("spam_score", 0.0)
+                return {
+                    **default_info,
+                    "spam_score": spam_score,
+                    "is_blocked": spam_score >= cfg.spam_block_threshold,
+                    "total_spam_count": data.get("total_spam_count", 0),
+                    "last_update": data.get("last_update")
+                }
+            return default_info
+
+        try:
+            doc = self._get_db().collection("spam_scores").document(doc_id).get()
+            if doc.exists:
+                data = doc.to_dict()
+                spam_score = data.get("spam_score", 0.0)
+                last_update = data.get("last_update")
+                if hasattr(last_update, 'isoformat'):
+                    last_update = last_update.isoformat()
+                return {
+                    **default_info,
+                    "spam_score": spam_score,
+                    "is_blocked": spam_score >= cfg.spam_block_threshold,
+                    "total_spam_count": data.get("total_spam_count", 0),
+                    "last_update": last_update
+                }
+            return default_info
+        except Exception as e:
+            print(f"[SpamInfo] Error: {e}")
+            return default_info
+
+    def unblock_user(self, agent_id: str, group_id: str, user_id: str) -> dict:
+        """Manually unblock a user by resetting their spam score."""
+        doc_id = f"{self._get_doc_id(agent_id, group_id)}_spam_{user_id.replace(':', '_')}"
+
+        if self._use_memory:
+            self._memory_store.set(doc_id, {
+                "spam_score": 0.0,
+                "last_update": time.time(),
+                "manually_unblocked": True,
+                "unblocked_at": time.time()
+            }, merge=True)
+            return {"success": True, "new_spam_score": 0.0}
+
+        try:
+            from google.cloud import firestore
+            doc_ref = self._get_db().collection("spam_scores").document(doc_id)
+            doc_ref.set({
+                "spam_score": 0.0,
+                "last_update": firestore.SERVER_TIMESTAMP,
+                "manually_unblocked": True,
+                "unblocked_at": firestore.SERVER_TIMESTAMP
+            }, merge=True)
+            return {"success": True, "new_spam_score": 0.0}
+        except Exception as e:
+            print(f"[Unblock] Error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_blocked_users(self, agent_id: str, group_id: str = None) -> list:
+        """Get all blocked users for an agent (optionally filtered by group)."""
+        cfg = self.threshold_config
+        blocked = []
+
+        if self._use_memory:
+            # In-memory: scan all spam docs
+            prefix = f"{agent_id}_"
+            for key, data in self._memory_store._store.items():
+                if key.startswith(prefix) and "_spam_" in key:
+                    if data.get("spam_score", 0.0) >= cfg.spam_block_threshold:
+                        blocked.append({
+                            "doc_id": key,
+                            "spam_score": data.get("spam_score", 0.0),
+                            "total_spam_count": data.get("total_spam_count", 0)
+                        })
+            return blocked
+
+        try:
+            query = self._get_db().collection("spam_scores").where(
+                "agent_id", "==", agent_id
+            ).where(
+                "spam_score", ">=", cfg.spam_block_threshold
+            )
+
+            if group_id:
+                query = query.where("group_id", "==", group_id)
+
+            docs = query.get()
+            for doc in docs:
+                data = doc.to_dict()
+                blocked.append({
+                    "doc_id": doc.id,
+                    "user_id": data.get("user_id"),
+                    "group_id": data.get("group_id"),
+                    "spam_score": data.get("spam_score", 0.0),
+                    "total_spam_count": data.get("total_spam_count", 0)
+                })
+            return blocked
+        except Exception as e:
+            print(f"[BlockedUsers] Error: {e}")
+            return []
+
     def record_message(
         self,
         agent_id: str,
