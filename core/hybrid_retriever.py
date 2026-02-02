@@ -32,6 +32,8 @@ import dateparser
 import concurrent.futures
 import numpy as np
 from lancedb.rerankers import RRFReranker
+from core.rerankers import get_cross_encoder_reranker
+import pyarrow as pa
 
 
 class HybridRetriever:
@@ -184,8 +186,8 @@ class HybridRetriever:
         if merged_results:
             merged_results = self._apply_temporal_scoring(merged_results)
 
-        # Final step: Rerank with cross-encoder
-        if len(merged_results) > 10:
+        # Final step: Rerank with cross-encoder (always run to ensure semantic ordering)
+        if merged_results:
             merged_results = self._rerank_with_cross_encoder(query, merged_results, top_k=10)
 
         return merged_results
@@ -1304,7 +1306,12 @@ Return ONLY JSON.
         """
         group_id = context.get('group_id')
         user_id = context.get('user_id')
-        is_group = group_id is not None and not group_id.startswith('dm_')
+        is_dm_with_group_reference = context.get('is_dm_with_group_reference', False)
+
+        # Determine if this is a group context or DM context
+        # Important: if is_dm_with_group_reference is True, this is a DM asking about a group,
+        # so we should take the DM path (which will search in the reference group)
+        is_group = group_id is not None and not group_id.startswith('dm_') and not is_dm_with_group_reference
 
         # Fetch conversation summary
         conversation_summary = self._fetch_conversation_summary(group_id, user_id)
@@ -1357,40 +1364,40 @@ Return ONLY JSON.
         query_vectors = self.unified_store.embedding_model.encode_query(search_queries)
         query_vector_map = {sq: query_vectors[i] for i, sq in enumerate(search_queries)}
 
-        # Step 3: Search ONLY shareable user memories (from groups) for this user
-        shareable_group_memories = []
-        if self.enable_parallel_retrieval and len(search_queries) > 1:
-            print(f"[DM Retrieval] Parallel search for shareable user memories")
-            try:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_retrieval_workers) as executor:
-                    futures = {
-                        executor.submit(self._search_shareable_user_memories, sq, user_id, query_vector_map[sq], top_k): sq
-                        for sq in search_queries
-                    }
-                    for future in concurrent.futures.as_completed(futures):
-                        try:
-                            results = future.result()
-                            shareable_group_memories.extend(results)
-                        except Exception as e:
-                            print(f"[DM Retrieval] Query failed: {e}")
-            except Exception as e:
-                print(f"[DM Retrieval] Parallel execution failed: {e}")
-                for sq in search_queries:
-                    results = self._search_shareable_user_memories(sq, user_id, query_vector_map[sq], top_k)
-                    shareable_group_memories.extend(results)
-        else:
+        # Step 3: Search DM memories (from dm_memories table)
+        dm_memories = []
+        try:
             for sq in search_queries:
-                results = self._search_shareable_user_memories(sq, user_id, query_vector_map[sq], top_k)
-                shareable_group_memories.extend(results)
+                qv = query_vector_map[sq]
+                results = self.unified_store.search_memories(sq, user_id=user_id, top_k=top_k, query_vector=qv)
+                dm_memories.extend(results)
+            dm_memories = self._deduplicate_by_id(dm_memories, "entry_id")
+            # Apply content-based deduplication to remove near-duplicates
+            # Higher threshold (0.95) because e5-small has high similarity for structurally similar texts
+            dm_memories = self._deduplicate_by_content(dm_memories, "dm_memories", similarity_threshold=0.95)
+            print(f"[DM Retrieval] Found {len(dm_memories)} DM memories")
+        except Exception as e:
+            print(f"[DM Retrieval] DM memories search failed: {e}")
 
-        # Deduplicate
-        shareable_group_memories = self._deduplicate_by_id(shareable_group_memories, "memory_id")
-        print(f"[DM Retrieval] Found {len(shareable_group_memories)} shareable user memories")
+        # Step 4: Search user memories from groups for this user (context from group interactions)
+        user_memories_from_groups = []
+        try:
+            if hasattr(self.unified_store, 'user_memories'):
+                for sq in search_queries:
+                    qv = query_vector_map[sq]
+                    # Search user memories where this user participated
+                    results = self.unified_store.user_memories.search_by_user(user_id, qv, top_k)
+                    user_memories_from_groups.extend(results)
+                user_memories_from_groups = self._deduplicate_by_id(user_memories_from_groups, "memory_id")
+                print(f"[DM Retrieval] Found {len(user_memories_from_groups)} user memories from groups")
+        except Exception as e:
+            print(f"[DM Retrieval] User memories search failed: {e}")
 
-        # Step 4: Search cross-group memories for this user
+        # Step 5: Search cross-group memories for this user
         cross_group_memories = []
         if user_id:
-            universal_id = f"telegram:{user_id}"  # Assuming telegram for now
+            # Use user_id directly if it already has platform prefix, otherwise assume format
+            universal_id = user_id if ':' in user_id else f"telegram:{user_id}"
             for sq in search_queries:
                 qv = query_vector_map[sq]
                 try:
@@ -1401,35 +1408,96 @@ Return ONLY JSON.
 
         cross_group_memories = self._deduplicate_by_id(cross_group_memories, "memory_id")
 
-        # Step 5: Apply temporal scoring
-        if shareable_group_memories:
-            shareable_group_memories = self._apply_temporal_scoring(shareable_group_memories)
+        # Step 5b: If reference_group_id provided, search in that specific group
+        group_memories = []
+        reference_group_id = context.get('group_id')  # This is the reference group for cross-context
+        if reference_group_id and context.get('is_dm_with_group_reference'):
+            print(f"[DM Retrieval] Cross-context: searching in reference group {reference_group_id}")
+            try:
+                for sq in search_queries:
+                    qv = query_vector_map[sq]
+                    # Search group memories
+                    gm = self.unified_store.search_group_memories(reference_group_id, sq, limit=top_k, query_vector=qv)
+                    group_memories.extend(gm)
+                    # Search user memories in that group
+                    um = self.unified_store.search_user_memories_in_group(reference_group_id, sq, limit=top_k, query_vector=qv)
+                    user_memories_from_groups.extend(um)
+                group_memories = self._deduplicate_by_id(group_memories, "memory_id")
+                user_memories_from_groups = self._deduplicate_by_id(user_memories_from_groups, "memory_id")
+                print(f"[DM Retrieval] Found {len(group_memories)} group memories from reference group")
+            except Exception as e:
+                print(f"[DM Retrieval] Reference group search failed: {e}")
+
+        # Step 5c: Search memories about involved/mentioned users
+        involved_user_memories = []
+        involved_users = context.get('involved_users', [])
+        if involved_users:
+            print(f"[DM Retrieval] Searching for involved users: {involved_users}")
+            fact_store = getattr(self, 'fact_store', None) or getattr(self.unified_store, 'fact_store', None)
+            for involved_user_id in involved_users:
+                try:
+                    # Get facts about the mentioned user
+                    if fact_store:
+                        facts = fact_store.get_user_facts(involved_user_id, min_confidence=0.3)
+                        for fact in facts[:5]:  # Limit per user
+                            involved_user_memories.append({
+                                "type": "user_fact",
+                                "user_id": involved_user_id,
+                                "content": fact.content,
+                                "fact_type": fact.fact_type.value if hasattr(fact.fact_type, 'value') else fact.fact_type
+                            })
+                    # Get user memories from groups
+                    if hasattr(self.unified_store, 'user_memories'):
+                        for sq in search_queries[:2]:  # Limit queries
+                            qv = query_vector_map[sq]
+                            um = self.unified_store.user_memories.search_by_user(involved_user_id, qv, 3)
+                            for m in um:
+                                involved_user_memories.append({
+                                    "type": "user_memory",
+                                    "user_id": involved_user_id,
+                                    "content": m.content,
+                                    "group_id": m.group_id
+                                })
+                except Exception as e:
+                    print(f"[DM Retrieval] Search for involved user {involved_user_id} failed: {e}")
+            print(f"[DM Retrieval] Found {len(involved_user_memories)} memories about involved users")
+
+        # Step 6: Apply temporal scoring to all memory types
+        if dm_memories:
+            dm_memories = self._apply_temporal_scoring(dm_memories)
+        if user_memories_from_groups:
+            user_memories_from_groups = self._apply_temporal_scoring(user_memories_from_groups)
         if cross_group_memories:
             cross_group_memories = self._apply_temporal_scoring(cross_group_memories)
 
-        # Step 6: Rerank and limit
-        shareable_group_memories = self._rerank_with_cross_encoder(query, shareable_group_memories, limit)
+        # Step 7: Rerank and limit
+        if dm_memories:
+            dm_memories = self._rerank_with_cross_encoder(query, dm_memories, limit)
+        if user_memories_from_groups:
+            user_memories_from_groups = self._rerank_with_cross_encoder(query, user_memories_from_groups, limit)
         if cross_group_memories:
             cross_group_memories = self._rerank_with_cross_encoder(query, cross_group_memories, limit)
 
-        print(f"[DM Retrieval] Results: shareable={len(shareable_group_memories)}, cross_group={len(cross_group_memories)}")
+        print(f"[DM Retrieval] Results: dm={len(dm_memories)}, user_from_groups={len(user_memories_from_groups)}, cross_group={len(cross_group_memories)}")
 
-        # Step 7: Get user facts (if fact store is available)
+        # Step 8: Get user facts (if fact store is available)
         user_facts = []
-        if hasattr(self.unified_store, 'fact_store') and self.unified_store.fact_store:
+        fact_store = getattr(self, 'fact_store', None) or getattr(self.unified_store, 'fact_store', None)
+        if fact_store:
             try:
-                user_facts = self.unified_store.fact_store.get_user_facts(user_id, min_confidence=0.3)
+                user_facts = fact_store.get_user_facts(user_id, min_confidence=0.3)
                 print(f"[DM Retrieval] Found {len(user_facts)} user facts")
             except Exception as e:
                 print(f"[DM Retrieval] Fact store lookup failed: {e}")
 
-        # Step 8: Format results
+        # Step 9: Format results
         raw_results = {
-            "dm_memories": [],  # No DM memories in unified store yet
-            "group_memories": [],
-            "user_memories": shareable_group_memories,
+            "dm_memories": dm_memories,
+            "group_memories": group_memories,
+            "user_memories": user_memories_from_groups,
             "interaction_memories": [],
-            "cross_group_memories": cross_group_memories
+            "cross_group_memories": cross_group_memories,
+            "involved_user_memories": involved_user_memories
         }
 
         formatted = self._format_dm_context_with_shareable(raw_results, context, user_facts)
@@ -1642,6 +1710,16 @@ Return ONLY JSON.
         all_interaction_memories = self._deduplicate_by_id(all_interaction_memories, "memory_id")
         all_cross_group_memories = self._deduplicate_by_id(all_cross_group_memories, "memory_id")
         all_speaker_dm_memories = self._deduplicate_by_id(all_speaker_dm_memories, "entry_id")
+
+        # Step 4.5: Apply content-based deduplication to remove near-duplicates
+        # Higher threshold (0.95) because e5-small has high similarity for structurally similar texts
+        all_group_memories = self._deduplicate_by_content(all_group_memories, "group_memories", similarity_threshold=0.95)
+        all_user_memories = self._deduplicate_by_content(all_user_memories, "user_memories", similarity_threshold=0.95)
+        all_interaction_memories = self._deduplicate_by_content(all_interaction_memories, "interaction_memories", similarity_threshold=0.95)
+        if all_cross_group_memories:
+            all_cross_group_memories = self._deduplicate_by_content(all_cross_group_memories, "cross_group_memories", similarity_threshold=0.95)
+        if all_speaker_dm_memories:
+            all_speaker_dm_memories = self._deduplicate_by_content(all_speaker_dm_memories, "speaker_dm_memories", similarity_threshold=0.95)
 
         print(f"[retrieve_for_context] Found {len(all_speaker_dm_memories)} shareable DM memories for speaker")
 
@@ -1960,29 +2038,86 @@ Return ONLY JSON.
         self,
         query: str,
         items: list,
-        top_k: int = 10
+        top_k: int = 10,
+        text_field: str = "lossless_restatement",
+        force_rerank: bool = True
     ) -> list:
         """
-        Rerank items using importance_score as a local ranking signal.
+        Rerank items using LanceDB's native CrossEncoderReranker.
 
-        Previously used HTTP calls to a0x-models /rerank (cross-encoder).
-        Now uses local importance_score sorting to avoid network latency.
-        The main reranking for group queries is done via LanceDB's RRF hybrid search.
+        Implements "Solution B: Reranking post-retrieval" from the plan.
 
-        For DM path, the vector similarity ranking from LanceDB (cosine) is already
-        good enough — this just trims to top_k with importance tiebreaking.
+        Args:
+            force_rerank: If True, always run reranker even if items <= top_k
+                         This ensures semantic relevance ordering even for small result sets
+        Converts Python objects to PyArrow table, reranks, and converts back.
+
+        Falls back to importance_score sorting if reranking fails.
+
+        Args:
+            query: Search query for reranking
+            items: List of memory objects to rerank
+            top_k: Number of top results to return
+            text_field: Field name to use as text content (default: lossless_restatement)
+
+        Returns:
+            Reranked list of items
         """
         if not items or len(items) <= 1:
             return items
 
-        # Sort by importance_score descending (tiebreak preserves vector similarity order)
-        def _get_score(item):
-            if hasattr(item, 'importance_score'):
-                return item.importance_score
-            return 0.5
+        # If items count is already <= top_k and force_rerank is False, return as-is
+        # With force_rerank=True, we still run reranking to ensure semantic ordering
+        if len(items) <= top_k and not force_rerank:
+            return items
 
-        sorted_items = sorted(items, key=_get_score, reverse=True)
-        return sorted_items[:top_k]
+        try:
+            reranker = get_cross_encoder_reranker()
+
+            # Convert items to PyArrow table
+            data = []
+            for idx, item in enumerate(items):
+                # Get text content - try multiple possible fields
+                content = getattr(item, text_field, None)
+                if content is None:
+                    content = getattr(item, 'content', None)
+                if content is None:
+                    content = getattr(item, 'lossless_restatement', '')
+                if not isinstance(content, str):
+                    content = str(content) if content else ''
+
+                data.append({
+                    "text": content,
+                    "_original_index": idx,
+                    "_distance": float(idx) / max(len(items), 1),  # Dummy distance for reranker
+                    "importance_score": getattr(item, 'importance_score', 0.5)
+                })
+
+            table = pa.Table.from_pylist(data)
+
+            # Use rerank_vector (requires _distance column for LanceDB rerankers)
+            reranked_table = reranker.rerank_vector(query, table)
+            reranked = reranked_table.to_pylist()
+
+            # Retrieve original items in new order (sorted by relevance_score descending)
+            reranked_items = []
+            for row in reranked[:top_k]:
+                original_idx = int(row["_original_index"])
+                reranked_items.append(items[original_idx])
+
+            print(f"[rerank] Cross-encoder reranked {len(items)} → {len(reranked_items)} items (query: {query[:50]}...)")
+            return reranked_items
+
+        except Exception as e:
+            print(f"[rerank] CrossEncoderReranker failed: {e}, fallback to importance_score sorting")
+            # Fallback: Sort by importance_score descending
+            def _get_score(item):
+                if hasattr(item, 'importance_score'):
+                    return item.importance_score
+                return 0.5
+
+            sorted_items = sorted(items, key=_get_score, reverse=True)
+            return sorted_items[:top_k]
 
     def _apply_temporal_scoring(
         self,
@@ -2116,16 +2251,32 @@ Return ONLY JSON.
         user_facts: List[Any] = None
     ) -> str:
         """
-        Format DM context with shareable group memories and user facts.
+        Format DM context with DM memories, shareable group memories and user facts.
 
         Access-aware formatting for DM conversations:
-        - Shows: shareable user memories from groups, cross-group patterns, user facts
+        - Shows: DM history, shareable user memories from groups, cross-group patterns, user facts
         - Hides: non-shareable memories, other users' private data
         """
         sections = []
         user_id = context.get('user_id')
 
-        # User memories from groups (only shareable ones)
+        # DM memories (conversation history with this user)
+        dm_mems = results.get("dm_memories", [])
+        if dm_mems:
+            dm_lines = ["## Previous Conversations"]
+            for i, mem in enumerate(dm_mems[:10], 1):  # Limit to 10 most relevant
+                # MemoryEntry uses lossless_restatement
+                content = getattr(mem, 'lossless_restatement', str(mem))
+                topic = getattr(mem, 'topic', None)
+                line = f"{i}. {content}"
+                if topic:
+                    line += f" (topic: {topic})"
+                dm_lines.append(line)
+            if len(dm_mems) > 10:
+                dm_lines.append(f"... and {len(dm_mems) - 10} more memories")
+            sections.append("\n".join(dm_lines))
+
+        # User memories from groups (context from group interactions)
         user_mems = results.get("user_memories", [])
         if user_mems:
             user_lines = ["## About You (from Groups)"]
@@ -2139,6 +2290,44 @@ Return ONLY JSON.
                     line += f" ({source_info})"
                 user_lines.append(line)
             sections.append("\n".join(user_lines))
+
+        # Group memories (from reference group in cross-context query)
+        group_mems = results.get("group_memories", [])
+        if group_mems:
+            ref_group = context.get('group_id', 'referenced group')
+            group_lines = [f"## From Group ({ref_group})"]
+            for i, mem in enumerate(group_mems[:10], 1):
+                content = getattr(mem, 'content', str(mem))
+                speaker = getattr(mem, 'speaker', None)
+                line = f"{i}. {content}"
+                if speaker:
+                    line = f"{i}. [{speaker}] {content}"
+                group_lines.append(line)
+            sections.append("\n".join(group_lines))
+
+        # Involved/mentioned users (facts and memories about them)
+        involved_mems = results.get("involved_user_memories", [])
+        if involved_mems:
+            involved_lines = ["## About Mentioned Users"]
+            # Group by user
+            by_user = {}
+            for mem in involved_mems:
+                uid = mem.get("user_id", "unknown")
+                if uid not in by_user:
+                    by_user[uid] = []
+                by_user[uid].append(mem)
+
+            for uid, mems in by_user.items():
+                involved_lines.append(f"### {uid}")
+                for mem in mems[:5]:
+                    content = mem.get("content", "")
+                    mem_type = mem.get("type", "")
+                    fact_type = mem.get("fact_type", "")
+                    if fact_type:
+                        involved_lines.append(f"- [{fact_type}] {content}")
+                    else:
+                        involved_lines.append(f"- {content}")
+            sections.append("\n".join(involved_lines))
 
         # Cross-group memories
         cross_mems = results.get("cross_group_memories", [])

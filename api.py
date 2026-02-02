@@ -217,13 +217,25 @@ class ContextResponse(BaseModel):
 
 class PlatformIdentity(BaseModel):
     """Platform-specific identity info"""
-    platform: str  # telegram, twitter, xmtp, farcaster
+    platform: str  # telegram, twitter, xmtp, farcaster, direct
     telegramId: Optional[int] = None
     chatId: Optional[str] = None
     groupId: Optional[str] = None
     username: Optional[str] = None
     walletAddress: Optional[str] = None
     basename: Optional[str] = None
+    clientId: Optional[str] = None  # For direct platform (web clients)
+
+
+class UnifiedAgentResponseRequest(BaseModel):
+    """Request to add agent response with platform identity"""
+    agent_id: str
+    response: str
+    platform_identity: PlatformIdentity
+    trigger_message: Optional[str] = None
+    trigger_message_id: Optional[str] = None
+    timestamp: Optional[str] = None
+    role: str = "assistant"  # Always assistant for agent responses
 
 
 class PassiveMemoryRequest(BaseModel):
@@ -232,6 +244,7 @@ class PassiveMemoryRequest(BaseModel):
     message: str
     platform_identity: PlatformIdentity
     speaker: Optional[str] = None
+    speaker_identity: Optional[PlatformIdentity] = None  # Identity of the speaker (for creating their profile)
     metadata: Optional[Dict[str, Any]] = None
 
 
@@ -241,6 +254,7 @@ class ActiveMemoryRequest(BaseModel):
     message: str
     platform_identity: PlatformIdentity
     speaker: Optional[str] = None
+    speaker_identity: Optional[PlatformIdentity] = None  # Identity of the speaker (for creating their profile)
     return_context: bool = True
     context_limit: int = 10
     metadata: Optional[Dict[str, Any]] = None
@@ -255,6 +269,7 @@ class ContextQueryRequest(BaseModel):
     recent_limit: int = 10
     memory_limit: int = 5
     involved_users: Optional[List[str]] = None  # Users mentioned/involved in the query (e.g., ["telegram:88001"])
+    reference_group_id: Optional[str] = None  # Group to search when asking about group context from DM
 
 
 class UnifiedContextResponse(BaseModel):
@@ -264,6 +279,8 @@ class UnifiedContextResponse(BaseModel):
     relevant_memories: List[Dict[str, Any]] = []
     user_profile: Optional[Dict[str, Any]] = None
     group_profile: Optional[Dict[str, Any]] = None
+    user_facts: List[Dict[str, Any]] = []
+    similar_agent_responses: List[Dict[str, Any]] = []  # Previous similar Q&A
     formatted_context: str = ""
 
 
@@ -1227,24 +1244,49 @@ async def add_agent_response(memory_id: str, request: AgentResponseRequest):
 # ============================================================================
 
 def _extract_identity_info(platform_identity: PlatformIdentity) -> Dict[str, Any]:
-    """Extract group_id, user_id, etc from platform_identity."""
+    """
+    Extract group_id, user_id, etc from platform_identity.
+
+    Platform-specific logic:
+    - telegram: Negative chatId = group (e.g., "-123456" or "telegram_-123456")
+    - direct/xmtp/farcaster/twitter: Any chatId = group/channel context
+
+    This allows non-Telegram platforms to use chatId for public spaces like:
+    - Social feeds: chatId="moltbook_feed"
+    - Threads: chatId="moltbook_thread_abc123"
+    - Channels: chatId="discord_general"
+    """
     platform = platform_identity.platform
 
-    # Determine if group or DM
+    # Determine if group or DM based on chatId
     chat_id = platform_identity.chatId or platform_identity.groupId
     is_group = False
     group_id = None
 
     if chat_id:
-        # Negative chatId = group in Telegram
-        if str(chat_id).startswith('-') or str(chat_id).startswith('telegram_-'):
+        chat_id_str = str(chat_id)
+
+        if platform == "telegram":
+            # Telegram: Only negative chatId = group
+            if chat_id_str.startswith('-') or chat_id_str.startswith('telegram_-'):
+                is_group = True
+                group_id = chat_id_str if chat_id_str.startswith('telegram_') else f"telegram_{chat_id_str}"
+        else:
+            # Other platforms (direct, xmtp, farcaster, twitter, etc.):
+            # Any chatId = group/channel context
             is_group = True
-            group_id = chat_id if str(chat_id).startswith('telegram_') else f"telegram_{chat_id}"
+            # Prefix with platform if not already prefixed
+            if chat_id_str.startswith(f"{platform}_"):
+                group_id = chat_id_str
+            else:
+                group_id = f"{platform}_{chat_id_str}"
 
     # Build user_id
     user_id = None
     if platform_identity.telegramId:
         user_id = f"{platform}:{platform_identity.telegramId}"
+    elif platform_identity.clientId:
+        user_id = f"{platform}:{platform_identity.clientId}"
     elif platform_identity.walletAddress:
         user_id = f"{platform}:{platform_identity.walletAddress}"
     elif platform_identity.username:
@@ -1271,12 +1313,27 @@ async def add_passive_memory(request: PassiveMemoryRequest, background_tasks: Ba
     - Checks batch threshold
     - If threshold met, schedules processing in background (non-blocking)
     - Returns immediately
+
+    Optional: speaker_identity - If provided, facts will be extracted to the speaker's profile
+    instead of the observer's profile. Useful when observing posts from other agents.
     """
     identity = _extract_identity_info(request.platform_identity)
+
+    # Extract speaker's user_id if speaker_identity is provided
+    # This allows facts to be extracted for the speaker's profile
+    speaker_user_id = None
+    if request.speaker_identity:
+        speaker_info = _extract_identity_info(request.speaker_identity)
+        speaker_user_id = speaker_info.get('user_id')
 
     # Build memory_id - always include colon so parse_memory_id extracts agent_id correctly
     memory_id = f"{request.agent_id}:{identity['user_id'] or ''}"
     system = get_memory_system(memory_id)
+
+    # Build metadata with speaker_user_id if available
+    msg_metadata = request.metadata.copy() if request.metadata else {}
+    if speaker_user_id:
+        msg_metadata['speaker_user_id'] = speaker_user_id
 
     # Step 1: Add to Firestore only (fast, no LLM processing)
     result = system.add_dialogue(
@@ -1287,7 +1344,8 @@ async def add_passive_memory(request: PassiveMemoryRequest, background_tasks: Ba
         user_id=identity['user_id'],
         username=identity['username'],
         add_to_firestore=True,
-        use_stateless_processing=False  # Don't process synchronously
+        use_stateless_processing=False,  # Don't process synchronously
+        metadata=msg_metadata if msg_metadata else None
     )
 
     # Step 2: Check if we should trigger background processing
@@ -1336,7 +1394,7 @@ async def add_passive_memory(request: PassiveMemoryRequest, background_tasks: Ba
         schedule_task(process_batch)
         print(f"[Passive] Scheduled background processing for {effective_group_id}")
 
-    return {
+    response_data = {
         "success": result.get("added", False),
         "is_group": identity['is_group'],
         "group_id": identity['group_id'],
@@ -1349,6 +1407,12 @@ async def add_passive_memory(request: PassiveMemoryRequest, background_tasks: Ba
         "spam_score": result.get("spam_score", 0.0)
     }
 
+    # Include speaker_user_id if it was provided (for tracking speaker profiles)
+    if speaker_user_id:
+        response_data["speaker_user_id"] = speaker_user_id
+
+    return response_data
+
 
 @app.post("/v1/memory/active")
 async def add_active_memory(request: ActiveMemoryRequest):
@@ -1359,12 +1423,25 @@ async def add_active_memory(request: ActiveMemoryRequest):
     - Adds to Firestore window (fast)
     - Returns context for response generation
     - Schedules batch processing in background if threshold reached
+
+    Optional: speaker_identity - If provided, facts will be extracted to the speaker's profile.
     """
     identity = _extract_identity_info(request.platform_identity)
+
+    # Extract speaker's user_id if speaker_identity is provided
+    speaker_user_id = None
+    if request.speaker_identity:
+        speaker_info = _extract_identity_info(request.speaker_identity)
+        speaker_user_id = speaker_info.get('user_id')
 
     # Build memory_id - always include colon so parse_memory_id extracts agent_id correctly
     memory_id = f"{request.agent_id}:{identity['user_id'] or ''}"
     system = get_memory_system(memory_id)
+
+    # Build metadata with speaker_user_id if available
+    msg_metadata = request.metadata.copy() if request.metadata else {}
+    if speaker_user_id:
+        msg_metadata['speaker_user_id'] = speaker_user_id
 
     # Step 1: Add to Firestore only (fast, no LLM processing)
     result = system.add_dialogue(
@@ -1375,7 +1452,8 @@ async def add_active_memory(request: ActiveMemoryRequest):
         user_id=identity['user_id'],
         username=identity['username'],
         add_to_firestore=True,
-        use_stateless_processing=False  # Don't process synchronously
+        use_stateless_processing=False,  # Don't process synchronously
+        metadata=msg_metadata if msg_metadata else None
     )
 
     effective_group_id = identity['group_id'] or f"dm_{identity['user_id']}"
@@ -1443,6 +1521,53 @@ async def add_active_memory(request: ActiveMemoryRequest):
     return response
 
 
+@app.post("/v1/memory/agent-response")
+async def add_unified_agent_response(request: UnifiedAgentResponseRequest):
+    """
+    Add agent response to memory (unified endpoint).
+
+    Used to store agent responses for:
+    - Immediate context (Firestore window)
+    - Semantic search (LanceDB - processed in background)
+    """
+    identity = _extract_identity_info(request.platform_identity)
+
+    memory_id = f"{request.agent_id}:{identity['user_id'] or ''}"
+    system = get_memory_system(memory_id)
+
+    # Determine effective group_id
+    effective_group_id = identity['group_id'] or (f"dm_{identity['user_id']}" if identity['user_id'] else None)
+
+    try:
+        # Add to Firestore window (uses the add_dialogue method with role=assistant)
+        result = system.add_dialogue(
+            speaker=request.agent_id,  # Agent is the speaker
+            content=request.response,
+            timestamp=request.timestamp,
+            platform=identity['platform'],
+            group_id=identity['group_id'],
+            user_id=identity['user_id'],
+            username=request.agent_id,
+            role="assistant",
+            metadata={
+                "is_agent_response": True,
+                "trigger_message": request.trigger_message,
+                "trigger_message_id": request.trigger_message_id
+            }
+        )
+
+        return {
+            "success": True,
+            "agent_id": request.agent_id,
+            "effective_group_id": effective_group_id,
+            "user_id": identity['user_id'],
+            "added": result.get("added", False)
+        }
+    except Exception as e:
+        print(f"[API] Error adding agent response: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/v1/memory/context")
 async def get_memory_context(request: ContextQueryRequest):
     """
@@ -1468,8 +1593,10 @@ async def get_memory_context(request: ContextQueryRequest):
     # Get recent messages from Firestore
     if request.include_recent:
         try:
-            context_data = system.get_firestore_context()
-            response["recent_messages"] = context_data.get("raw_messages", [])[-request.recent_limit:]
+            # Use group_id if available, otherwise use effective DM group
+            effective_group_id = identity['group_id'] or (f"dm_{identity['user_id']}" if identity['user_id'] else None)
+            context_data = system.get_firestore_context(group_id=effective_group_id, limit=request.recent_limit)
+            response["recent_messages"] = context_data.get("raw_messages", [])
         except Exception as e:
             print(f"[API] Warning: Could not get recent messages: {e}")
 
@@ -1506,15 +1633,80 @@ async def get_memory_context(request: ContextQueryRequest):
                     results, context
                 )
             else:
-                # DM context - use basic retrieve
-                memories = await asyncio.to_thread(
-                    system.hybrid_retriever.retrieve,
+                # DM context - use retrieve_for_context with DM-specific context
+                # If reference_group_id provided, search in that group (cross-context query)
+                context = {
+                    'group_id': request.reference_group_id,  # Can be None for pure DM, or group_id for cross-context
+                    'user_id': identity['user_id'],
+                    'platform': identity['platform'],
+                    'involved_users': request.involved_users or [],
+                    'is_dm_with_group_reference': request.reference_group_id is not None
+                }
+                results = await asyncio.to_thread(
+                    system.hybrid_retriever.retrieve_for_context,
                     request.query,
-                    enable_reflection=True
+                    context,
+                    limit_per_table=request.memory_limit
                 )
-                response["relevant_memories"] = memories[:request.memory_limit] if memories else []
+                # Combine all memory types from DM retrieval
+                all_memories = []
+                all_memories.extend(results.get("dm_memories", []))
+                all_memories.extend(results.get("user_memories", []))
+                all_memories.extend(results.get("group_memories", []))  # Include if reference_group_id was provided
+                all_memories.extend(results.get("cross_group_memories", []))
+                all_memories.extend(results.get("involved_user_memories", []))  # Memories about mentioned users
+                response["relevant_memories"] = all_memories[:request.memory_limit]
+                response["user_facts"] = results.get("user_facts", [])
+                response["formatted_context"] = results.get("formatted_context", "")
+
+                # Get user profile for DM context
+                if identity['user_id']:
+                    try:
+                        user_profile = system.user_profile_store.get_profile_by_universal_id(identity['user_id'])
+                        if user_profile:
+                            response["user_profile"] = {
+                                "profile_id": user_profile.profile_id,
+                                "agent_id": user_profile.agent_id,
+                                "universal_user_id": user_profile.universal_user_id,
+                                "platform_type": user_profile.platform_type,
+                                "username": user_profile.username,
+                                "summary": user_profile.summary,
+                                "interests": [{"keyword": i.keyword, "score": i.score} for i in user_profile.interests] if user_profile.interests else [],
+                                "expertise_level": {"value": user_profile.expertise_level.value, "confidence": user_profile.expertise_level.confidence} if user_profile.expertise_level else None,
+                                "communication_style": {"value": user_profile.communication_style.value, "confidence": user_profile.communication_style.confidence} if user_profile.communication_style else None,
+                                "total_messages_processed": user_profile.total_messages_processed,
+                                "wallet_address": user_profile.wallet_address,
+                                "basename": user_profile.basename,
+                                "created_at": user_profile.created_at,
+                                "updated_at": user_profile.updated_at
+                            }
+                    except Exception as e:
+                        print(f"[API] Warning: Could not get user profile: {e}")
         except Exception as e:
             print(f"[API] Warning: Could not search memories: {e}")
+
+    # Search for similar agent responses (previous Q&A)
+    if request.query:
+        try:
+            similar_responses = await asyncio.to_thread(
+                system.unified_store.search_agent_responses_by_trigger,
+                request.query,
+                scope="dm" if not identity['is_group'] else "group",
+                group_id=identity['group_id'],
+                limit=3
+            )
+            if similar_responses:
+                response["similar_agent_responses"] = [
+                    {
+                        "trigger_message": r.get("trigger_message", ""),
+                        "response": r.get("response", ""),
+                        "scope": r.get("scope", ""),
+                        "created_at": r.get("created_at", "")
+                    }
+                    for r in similar_responses
+                ]
+        except Exception as e:
+            print(f"[API] Warning: Could not search agent responses: {e}")
 
     # Build formatted context only if not already set by retriever
     if not response["formatted_context"]:

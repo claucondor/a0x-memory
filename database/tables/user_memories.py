@@ -99,10 +99,33 @@ class UserMemoriesTable:
         except Exception:
             pass
 
-    def add(self, memory: UserMemory) -> UserMemory:
-        """Add a single user memory."""
+    def add(self, memory: UserMemory, dedup_threshold: float = 0.85) -> UserMemory:
+        """Add a single user memory with deduplication."""
         vector = self.embedding_model.encode_single(memory.content, is_query=False)
 
+        # === DEDUPLICACIÓN INSERT-TIME ===
+        if self.table.count_rows() > 0:
+            try:
+                where_clause = f"group_id = '{memory.group_id}' AND user_id = '{memory.user_id}'"
+                similar = (
+                    self.table.search(vector.tolist())
+                    .distance_type("cosine")
+                    .where(where_clause, prefilter=True)
+                    .limit(1)
+                    .to_list()
+                )
+
+                if similar:
+                    distance = similar[0].get('_distance', 2.0)
+                    similarity = 1 - (distance / 2)
+
+                    if similarity >= dedup_threshold:
+                        print(f"[dedup] Skip user memory (sim={similarity:.2f}): {memory.content[:40]}...")
+                        return memory
+            except Exception as e:
+                print(f"[dedup] Search failed: {e}")
+
+        # === Insertar si no es duplicado ===
         data = {
             "memory_id": memory.memory_id,
             "agent_id": memory.agent_id,
@@ -288,6 +311,33 @@ class UserMemoriesTable:
         if exclude_user_id:
             where_clause += f" AND user_id != '{exclude_user_id}'"
 
+        search = search.where(where_clause, prefilter=True)
+
+        search = search.select([
+            "_distance", "memory_id", "agent_id", "group_id", "user_id",
+            "memory_level", "memory_type", "privacy_scope", "content",
+            "keywords", "topics", "importance_score", "evidence_count",
+            "first_seen", "last_seen", "last_updated",
+            "source_message_id", "source_timestamp", "username", "platform"
+        ])
+
+        results = search.limit(limit).to_list()
+        return [self._row_to_user_memory(r) for r in results]
+
+    def search_by_user(self, user_id: str, query_vector, limit: int = 10) -> List[UserMemory]:
+        """Search all user memories for a specific user across ALL groups.
+
+        This is used for DM context to retrieve what the agent knows about a user
+        from their interactions in various groups.
+        """
+        if self.table.count_rows() == 0:
+            return []
+
+        vec = query_vector.tolist() if hasattr(query_vector, 'tolist') else query_vector
+        search = self.table.search(vec).distance_type("cosine")
+
+        # Search by user_id only, across all groups
+        where_clause = f"user_id = '{user_id}'"
         search = search.where(where_clause, prefilter=True)
 
         search = search.select([

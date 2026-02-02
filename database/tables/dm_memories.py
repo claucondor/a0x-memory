@@ -109,18 +109,60 @@ class DMMemoriesTable:
         except Exception as e:
             print(f"[{self.agent_id}] Error updating topic {entry.topic}: {e}")
 
-    def add_batch(self, entries: List[MemoryEntry], user_id: str = None):
-        """Add DM memory entries."""
+    def add_batch(self, entries: List[MemoryEntry], user_id: str = None, dedup_threshold: float = 0.85):
+        """Add DM memory entries with deduplication."""
         if not entries:
             return
 
         restatements = [entry.lossless_restatement for entry in entries]
         vectors = self.embedding_model.encode_documents(restatements)
 
-        data = []
-        for entry, vector in zip(entries, vectors):
-            dm_group_id = entry.group_id or f"dm_{entry.user_id or user_id or 'unknown'}"
+        # === DEDUPLICACIÓN INSERT-TIME ===
+        entries_to_insert = []
+        vectors_to_insert = []
+        duplicates_skipped = 0
 
+        for entry, vector in zip(entries, vectors):
+            is_duplicate = False
+
+            if self.table.count_rows() > 0:
+                dm_group_id = entry.group_id or f"dm_{entry.user_id or user_id or 'unknown'}"
+
+                # Buscar memorias similares existentes usando LanceDB nativo
+                try:
+                    similar = (
+                        self.table.search(vector.tolist())
+                        .distance_type("cosine")
+                        .where(f"agent_id = '{self.agent_id}' AND group_id = '{dm_group_id}'", prefilter=True)
+                        .limit(1)
+                        .to_list()
+                    )
+
+                    if similar:
+                        # cosine distance en LanceDB: 0 = idéntico, 2 = opuesto
+                        # similarity = 1 - (distance / 2) para normalizar a [0,1]
+                        distance = similar[0].get('_distance', 2.0)
+                        similarity = 1 - (distance / 2)
+
+                        if similarity >= dedup_threshold:
+                            is_duplicate = True
+                            duplicates_skipped += 1
+                            print(f"[dedup] Skip (sim={similarity:.2f}): {entry.lossless_restatement[:40]}...")
+                except Exception as e:
+                    print(f"[dedup] Search failed: {e}")
+
+            if not is_duplicate:
+                entries_to_insert.append(entry)
+                vectors_to_insert.append(vector)
+
+        if not entries_to_insert:
+            print(f"[{self.agent_id}] All {len(entries)} entries were duplicates")
+            return
+
+        # === Insertar solo las no-duplicadas ===
+        data = []
+        for entry, vector in zip(entries_to_insert, vectors_to_insert):
+            dm_group_id = entry.group_id or f"dm_{entry.user_id or user_id or 'unknown'}"
             data.append({
                 "agent_id": self.agent_id,
                 "user_id": entry.user_id or user_id or "",
@@ -143,7 +185,7 @@ class DMMemoriesTable:
             })
 
         self.table.add(data)
-        print(f"[{self.agent_id}] Added {len(entries)} DM memory entries")
+        print(f"[{self.agent_id}] Added {len(entries_to_insert)}/{len(entries)} DM entries (skipped {duplicates_skipped} duplicates)")
         self._init_fts_index()
 
         # Update topics index for all entries

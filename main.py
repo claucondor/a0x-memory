@@ -240,6 +240,7 @@ class SimpleMemSystem:
         # Pass profile stores to hybrid_retriever for lightweight entity system
         self.hybrid_retriever.user_profile_store = self.user_profile_store
         self.hybrid_retriever.group_profile_store = self.group_profile_store
+        self.hybrid_retriever.fact_store = self.user_fact_store
 
         print("\nSystem initialization complete!")
         print("=" * 60)
@@ -261,7 +262,10 @@ class SimpleMemSystem:
         reply_to_message_id: Optional[str] = None,
         # Processing options
         add_to_firestore: bool = True,
-        use_stateless_processing: bool = True
+        use_stateless_processing: bool = True,
+        # Agent response support
+        role: str = "user",
+        metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Add a single dialogue with optional group context.
@@ -285,6 +289,8 @@ class SimpleMemSystem:
         - reply_to_message_id: Message ID being replied to
         - add_to_firestore: Add to Firestore for immediate context (default: True)
         - use_stateless_processing: Use Firestore as buffer instead of in-memory (default: True)
+        - role: Role of the speaker ("user" or "assistant")
+        - metadata: Additional metadata to merge with message metadata
 
         Returns:
         - Dict with processing status
@@ -326,20 +332,26 @@ class SimpleMemSystem:
             except Exception as e:
                 print(f"[Spam] Warning: Could not generate embedding: {e}")
 
+            # Build message metadata and merge with extra metadata
+            msg_metadata = {
+                "message_id": message_id,
+                "timestamp": timestamp,
+                "is_reply": is_reply,
+                "mentioned_users": mentioned_users,
+                "reply_to_message_id": reply_to_message_id,
+                "speaker": speaker,
+                "role": role
+            }
+            if metadata:
+                msg_metadata.update(metadata)
+
             add_result = self.firestore.add_message(
                 agent_id=self.agent_id,
                 group_id=effective_group_id,
                 message=content,
                 username=username or speaker,
                 platform_identity=stored_platform_identity,
-                metadata={
-                    "message_id": message_id,
-                    "timestamp": timestamp,
-                    "is_reply": is_reply,
-                    "mentioned_users": mentioned_users,
-                    "reply_to_message_id": reply_to_message_id,
-                    "speaker": speaker
-                },
+                metadata=msg_metadata,
                 embedding=message_embedding
             )
 
@@ -560,15 +572,20 @@ class SimpleMemSystem:
             all_messages.append(content)
 
             platform_identity = msg.get('platform_identity', {})
-            user_id = platform_identity.get('user_id')
+            metadata = msg.get('metadata', {})
+
+            # Use speaker_user_id if available (for observed posts from other agents)
+            # Otherwise fall back to the observer's user_id
+            speaker_user_id = metadata.get('speaker_user_id')
+            user_id = speaker_user_id or platform_identity.get('user_id')
 
             if user_id:
                 user_data[user_id]['messages'].append(content)
                 user_data[user_id]['universal_user_id'] = user_id
-                user_data[user_id]['username'] = msg.get('username') or platform_identity.get('username')
+                # Use speaker name from metadata if available
+                user_data[user_id]['username'] = metadata.get('speaker') or msg.get('username') or platform_identity.get('username')
 
             if not group_name:
-                metadata = msg.get('metadata', {})
                 group_name = metadata.get('group_name') or platform_identity.get('groupName')
 
         # ============================================================

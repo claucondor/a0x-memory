@@ -124,10 +124,32 @@ class GroupMemoriesTable:
             except Exception as e:
                 print(f"[{self.agent_id}] Error updating topic {topic_name}: {e}")
 
-    def add(self, memory: GroupMemory) -> GroupMemory:
-        """Add a single group memory."""
+    def add(self, memory: GroupMemory, dedup_threshold: float = 0.85) -> GroupMemory:
+        """Add a single group memory with deduplication."""
         vector = self.embedding_model.encode_single(memory.content, is_query=False)
 
+        # === DEDUPLICACIÓN INSERT-TIME ===
+        if self.table.count_rows() > 0:
+            try:
+                similar = (
+                    self.table.search(vector.tolist())
+                    .distance_type("cosine")
+                    .where(f"group_id = '{memory.group_id}'", prefilter=True)
+                    .limit(1)
+                    .to_list()
+                )
+
+                if similar:
+                    distance = similar[0].get('_distance', 2.0)
+                    similarity = 1 - (distance / 2)
+
+                    if similarity >= dedup_threshold:
+                        print(f"[dedup] Skip group memory (sim={similarity:.2f}): {memory.content[:40]}...")
+                        return memory
+            except Exception as e:
+                print(f"[dedup] Search failed: {e}")
+
+        # === Insertar si no es duplicado ===
         data = {
             "memory_id": memory.memory_id,
             "agent_id": memory.agent_id,

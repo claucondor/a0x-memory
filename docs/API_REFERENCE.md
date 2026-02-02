@@ -139,11 +139,38 @@ curl http://136.118.160.81:8080/health
     "chatId": "-100002"
   },
   "involved_users": ["telegram:88001"],
+  "reference_group_id": null,
   "include_recent": true,
   "recent_limit": 10,
   "memory_limit": 5
 }
 ```
+
+| Parámetro | Tipo | Requerido | Descripción |
+|-----------|------|-----------|-------------|
+| `agent_id` | string | ✅ | ID del agente |
+| `query` | string | ⚪ | Query para búsqueda semántica |
+| `platform_identity` | object | ✅ | Identidad del contexto actual |
+| `involved_users` | string[] | ⚪ | IDs de usuarios mencionados/involucrados (carga sus profiles/facts) |
+| `reference_group_id` | string | ⚪ | **NUEVO:** ID de grupo para cross-context queries (DM preguntando sobre grupo) |
+| `include_recent` | bool | ⚪ | Incluir mensajes recientes de Firestore (default: true) |
+| `recent_limit` | int | ⚪ | Límite de mensajes recientes (default: 10) |
+| `memory_limit` | int | ⚪ | Límite de memorias por tabla (default: 5) |
+
+**Cross-Context Query (reference_group_id)**:
+```json
+{
+  "agent_id": "jessexbt",
+  "query": "What did they say about my project in the team group?",
+  "platform_identity": {
+    "platform": "telegram",
+    "telegramId": 88001,
+    "username": "elena_dev"
+  },
+  "reference_group_id": "-100002"
+}
+```
+Cuando un usuario en DM pregunta sobre un grupo específico, `reference_group_id` permite buscar en las memorias de ese grupo además de las del usuario.
 
 **Response**:
 ```json
@@ -151,7 +178,8 @@ curl http://136.118.160.81:8080/health
   "success": true,
   "recent_messages": [...],
   "relevant_memories": [...],
-  "user_profile": [...],
+  "user_profile": {...},
+  "user_facts": [...],
   "group_profile": {...},
   "formatted_context": "## Group Knowledge\n1. ...\n\n## Speaker's Personal Context (shareable)\n1. Elena specializes in TypeScript..."
 }
@@ -161,6 +189,7 @@ curl http://136.118.160.81:8080/health
 - "¿Qué sabe hacer Elena?" → Busca en group_memories + speaker_dm_memories
 - "¿De qué se habló ayer?" → Busca en group_memories con temporal scoring
 - "¿Qué dijeron sobre el proyecto X?" → Busca semánticamente en todas las tablas
+- "¿Qué dijeron de mi en el grupo Y?" → Usa `reference_group_id` para cross-context
 
 ---
 
@@ -186,6 +215,50 @@ curl http://136.118.160.81:8080/v1/memory/stats/jessexbt
     "cross_group_memories": 5,
     "conversation_summaries": 5
   }
+}
+```
+
+---
+
+### 3.5. Agent Responses
+
+#### `POST /v1/memory/agent-response`
+**Descripción**: Almacenar respuesta del agente en la memoria.
+
+**Cuándo usar**: Después de que el agente responde, para mantener contexto de sus propias respuestas.
+
+**Parámetros**:
+```json
+{
+  "agent_id": "jessexbt",
+  "response": "For your DEX, I recommend using concentrated liquidity pools.",
+  "platform_identity": {
+    "platform": "telegram",
+    "telegramId": 88001,
+    "username": "elena_dev",
+    "chatId": "-100002"
+  },
+  "trigger_message": "What do you recommend for my DEX?",
+  "role": "assistant"
+}
+```
+
+| Parámetro | Tipo | Requerido | Descripción |
+|-----------|------|-----------|-------------|
+| `agent_id` | string | ✅ | ID del agente |
+| `response` | string | ✅ | Respuesta del agente |
+| `platform_identity` | object | ✅ | Contexto donde se respondió |
+| `trigger_message` | string | ⚪ | Mensaje que disparó la respuesta |
+| `role` | string | ⚪ | "assistant" (default) |
+
+**Response**:
+```json
+{
+  "success": true,
+  "agent_id": "jessexbt",
+  "effective_group_id": "dm_telegram:88001",
+  "user_id": "telegram:88001",
+  "added": true
 }
 ```
 
@@ -592,16 +665,26 @@ curl -X POST "http://136.118.160.81:8080/v1/memory/process-pending?agent_id=jess
 | `agent_id` | string | ✅ | ID del agente (e.g., "jessexbt") |
 | `message` | string | ✅ | Contenido del mensaje |
 | `platform_identity` | object | ✅ | Identidad de la plataforma |
-| `platform_identity.platform` | string | ✅ | "telegram", "xmtp", "farcaster" |
+| `platform_identity.platform` | string | ✅ | "telegram", "xmtp", "farcaster", "direct" |
 | `platform_identity.telegramId` | int | ✅* | ID único del usuario en Telegram |
 | `platform_identity.username` | string | ⚪ | Username visible |
 | `platform_identity.chatId` | string | ⚪ | ID del chat (negativo = grupo, null = DM) |
+| `platform_identity.clientId` | string | ⚪ | **NUEVO:** ID de cliente para platform="direct" (web clients) |
 | `speaker` | string | ✅ | Quien envió el mensaje |
 
 **Ejemplos de `chatId`:**
 - `"-100001234567"` → Grupo de Telegram (negativo)
 - `null` o ausente → DM privado
 - `"123456789"` → Chat privado (positivo, tratado como DM)
+
+**Platform "direct" (web clients)**:
+```json
+{
+  "platform": "direct",
+  "clientId": "web_session_abc123"
+}
+```
+Para clientes web sin plataforma específica, usar `clientId` que genera `user_id = "direct:web_session_abc123"`.
 
 #### Response
 
@@ -1087,7 +1170,53 @@ Cuando se incluyen summaries jerárquicos en el contexto, se aplican límites:
 | Contexto | Tablas Buscadas |
 |----------|-----------------|
 | **DM** | dm_memories, cross_group_memories, user_facts, user_profiles |
+| **DM + reference_group_id** | dm_memories + group_memories del grupo referenciado + user_memories en ese grupo |
 | **Group** | group_memories, user_memories, interaction_memories, speaker's dm_memories (shareable), user_facts, group_summaries |
+| **Group + involved_users** | Lo anterior + profiles/facts de los usuarios mencionados |
+
+---
+
+### Cross-Context Queries
+
+#### `reference_group_id` (DM preguntando sobre un grupo)
+
+Cuando un usuario en DM pregunta sobre un grupo específico:
+
+```
+Usuario en DM: "¿Qué dijeron sobre mi proyecto en el grupo de devs?"
+                        ↓
+API call con: reference_group_id = "-100002"
+                        ↓
+┌─────────────────────────────────────────────────────────────┐
+│  Búsqueda combina:                                          │
+│  1. DM memories del usuario                                 │
+│  2. Group memories del grupo referenciado                   │
+│  3. User memories del usuario en ese grupo                  │
+│  4. User facts del usuario                                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Use case:** El usuario quiere saber qué se habló de él/su proyecto en un grupo donde participa.
+
+#### `involved_users` (Menciones en grupo)
+
+Cuando se menciona a otros usuarios en un grupo:
+
+```
+Usuario en grupo: "@carlos_dev ¿Qué sabes de smart contracts?"
+                        ↓
+API call con: involved_users = ["telegram:carlos_id"]
+                        ↓
+┌─────────────────────────────────────────────────────────────┐
+│  Búsqueda combina:                                          │
+│  1. Contexto normal del grupo                               │
+│  2. Profile de carlos_dev                                   │
+│  3. Facts de carlos_dev                                     │
+│  4. (NO incluye DMs privadas de carlos)                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Use case:** El agente necesita contexto sobre usuarios mencionados para responder mejor.
 
 ---
 
