@@ -1,10 +1,11 @@
 """
-Vector Store - Multi-View Indexing (Section 3.1)
+Vector Store - Structured Multi-View Indexing Implementation (Section 3.2)
 
-Implements three-layer indexing I(m_k):
-- Semantic Layer: s_k = E_dense(m_k) - Dense vector similarity
-- Lexical Layer: l_k = E_sparse(m_k) - BM25 keyword matching (Tantivy FTS)
-- Symbolic Layer: r_k = E_sym(m_k) - Metadata filtering (SQL)
+Paper Reference: Section 3.2 - Structured Indexing
+Implements the three structured indexing dimensions:
+- Semantic Layer: Dense vectors v_k ∈ ℝ^d (embedding-based similarity)
+- Lexical Layer: Full-text search with Tantivy FTS
+- Symbolic Layer: Metadata R_k = {(key, val)} (structured filtering via SQL)
 """
 from typing import List, Optional, Dict, Any
 import lancedb
@@ -17,12 +18,13 @@ import os
 
 class VectorStore:
     """
-    Multi-View Indexing - Storage and retrieval for memory units (Section 3.1)
+    Structured Multi-View Indexing - Storage and retrieval for Atomic Entries
 
-    Three-layer indexing I(m_k):
-    1. Semantic Layer: Dense embeddings for conceptual similarity
-    2. Lexical Layer: Tantivy FTS for exact keyword matching
-    3. Symbolic Layer: SQL-based metadata filtering
+    Paper Reference: Section 3.2 - Structured Indexing
+    Implements M(m_k) with three structured layers:
+    1. Semantic Layer: Dense embedding vectors for conceptual similarity
+    2. Lexical Layer: Full-text search via Tantivy FTS index
+    3. Symbolic Layer: SQL-based metadata filtering with DataFusion
     """
 
     def __init__(
@@ -149,8 +151,10 @@ class VectorStore:
 
     def semantic_search(self, query: str, top_k: int = 5) -> List[MemoryEntry]:
         """
-        Semantic Layer Search - Dense vector similarity (Section 3.1)
-        s_k = E_dense(m_k)
+        Semantic Layer Search - Dense vector similarity.
+
+        Paper Reference: Section 3.1
+        Retrieves based on v_k = E_dense(S_k) where S_k is the lossless restatement.
         """
         try:
             if self.table.count_rows() == 0:
@@ -166,8 +170,10 @@ class VectorStore:
 
     def keyword_search(self, keywords: List[str], top_k: int = 3) -> List[MemoryEntry]:
         """
-        Lexical Layer Search - BM25 keyword matching (Section 3.1)
-        l_k = E_sparse(m_k)
+        Lexical Layer Search - Full-text search via Tantivy FTS.
+
+        Paper Reference: Section 3.1
+        Retrieves based on BM25 text matching using LanceDB native FTS.
         """
         try:
             if not keywords or self.table.count_rows() == 0:
@@ -191,8 +197,11 @@ class VectorStore:
         top_k: Optional[int] = None
     ) -> List[MemoryEntry]:
         """
-        Symbolic Layer Search - Metadata filtering (Section 3.1)
-        r_k = E_sym(m_k), filters by timestamps, entities, persons
+        Symbolic Layer Search - SQL-based metadata filtering.
+
+        Paper Reference: Section 3.1
+        Retrieves based on R_k = {(key, val)} for structured constraints.
+        Uses DataFusion SQL expressions with array_has_any for list columns.
         """
         try:
             if self.table.count_rows() == 0:
@@ -248,55 +257,3 @@ class VectorStore:
         self._fts_initialized = False
         self._init_table()
         print("Database cleared")
-
-    def keyword_search_with_scores(self, keywords: List[str], top_k: int = 3) -> List[tuple]:
-        """
-        Keyword search using BM25 FTS that returns (MemoryEntry, score) tuples.
-
-        Uses LanceDB native Full-Text Search with BM25 ranking.
-        Scores are normalized to [0, 1] range.
-
-        Returns:
-            List of (MemoryEntry, float) tuples sorted by score (highest first)
-        """
-        try:
-            if not keywords or self.table.count_rows() == 0:
-                return []
-
-            query = " ".join(keywords)
-            results = self.table.search(query).limit(top_k).to_list()
-
-            if not results:
-                return []
-
-            scored_entries = []
-            max_score = 0
-
-            for r in results:
-                score = r.get("_score", 0.0)
-                max_score = max(max_score, score)
-                try:
-                    entry = MemoryEntry(
-                        entry_id=r["entry_id"],
-                        lossless_restatement=r["lossless_restatement"],
-                        keywords=list(r.get("keywords") or []),
-                        timestamp=r.get("timestamp") or None,
-                        location=r.get("location") or None,
-                        persons=list(r.get("persons") or []),
-                        entities=list(r.get("entities") or []),
-                        topic=r.get("topic") or None
-                    )
-                    scored_entries.append((entry, score))
-                except Exception as e:
-                    print(f"Warning: Failed to parse FTS result: {e}")
-                    continue
-
-            # Normalize scores to [0, 1]
-            if max_score > 0:
-                scored_entries = [(entry, score / max_score) for entry, score in scored_entries]
-
-            return scored_entries
-
-        except Exception as e:
-            print(f"Error during keyword search with scores: {e}")
-            return []

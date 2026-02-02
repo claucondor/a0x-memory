@@ -17,21 +17,19 @@ class SimpleMemSystem:
     """
     SimpleMem Main System
 
-    Three-stage pipeline:
-    1. Semantic Structured Compression (Section 3.1): add_dialogue() -> MemoryBuilder -> VectorStore
-    2. Online Semantic Synthesis (Section 3.2): Intra-session consolidation during write
-    3. Intent-Aware Retrieval Planning (Section 3.3): ask() -> HybridRetriever -> AnswerGenerator
+    Three-stage pipeline based on Semantic Lossless Compression:
+    1. Semantic Structured Compression: add_dialogue() -> MemoryBuilder -> VectorStore
+    2. Structured Indexing and Recursive Consolidation: (background evolution - future work)
+    3. Adaptive Query-Aware Retrieval: ask() -> HybridRetriever -> AnswerGenerator
     """
     def __init__(
         self,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
-        base_url: Optional[str] = None,
+        temperature: Optional[float] = None,
         db_path: Optional[str] = None,
         table_name: Optional[str] = None,
         clear_db: bool = False,
-        enable_thinking: Optional[bool] = None,
-        use_streaming: Optional[bool] = None,
         enable_planning: Optional[bool] = None,
         enable_reflection: Optional[bool] = None,
         max_reflection_rounds: Optional[int] = None,
@@ -44,14 +42,12 @@ class SimpleMemSystem:
         Initialize system
 
         Args:
-        - api_key: OpenAI API key
-        - model: LLM model name
-        - base_url: Custom OpenAI base URL (for compatible APIs)
-        - db_path: Database path
-        - table_name: Memory table name (for parallel processing)
+        - api_key: OpenRouter API key (or None to use config.OPENROUTER_API_KEY)
+        - model: LLM model name (or None to use config.LLM_MODEL)
+        - temperature: LLM temperature (or None to use config.TEMPERATURE)
+        - db_path: Database path (or None to use config.LANCEDB_PATH)
+        - table_name: Memory table name (or None to use config.MEMORY_TABLE_NAME)
         - clear_db: Whether to clear existing database
-        - enable_thinking: Enable deep thinking mode (for Qwen and compatible models)
-        - use_streaming: Enable streaming responses
         - enable_planning: Enable multi-query planning for retrieval (None=use config default)
         - enable_reflection: Enable reflection-based additional retrieval (None=use config default)
         - max_reflection_rounds: Maximum number of reflection rounds (None=use config default)
@@ -68,9 +64,7 @@ class SimpleMemSystem:
         self.llm_client = LLMClient(
             api_key=api_key,
             model=model,
-            base_url=base_url,
-            enable_thinking=enable_thinking,
-            use_streaming=use_streaming
+            temperature=temperature,
         )
         self.embedding_model = EmbeddingModel()
         self.vector_store = VectorStore(
@@ -156,10 +150,10 @@ class SimpleMemSystem:
         print(f"Question: {question}")
         print("=" * 60)
 
-        # Stage 3: Intent-Aware Retrieval Planning
+        # Stage 2: Hybrid retrieval
         contexts = self.hybrid_retriever.retrieve(question)
 
-        # Generate answer from retrieved context C_q
+        # Stage 3: Answer generation
         answer = self.answer_generator.generate_answer(question, contexts)
 
         print("\nAnswer:")

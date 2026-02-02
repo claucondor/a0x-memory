@@ -1,10 +1,12 @@
 """
-Hybrid Retriever - Stage 3: Intent-Aware Retrieval Planning (Section 3.3)
+Hybrid Retriever - Stage 3: Adaptive Query-Aware Retrieval with Pruning (Section 3.3)
 
+Paper Reference: Section 3.3 - Adaptive Query-Aware Retrieval with Pruning
 Implements:
-- Retrieval planning P(q, H) → {q_sem, q_lex, q_sym, d}
-- Parallel multi-view retrieval across Semantic, Lexical, Symbolic layers
-- Result merging: C_q = R_sem ∪ R_lex ∪ R_sym
+- Hybrid scoring function S(q, m_k) aggregating semantic, lexical, and symbolic signals
+- Query Complexity estimation C_q for adaptive retrieval depth
+- Dynamic retrieval depth k_dyn = k_base · (1 + δ · C_q)
+- Complexity-Aware Pruning to minimize token usage while maximizing accuracy
 """
 from typing import List, Optional, Dict, Any
 from models.memory_entry import MemoryEntry
@@ -19,15 +21,18 @@ import concurrent.futures
 
 class HybridRetriever:
     """
-    Hybrid Retriever - Intent-Aware Retrieval Planning (Section 3.3)
+    Hybrid Retriever - Stage 3: Adaptive Query-Aware Retrieval with Pruning
+
+    Paper Reference: Section 3.3 - Adaptive Query-Aware Retrieval with Pruning
 
     Core Components:
-    1. Retrieval planning: infers search intent and generates optimized queries
-    2. Parallel multi-view retrieval:
-       - Semantic: R_sem = Top-n(cos(E(q_sem), E(m_i)))
-       - Lexical: R_lex = Top-n(BM25(q_lex, m_i))
-       - Symbolic: R_sym = Top-n({m_i | Meta(m_i) ⊨ q_sym})
-    3. Result merging: C_q = R_sem ∪ R_lex ∪ R_sym
+    1. Query-aware retrieval across three structured layers:
+       - Semantic Layer: Dense vector similarity
+       - Lexical Layer: Sparse keyword matching (BM25)
+       - Symbolic Layer: Metadata filtering
+    2. Hybrid Scoring Function S(q, m_k): aggregates multi-layer signals
+    3. Complexity-Aware Pruning: dynamic depth based on C_q
+    4. Planning-based multi-query decomposition for comprehensive retrieval
     """
     def __init__(
         self,
@@ -40,24 +45,20 @@ class HybridRetriever:
         enable_reflection: bool = True,
         max_reflection_rounds: int = 2,
         enable_parallel_retrieval: bool = True,
-        max_retrieval_workers: int = 3,
-        cc_alpha: float = None
+        max_retrieval_workers: int = 3
     ):
         self.llm_client = llm_client
         self.vector_store = vector_store
         self.semantic_top_k = semantic_top_k or config.SEMANTIC_TOP_K
         self.keyword_top_k = keyword_top_k or config.KEYWORD_TOP_K
         self.structured_top_k = structured_top_k or config.STRUCTURED_TOP_K
-
+        
         # Use config values as default if not explicitly provided
         self.enable_planning = enable_planning if enable_planning is not None else getattr(config, 'ENABLE_PLANNING', True)
         self.enable_reflection = enable_reflection if enable_reflection is not None else getattr(config, 'ENABLE_REFLECTION', True)
         self.max_reflection_rounds = max_reflection_rounds if max_reflection_rounds is not None else getattr(config, 'MAX_REFLECTION_ROUNDS', 2)
         self.enable_parallel_retrieval = enable_parallel_retrieval if enable_parallel_retrieval is not None else getattr(config, 'ENABLE_PARALLEL_RETRIEVAL', True)
         self.max_retrieval_workers = max_retrieval_workers if max_retrieval_workers is not None else getattr(config, 'MAX_RETRIEVAL_WORKERS', 3)
-
-        # Convex Combination alpha for adaptive keyword boost
-        self.cc_alpha = cc_alpha if cc_alpha is not None else getattr(config, 'CC_ALPHA', 0.7)
 
     def retrieve(self, query: str, enable_reflection: Optional[bool] = None) -> List[MemoryEntry]:
         """
@@ -103,31 +104,18 @@ class HybridRetriever:
                 print(f"[Search {i}] {search_query}")
                 results = self._semantic_search(search_query)
                 all_results.extend(results)
-
-        # Step 3.5: Execute keyword and structured searches (hybrid retrieval)
-        query_analysis = self._analyze_query(query)
-
-        # Keyword search (Lexical Layer)
-        keyword_results = self._keyword_search(query, query_analysis)
-        print(f"[Keyword Search] Found {len(keyword_results)} results")
-        all_results.extend(keyword_results)
-
-        # Structured search (Symbolic Layer)
-        structured_results = self._structured_search(query_analysis)
-        print(f"[Structured Search] Found {len(structured_results)} results")
-        all_results.extend(structured_results)
-
+        
         # Step 4: Merge and deduplicate results
         merged_results = self._merge_and_deduplicate_entries(all_results)
-        print(f"[Planning] Found {len(merged_results)} unique results (semantic + keyword + structured)")
+        print(f"[Planning] Found {len(merged_results)} unique results")
         
         # Step 5: Optional reflection-based additional retrieval
         # Use override parameter if provided, otherwise use global setting
         should_use_reflection = enable_reflection if enable_reflection is not None else self.enable_reflection
-
+        
         if should_use_reflection:
             merged_results = self._retrieve_with_intelligent_reflection(query, merged_results, information_plan)
-
+        
         return merged_results
     
     def _retrieve_with_reflection(self, query: str, initial_results: List[MemoryEntry]) -> List[MemoryEntry]:
@@ -244,8 +232,10 @@ Return ONLY JSON, no other content.
 
     def _semantic_search(self, query: str) -> List[MemoryEntry]:
         """
-        Semantic Layer Retrieval (Section 3.3)
-        R_sem = Top-n(cos(E(q_sem), E(m_i)))
+        Semantic Layer Retrieval
+
+        Paper Reference: Section 3.3 - Part of hybrid scoring function S(q, m_k)
+        Retrieves based on dense vector similarity: λ₁ · cos(e_q, v_k)
         """
         return self.vector_store.semantic_search(query, top_k=self.semantic_top_k)
 
@@ -255,8 +245,10 @@ Return ONLY JSON, no other content.
         query_analysis: Dict[str, Any]
     ) -> List[MemoryEntry]:
         """
-        Lexical Layer Retrieval (Section 3.3)
-        R_lex = Top-n(BM25(q_lex, m_i))
+        Lexical Layer Retrieval
+
+        Paper Reference: Section 3.3 - Part of hybrid scoring function S(q, m_k)
+        Retrieves based on sparse keyword matching: λ₂ · BM25(q_lex, S_k)
         """
         keywords = query_analysis.get("keywords", [])
         if not keywords:
@@ -267,8 +259,10 @@ Return ONLY JSON, no other content.
 
     def _structured_search(self, query_analysis: Dict[str, Any]) -> List[MemoryEntry]:
         """
-        Symbolic Layer Retrieval (Section 3.3)
-        R_sym = Top-n({m_i | Meta(m_i) ⊨ q_sym})
+        Symbolic Layer Retrieval
+
+        Paper Reference: Section 3.3 - Part of hybrid scoring function S(q, m_k)
+        Hard filter based on symbolic constraints: γ · 𝕀(R_k ⊨ C_meta)
         """
         persons = query_analysis.get("persons", [])
         location = query_analysis.get("location")
@@ -423,56 +417,7 @@ Return ONLY the JSON, no other text.
                 merged.append(entry)
         
         return merged
-
-    def _convex_combination_fusion(
-        self,
-        semantic_results: List[tuple],
-        keyword_results: List[tuple],
-        alpha: float = 0.7
-    ) -> List[MemoryEntry]:
-        """
-        Convex Combination (CC) fusion for hybrid retrieval.
-
-        Formula: S_final = α·S_sem + (1-α)·S_kw
-
-        Args:
-            semantic_results: List of (MemoryEntry, score) from semantic search
-            keyword_results: List of (MemoryEntry, score) from keyword search
-            alpha: Weight for semantic scores (default 0.7)
-
-        Returns:
-            List of MemoryEntry sorted by fused score
-        """
-        semantic_scores: Dict[str, float] = {}
-        keyword_scores: Dict[str, float] = {}
-        entry_map: Dict[str, MemoryEntry] = {}
-
-        for entry, score in semantic_results:
-            semantic_scores[entry.entry_id] = score
-            entry_map[entry.entry_id] = entry
-
-        for entry, score in keyword_results:
-            keyword_scores[entry.entry_id] = score
-            if entry.entry_id not in entry_map:
-                entry_map[entry.entry_id] = entry
-
-        all_ids = set(semantic_scores.keys()) | set(keyword_scores.keys())
-
-        fused_scores: Dict[str, float] = {}
-        for entry_id in all_ids:
-            sem_score = semantic_scores.get(entry_id, 0.0)
-            kw_score = keyword_scores.get(entry_id, 0.0)
-
-            if entry_id in semantic_scores and entry_id in keyword_scores:
-                fused_scores[entry_id] = alpha * sem_score + (1 - alpha) * kw_score
-            elif entry_id in semantic_scores:
-                fused_scores[entry_id] = alpha * sem_score
-            else:
-                fused_scores[entry_id] = (1 - alpha) * kw_score
-
-        sorted_ids = sorted(fused_scores.keys(), key=lambda x: fused_scores[x], reverse=True)
-        return [entry_map[entry_id] for entry_id in sorted_ids]
-
+    
     def _check_answer_adequacy(self, query: str, contexts: List[MemoryEntry]) -> str:
         """
         Check if current contexts are sufficient to answer the query
@@ -702,8 +647,11 @@ Return ONLY the JSON, no other text.
     
     def _analyze_information_requirements(self, query: str) -> Dict[str, Any]:
         """
-        Retrieval Planning (Section 3.3)
-        Analyzes query to determine information requirements and retrieval depth d
+        Query Complexity Estimation C_q
+
+        Paper Reference: Section 3.3 - Eq. (8)
+        Analyzes query complexity to determine minimal information requirements
+        and optimal retrieval depth k_dyn
         """
         prompt = f"""
 Analyze the following question and determine what specific information is required to answer it comprehensively.
@@ -715,7 +663,6 @@ Think step by step:
 2. What key entities, events, or concepts need to be identified?
 3. What relationships or connections need to be established?
 4. What minimal set of information pieces would be sufficient to answer this question?
-5. Are there technical terms requiring exact lexical matching?
 
 Return your analysis in JSON format:
 ```json
@@ -730,20 +677,11 @@ Return your analysis in JSON format:
     }}
   ],
   "relationships": ["relationship1", "relationship2", ...],
-  "minimal_queries_needed": 2,
-  "exact_match_terms": [],
-  "use_keyword_boost": false
+  "minimal_queries_needed": 2
 }}
 ```
 
-For exact_match_terms, include ONLY terms requiring exact lexical matching:
-- Function/method names: parseJWT, get_user_id
-- Error codes: ECONNREFUSED, CVE-2017-3156
-- Version numbers: v2.1.0, Oracle 12c
-- File names: config.yaml, .env
-
-Set use_keyword_boost=true ONLY if exact_match_terms is non-empty.
-For conversational queries about people/events, leave both fields as defaults.
+Focus on identifying the minimal essential information needed, not exhaustive details.
 
 Return ONLY the JSON, no other text.
 """
@@ -776,9 +714,7 @@ Return ONLY the JSON, no other text.
                 "key_entities": [query],
                 "required_info": [{"info_type": "general", "description": "relevant information", "priority": "high"}],
                 "relationships": [],
-                "minimal_queries_needed": 1,
-                "exact_match_terms": [],
-                "use_keyword_boost": False
+                "minimal_queries_needed": 1
             }
     
     def _generate_targeted_queries(self, original_query: str, information_plan: Dict[str, Any]) -> List[str]:

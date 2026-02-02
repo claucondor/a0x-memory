@@ -18,9 +18,11 @@
 ---
 
 ## 🔥 News
+- **[01/20/2026]** **SimpleMem is now available on PyPI!** 📦 You can now install SimpleMem directly via `pip install simplemem` for easier setup and integration. [View Package Usage Guide →](docs/PACKAGE_USAGE.md)
+- **[01/19/2026]** **Added Local Memory Storage for SimpleMem Skill!** 💾 SimpleMem Skill now supports local memory storage, enabling seamless memory retention and management directly within Claude Skills.
 - **[01/18/2026]** **SimpleMem now supports Claude Skills!** 🚀 Use SimpleMem in claude.ai to remember long-term information and project history across conversations. Register at [mcp.simplemem.cloud](https://mcp.simplemem.cloud), add the domain to Claude's network whitelist, **configure with your token in the skill file**, and import the skill!
 - **[01/14/2026]** **SimpleMem MCP Server is now LIVE and Open Source!** 🎉 Experience SimpleMem as a cloud-hosted memory service at [mcp.simplemem.cloud](https://mcp.simplemem.cloud). Easily integrate with your favorite chat platforms (LM Studio, Cherry Studio) and AI agents (Cursor, Claude Desktop) using the **Streamable HTTP** MCP protocol. The MCP implementation features production-ready optimizations including multi-tenant user isolation, faster response times, and enhanced security. [View MCP Documentation →](MCP/README.md)
-- **[01/08/2026]** We've set up a Discord server and WeChat group to make it easier to collaborate and exchange ideas on this project. Welcome to join the Group to share your thoughts, ask questions, or contribute your ideas! 🔥 Join our [Discord](https://discord.gg/KA2zC32M) and [WeChat Group](fig/wechat_logo2.jpg) Now!
+- **[01/08/2026]** We've set up a Discord server and WeChat group to make it easier to collaborate and exchange ideas on this project. Welcome to join the Group to share your thoughts, ask questions, or contribute your ideas! 🔥 Join our [Discord](https://discord.gg/KA2zC32M) and [WeChat Group](fig/wechat_logo3.JPG) Now!
 - **[01/05/2026]** SimpleMem paper was released on [arXiv](https://arxiv.org/abs/2601.02553)!
 
 ---
@@ -50,7 +52,7 @@
 </div>
 
 
-**SimpleMem** addresses the fundamental challenge of **efficient long-term memory for LLM agents** through a three-stage pipeline grounded in **Semantic Lossless Compression**. Unlike existing systems that either passively accumulate redundant context or rely on expensive iterative reasoning loops, SimpleMem maximizes **information density** and **token utilization** through:
+**SimpleMem** is an efficient memory framework based on **semantic lossless compression** that addresses the fundamental challenge of **efficient long-term memory for LLM agents**. Unlike existing systems that either passively accumulate redundant context or rely on expensive iterative reasoning loops, SimpleMem maximizes **information density** and **token utilization** through a three-stage pipeline:
 
 <table>
 <tr>
@@ -59,23 +61,23 @@
 ### 🔍 Stage 1
 **Semantic Structured Compression**
 
-Entropy-based filtering and de-linearization of dialogue into self-contained atomic facts
+Distills unstructured interactions into compact, multi-view indexed memory units
 
 </td>
 <td width="33%" align="center">
 
 ### 🗂️ Stage 2
-**Structured Indexing**
+**Online Semantic Synthesis**
 
-Asynchronous evolution from fragmented atoms to higher-order molecular insights
+Intra-session process that instantly integrates related context into unified abstract representations to eliminate redundancy
 
 </td>
 <td width="33%" align="center">
 
 ### 🎯 Stage 3
-**Adaptive Retrieval**
+**Intent-Aware Retrieval Planning**
 
-Complexity-aware pruning across semantic, lexical, and symbolic layers
+Infers search intent to dynamically determine retrieval scope and construct precise context efficiently
 
 </td>
 </tr>
@@ -83,7 +85,7 @@ Complexity-aware pruning across semantic, lexical, and symbolic layers
 
 <img src="fig/Fig_framework.png" alt="SimpleMem Framework" width="900"/>
 
-*The SimpleMem Architecture: A three-stage pipeline for efficient lifelong memory through semantic lossless compression*
+*The SimpleMem Architecture: (1) Semantic Structured Compression filters low-utility dialogue and converts informative windows into compact, context-independent memory units. (2) Online Semantic Synthesis consolidates related fragments during writing, maintaining a compact and coherent memory topology. (3) Intent-Aware Retrieval Planning infers search intent to adapt retrieval scope and query forms, enabling parallel multi-view retrieval and token-efficient context construction.*
 
 ---
 
@@ -121,21 +123,9 @@ Complexity-aware pruning across semantic, lexical, and symbolic layers
 
 ## 🎯 Key Contributions
 
-### 1️⃣ Semantic Lossless Compression Pipeline
+### 1️⃣ Semantic Structured Compression
 
-SimpleMem transforms raw, ambiguous dialogue streams into **atomic entries** — self-contained facts with resolved coreferences and absolute timestamps. This **write-time disambiguation** eliminates downstream reasoning overhead.
-
-**✨ Example Transformation:**
-```diff
-- Input:  "He'll meet Bob tomorrow at 2pm"  [❌ relative, ambiguous]
-+ Output: "Alice will meet Bob at Starbucks on 2025-11-16T14:00:00"  [✅ absolute, atomic]
-```
-
----
-
-### 2️⃣ Structured Multi-View Indexing
-
-Memory is indexed across three **structured dimensions** for robust, multi-granular retrieval:
+SimpleMem applies an **implicit semantic density gating** mechanism integrated into the LLM generation process to filter redundant interaction content. The system reformulates raw dialogue streams into **compact memory units** — self-contained facts with resolved coreferences and absolute timestamps. Each unit is indexed through three complementary representations for flexible retrieval:
 
 <div align="center">
 
@@ -147,29 +137,53 @@ Memory is indexed across three **structured dimensions** for robust, multi-granu
 
 </div>
 
+**✨ Example Transformation:**
+```diff
+- Input:  "He'll meet Bob tomorrow at 2pm"  [❌ relative, ambiguous]
++ Output: "Alice will meet Bob at Starbucks on 2025-11-16T14:00:00"  [✅ absolute, atomic]
+```
+
 ---
 
-### 3️⃣ Complexity-Aware Adaptive Retrieval
+### 2️⃣ Online Semantic Synthesis
 
-Instead of fixed-depth retrieval, SimpleMem dynamically estimates **query complexity** ($C_q$) to modulate retrieval depth:
+Unlike traditional systems that rely on asynchronous background maintenance, SimpleMem performs synthesis **on-the-fly during the write phase**. Related memory units are synthesized into higher-level abstract representations within the current session scope, allowing repetitive or structurally similar experiences to be **denoised and compressed immediately**.
 
-$$k_{dyn} = \lfloor k_{base} \cdot (1 + \delta \cdot C_q) \rfloor$$
+**✨ Example Synthesis:**
+```diff
+- Fragment 1: "User wants coffee"
+- Fragment 2: "User prefers oat milk"
+- Fragment 3: "User likes it hot"
++ Consolidated: "User prefers hot coffee with oat milk"
+```
+
+This proactive synthesis ensures the memory topology remains compact and free of redundant fragmentation.
+
+---
+
+### 3️⃣ Intent-Aware Retrieval Planning
+
+Instead of fixed-depth retrieval, SimpleMem leverages the reasoning capabilities of the LLM to generate a **comprehensive retrieval plan**. Given a query, the planning module infers **latent search intent** to dynamically determine retrieval scope and depth:
+
+$$\{ q_{\text{sem}}, q_{\text{lex}}, q_{\text{sym}}, d \} \sim \mathcal{P}(q, H)$$
+
+The system then executes **parallel multi-view retrieval** across semantic, lexical, and symbolic indexes, and merges results through ID-based deduplication:
 
 <table>
 <tr>
 <td width="50%">
 
-**🔹 Low Complexity Queries**
-- Retrieve minimal molecular headers
-- ~100 tokens
+**🔹 Simple Queries**
+- Direct fact lookup via single memory unit
+- Minimal retrieval depth
 - Fast response time
 
 </td>
 <td width="50%">
 
-**🔸 High Complexity Queries**
-- Expand to detailed atomic contexts
-- ~1000 tokens
+**🔸 Complex Queries**
+- Aggregation across multiple events
+- Expanded retrieval depth
 - Comprehensive coverage
 
 </td>
@@ -209,7 +223,12 @@ $$k_{dyn} = \lfloor k_{base} \cdot (1 + \delta \cdot C_q) \rfloor$$
 ---
 
 ## 📦 Installation
+### 📝 Notes for First-Time Users
 
+- Ensure you are using **Python 3.10 in your active environment**, not just installed globally.
+- An OpenAI-compatible API key must be configured **before running any memory construction or retrieval**, otherwise initialization may fail.
+- When using non-OpenAI providers (e.g., Qwen or Azure OpenAI), verify both the model name and `OPENAI_BASE_URL` in `config.py`.
+- For large dialogue datasets, enabling parallel processing can significantly reduce memory construction time.
 ### 📋 Requirements
 - 🐍 Python 3.10
 - 🔑 OpenAI-compatible API (OpenAI, Qwen, Azure OpenAI, etc.)
@@ -243,6 +262,31 @@ EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"  # State-of-the-art retrieval
 ---
 
 ## ⚡ Quick Start
+### 🧠 Understanding the Basic Workflow
+
+At a high level, SimpleMem works as a long-term memory system for LLM-based agents. 
+The workflow consists of three simple steps:
+
+1. **Store information** – Dialogues or facts are processed and converted into structured, atomic memories.
+2. **Index memory** – Stored memories are organized using semantic embeddings and structured metadata.
+3. **Retrieve relevant memory** – When a query is made, SimpleMem retrieves the most relevant stored information based on meaning rather than keywords.
+
+This design allows LLM agents to maintain context, recall past information efficiently, and avoid repeatedly processing redundant history.
+
+## ❓ Common Setup Issues & Troubleshooting
+
+If you encounter issues while setting up or running SimpleMem for the first time, check the following common cases:
+
+### 1️⃣ API Key Not Detected
+- Ensure your API key is correctly set in `config.py`
+- For OpenAI-compatible providers (Qwen, Azure, etc.), verify that `OPENAI_BASE_URL` is configured correctly
+- Restart your Python environment after updating the key
+
+### 2️⃣ Python Version Mismatch
+- SimpleMem requires **Python 3.10**
+- Check your version using:
+  ```bash
+  python --version
 
 ### 🎓 Basic Usage
 
@@ -259,7 +303,7 @@ system.add_dialogue("Bob", "Sure, I'll bring the market analysis report", "2025-
 # ✅ Finalize atomic encoding
 system.finalize()
 
-# 🔎 Query with adaptive retrieval (Stage 3: Adaptive Query-Aware Retrieval)
+# 🔎 Query with intent-aware retrieval (Stage 3: Intent-Aware Retrieval Planning)
 answer = system.ask("When and where will Alice and Bob meet?")
 print(answer)
 # Output: "16 November 2025 at 2:00 PM at Starbucks"
