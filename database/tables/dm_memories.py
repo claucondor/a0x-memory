@@ -3,11 +3,13 @@ DMMemories table operations (SimpleMem compatible).
 Extracted from unified_store.py.
 """
 from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
 
 from models.memory_entry import MemoryEntry, MemoryType as DM_MemoryType, PrivacyScope as DM_PrivacyScope
 from database.base import LanceDBConnection
+from database.tables.dm_topics import DMTopicsTable
 from utils.embedding import EmbeddingModel
 import config
 
@@ -22,6 +24,8 @@ class DMMemoriesTable:
         self.db = LanceDBConnection.get_agent_db(agent_id, storage_options=storage_options)
         self.table = self._init_table()
         self._fts_initialized = False
+        # Initialize derived topics table for efficient topic search
+        self.topics_table = DMTopicsTable(agent_id, embedding_model, storage_options)
 
     def _init_table(self):
         """Initialize table with schema."""
@@ -86,6 +90,25 @@ class DMMemoriesTable:
         except Exception:
             pass
 
+    def _update_topics_for_entry(self, entry: MemoryEntry, user_id: str = None):
+        """Update topics table when a DM memory is added/updated."""
+        if not entry.topic:
+            return
+
+        uid = entry.user_id or user_id or "unknown"
+
+        try:
+            # Generate topic summary from memory content
+            summary = f"Discussions about {entry.topic} with {uid}. Recent: {entry.lossless_restatement[:100]}..."
+            self.topics_table.upsert_topic(
+                user_id=uid,
+                name=entry.topic,
+                summary=summary,
+                memory_count_delta=1
+            )
+        except Exception as e:
+            print(f"[{self.agent_id}] Error updating topic {entry.topic}: {e}")
+
     def add_batch(self, entries: List[MemoryEntry], user_id: str = None):
         """Add DM memory entries."""
         if not entries:
@@ -122,6 +145,10 @@ class DMMemoriesTable:
         self.table.add(data)
         print(f"[{self.agent_id}] Added {len(entries)} DM memory entries")
         self._init_fts_index()
+
+        # Update topics index for all entries
+        for entry in entries:
+            self._update_topics_for_entry(entry, user_id)
 
     def search_semantic(self, query: str, user_id: str = None, top_k: int = 10, query_vector=None) -> List[MemoryEntry]:
         """Search DM memories."""
@@ -169,6 +196,95 @@ class DMMemoriesTable:
             return [self._row_to_memory_entry(r) for r in results]
         except Exception:
             return []
+
+    def search_by_topic(
+        self,
+        user_id: str,
+        query: str,
+        topic_name: Optional[str] = None,
+        limit: int = 10
+    ) -> dict:
+        """
+        Search by topic with parallel semantic + topic-based retrieval.
+
+        Args:
+            user_id: User to search within
+            query: Search query for semantic search
+            topic_name: Optional specific topic to filter by
+            limit: Max results per search type
+
+        Returns:
+            Dict with:
+                - topic_results: List of matching topics with similarity
+                - memory_results: List of relevant memories
+                - combined: Fused results ranked by relevance
+        """
+        query_vector = self.embedding_model.encode_single(query, is_query=True)
+
+        # Parallel execution of topic and memory searches
+        results = {"topic_results": [], "memory_results": [], "combined": []}
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Submit both searches in parallel
+            topic_future = executor.submit(
+                self.topics_table.search_semantic,
+                user_id, query_vector, limit
+            )
+            memory_future = executor.submit(
+                self.search_semantic,
+                query, user_id, limit, query_vector
+            )
+
+            # Collect results
+            try:
+                results["topic_results"] = topic_future.result(timeout=10)
+            except Exception as e:
+                print(f"[{self.agent_id}] Topic search error: {e}")
+
+            try:
+                results["memory_results"] = memory_future.result(timeout=10)
+            except Exception as e:
+                print(f"[{self.agent_id}] Memory search error: {e}")
+
+        # Filter by specific topic if provided
+        if topic_name:
+            filtered_topics = [
+                t for t in results["topic_results"]
+                if t["name"] == topic_name
+            ]
+            filtered_memories = [
+                m for m in results["memory_results"]
+                if m.topic == topic_name
+            ]
+            results["topic_results"] = filtered_topics
+            results["memory_results"] = filtered_memories
+
+        # Combine and rank results
+        topic_set = {t["name"] for t in results["topic_results"]}
+        combined = []
+
+        # Add memories from matching topics first
+        for memory in results["memory_results"]:
+            relevance_boost = 0
+            if memory.topic and memory.topic in topic_set:
+                relevance_boost = 0.1
+            combined.append({
+                "type": "memory",
+                "data": memory,
+                "relevance_boost": relevance_boost
+            })
+
+        # Add topic headers
+        for topic in results["topic_results"]:
+            combined.append({
+                "type": "topic",
+                "data": topic,
+                "relevance_boost": 0
+            })
+
+        results["combined"] = combined
+
+        return results
 
     def get_all(self) -> List[MemoryEntry]:
         """Get all entries."""
