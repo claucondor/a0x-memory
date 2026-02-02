@@ -4,11 +4,13 @@ Extracted from unified_store.py - will be refactored to standalone.
 """
 from typing import List, Optional
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pyarrow as pa
 
 from models.group_memory import GroupMemory, MemoryLevel, MemoryType, PrivacyScope
 from database.base import LanceDBConnection
+from database.tables.group_topics import GroupTopicsTable
 from utils.embedding import EmbeddingModel
 import config
 
@@ -23,6 +25,8 @@ class GroupMemoriesTable:
         self.db = LanceDBConnection.get_agent_db(agent_id, storage_options=storage_options)
         self.table = self._init_table()
         self._fts_initialized = False
+        # Initialize derived topics table for efficient topic search
+        self.topics_table = GroupTopicsTable(agent_id, embedding_model, storage_options)
 
     def _init_table(self):
         """Initialize table with schema."""
@@ -101,6 +105,25 @@ class GroupMemoriesTable:
         except Exception:
             pass  # Index may already exist or not supported
 
+    def _update_topics_for_memory(self, memory: GroupMemory):
+        """Update topics table when a memory is added/updated."""
+        if not memory.topics:
+            return
+
+        group_id = memory.group_id
+        for topic_name in memory.topics:
+            try:
+                # Generate topic summary from memory content
+                summary = f"Discussions about {topic_name} in {group_id}. Recent: {memory.content[:100]}..."
+                self.topics_table.upsert_topic(
+                    group_id=group_id,
+                    name=topic_name,
+                    summary=summary,
+                    memory_count_delta=1
+                )
+            except Exception as e:
+                print(f"[{self.agent_id}] Error updating topic {topic_name}: {e}")
+
     def add(self, memory: GroupMemory) -> GroupMemory:
         """Add a single group memory."""
         vector = self.embedding_model.encode_single(memory.content, is_query=False)
@@ -128,6 +151,9 @@ class GroupMemoriesTable:
 
         self.table.add([data])
         self._init_fts_index()
+
+        # Update topics index (derived index maintenance)
+        self._update_topics_for_memory(memory)
 
         return memory
 
@@ -259,6 +285,11 @@ class GroupMemoriesTable:
             self.table.add(all_data)
             self._init_fts_index()
 
+            # Update topics index for all new/updated memories
+            for group_id, memory_list in pending_memories.items():
+                for memory, _ in memory_list:
+                    self._update_topics_for_memory(memory)
+
         print(f"[{self.agent_id}] Added {new_count} new group memories, merged {merged_count}")
         return memories
 
@@ -324,6 +355,98 @@ class GroupMemoriesTable:
         except Exception as e:
             print(f"Error during group keyword search: {e}")
             return []
+
+    def search_by_topic(
+        self,
+        group_id: str,
+        query: str,
+        topic_names: Optional[List[str]] = None,
+        limit: int = 10
+    ) -> dict:
+        """
+        Search by topic with parallel semantic + topic-based retrieval.
+
+        Args:
+            group_id: Group to search within
+            query: Search query for semantic search
+            topic_names: Optional list of specific topics to filter by
+            limit: Max results per search type
+
+        Returns:
+            Dict with:
+                - topic_results: List of matching topics with similarity
+                - memory_results: List of relevant memories
+                - combined: Fused results ranked by relevance
+        """
+        query_vector = self.embedding_model.encode_single(query, is_query=True)
+
+        # Parallel execution of topic and memory searches
+        results = {"topic_results": [], "memory_results": [], "combined": []}
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Submit both searches in parallel
+            topic_future = executor.submit(
+                self.topics_table.search_semantic,
+                group_id, query_vector, limit
+            )
+            memory_future = executor.submit(
+                self.search_semantic,
+                group_id, query_vector, limit
+            )
+
+            # Collect results
+            try:
+                results["topic_results"] = topic_future.result(timeout=10)
+            except Exception as e:
+                print(f"[{self.agent_id}] Topic search error: {e}")
+
+            try:
+                results["memory_results"] = memory_future.result(timeout=10)
+            except Exception as e:
+                print(f"[{self.agent_id}] Memory search error: {e}")
+
+        # Filter by specific topics if provided
+        if topic_names:
+            filtered_topics = [
+                t for t in results["topic_results"]
+                if t["name"] in topic_names
+            ]
+            filtered_memories = [
+                m for m in results["memory_results"]
+                if any(t in topic_names for t in m.topics)
+            ]
+            results["topic_results"] = filtered_topics
+            results["memory_results"] = filtered_memories
+
+        # Combine and rank results
+        topic_set = {t["name"] for t in results["topic_results"]}
+        combined = []
+
+        # Add memories from matching topics first
+        for memory in results["memory_results"]:
+            relevance_boost = 0
+            matching_topics = [t for t in memory.topics if t in topic_set]
+            if matching_topics:
+                # Boost relevance if memory has matching topics
+                relevance_boost = len(matching_topics) * 0.1
+            combined.append({
+                "type": "memory",
+                "data": memory,
+                "relevance_boost": relevance_boost
+            })
+
+        # Add topic headers
+        for topic in results["topic_results"]:
+            combined.append({
+                "type": "topic",
+                "data": topic,
+                "relevance_boost": 0
+            })
+
+        # Sort by topic name for consistent results
+        results["combined"] = combined
+
+        return results
 
     def _row_to_group_memory(self, row: dict) -> GroupMemory:
         """Convert LanceDB row to GroupMemory."""
