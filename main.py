@@ -882,7 +882,7 @@ class SimpleMemSystem:
 
         try:
             # Get recent messages from Firestore
-            messages = self.firestore.get_recent_messages(
+            messages = self.firestore.get_recent(
                 self.agent_id,
                 effective_group_id,
                 limit=50
