@@ -71,7 +71,9 @@ class HybridRetriever:
         cc_alpha: float = None,
         user_profile_store=None,  # UserProfileStore for entity lookups
         group_profile_store=None,  # GroupProfileStore for group context
-        group_summary_store=None  # GroupSummaryStore for hierarchical summaries
+        group_summary_store=None,  # GroupSummaryStore for hierarchical summaries
+        dm_summary_store=None,  # DMSummaryStore for DM summaries
+        fact_store=None  # UserFactStore for user facts
     ):
         self.llm_client = llm_client
         self.unified_store = unified_store
@@ -83,6 +85,8 @@ class HybridRetriever:
         self.user_profile_store = user_profile_store
         self.group_profile_store = group_profile_store
         self.group_summary_store = group_summary_store
+        self.dm_summary_store = dm_summary_store
+        self.fact_store = fact_store
 
         self.semantic_top_k = semantic_top_k or config.SEMANTIC_TOP_K
         self.keyword_top_k = keyword_top_k or config.KEYWORD_TOP_K
@@ -939,30 +943,120 @@ Return ONLY the JSON, no other text.
             # Fallback to original query
             return [original_query]
     
-    def _plan_and_generate_queries(self, query: str) -> tuple:
+    def _plan_and_generate_queries(
+        self,
+        query: str,
+        user_id: str = None,
+        user_groups_summary: str = None,
+        recent_topics: List[str] = None
+    ) -> tuple:
         """
         Combined planning: analyze information requirements AND generate targeted queries
         in a single LLM call instead of two sequential calls.
 
+        Extended Planning System (v2):
+        - Detects ALL query intents in a single LLM call
+        - Temporal attributes (yesterday, last week, etc.)
+        - Summarization intent (resume, summarize, catch up)
+        - Entity focus (@user, person names, projects)
+        - Comparison queries (X vs Y)
+        - Memory type filtering (technical, social, business, personal)
+        - Confidence estimation for retrieval depth
+
+        Extended for Group Reference Resolution:
+        - If user_id and user_groups_summary are provided, also detects references to groups
+        - Returns group_hints and inferred_group_id when the query mentions "the group", "el grupo", etc.
+
+        Enhanced with Recent Topics (v3):
+        - If recent_topics is provided, the planner knows what has been discussed
+        - Helps generate better queries for continuation/recall questions
+        - Enables smarter summarization routing
+
+        Args:
+            query: The user's question
+            user_id: Optional user ID for group reference resolution
+            user_groups_summary: Optional summary of groups the user is in
+            recent_topics: Optional list of recent conversation topics for context
+
         Returns:
             Tuple of (information_plan dict, list of search queries)
         """
+        # Build the group reference section if we have user groups info
+        group_reference_section = ""
+        group_reference_output = ""
+
+        # Build recent topics section (~20-30 tokens extra)
+        topics_section = ""
+        if recent_topics:
+            topics_str = ", ".join(recent_topics[:10])
+            topics_section = f"\nRecent conversation topics: [{topics_str}]"
+            print(f"[Planning] Including {len(recent_topics)} recent topics in context")
+
+        if user_groups_summary:
+            group_reference_section = f"""
+6. Does the question reference a group (e.g., "the group", "el grupo", "in the chat", "what they said")?
+   If yes, identify which group the user likely means based on context clues.
+
+User's Groups:
+{user_groups_summary}
+"""
+            group_reference_output = """
+  "references_group": true|false,
+  "group_hints": ["keyword1", "keyword2"],
+  "inferred_group_id": "group_id or null",
+  "group_inference_confidence": "high|medium|low","""
+
         prompt = f"""
 Analyze the following question and generate targeted search queries to find the answer in a PERSONAL MEMORY STORE (conversations, facts shared by users, user profiles). This is NOT a web search.
 
-Question: {query}
+Question: {query}{topics_section}
 
 Think step by step:
-1. What type of question is this? (factual, temporal, relational, etc.)
-2. What key entities need to be identified?
-3. What minimal set of search queries would find the relevant memories?
-4. Are there technical terms requiring exact lexical matching?
+1. What TYPE of question is this? (factual, temporal, entity_focused, comparative, multi_hop, negative, summarization)
+2. What key entities (people, projects, topics) need to be identified?
+3. Does it have TEMPORAL attributes (yesterday, last week, last month, today)?
+4. Is it a SUMMARIZATION request (resume, summarize, catch up, what happened)?
+5. Is it ENTITY-FOCUSED on a specific person (mentions @username or a name)?
+6. If recent topics are provided, consider if the query relates to any of them.{group_reference_section}
 
 Return in JSON format:
 ```json
-{{
-  "question_type": "type of question",
+{{{group_reference_output}
+  "question_type": "factual|temporal|entity_focused|comparative|multi_hop|negative|summarization",
+
   "key_entities": ["entity1", "entity2"],
+
+  "temporal_attributes": {{
+    "time_reference": "relative|absolute|range|null",
+    "period": "yesterday|last_week|last_month|today|null",
+    "lookback_days": null,
+    "recency_bias_level": 0.2
+  }},
+
+  "summarization_intent": {{
+    "use_summaries": false,
+    "summary_level": "micro|chunk|block|null",
+    "scope": "today|weekly|monthly|null"
+  }},
+
+  "entity_focus": {{
+    "primary_entity": null,
+    "entity_type": "person|project|topic|null",
+    "search_scope": "memories_by_entity|facts_about_entity|null"
+  }},
+
+  "comparison": {{
+    "is_comparative": false,
+    "entity1": null,
+    "entity2": null,
+    "aspect": null
+  }},
+
+  "memory_type_filter": "technical|social|business|personal|mixed|null",
+
+  "question_confidence": 0.8,
+  "retrieval_depth": "shallow|medium|deep",
+
   "required_info": [
     {{
       "info_type": "what kind of information",
@@ -979,9 +1073,24 @@ Return in JSON format:
 }}
 ```
 
+GUIDELINES for setting fields:
+- For "resume/summarize/catch up/what happened" queries -> summarization_intent.use_summaries=true, summary_level based on scope
+- For "@Bob" or "what does X know" -> entity_focus.primary_entity="Bob", search_scope="facts_about_entity"
+- For "yesterday/last week/last month" -> temporal_attributes.period=appropriate value, set lookback_days (1, 7, 30)
+- For "yesterday" -> recency_bias_level=0.9 (high), "last month" -> recency_bias_level=0.3 (lower)
+- For ambiguous queries -> question_confidence < 0.7, retrieval_depth="deep"
+- For technical queries (code, errors, bugs, deployment) -> memory_type_filter="technical"
+- For social queries (relationships, feelings, opinions) -> memory_type_filter="social"
+- For "X vs Y" or "compare X and Y" -> comparison.is_comparative=true, set entity1/entity2
+
 For exact_match_terms, include ONLY terms requiring exact lexical matching (function names, error codes, version numbers, file names).
 Set use_keyword_boost=true ONLY if exact_match_terms is non-empty.
-
+{f'''
+For references_group: set to true if the query mentions "the group", "el grupo", "the chat", "in that group", "what they discussed", etc.
+For group_hints: extract keywords that might identify which group (e.g., "trading", "dev", "builders", topic names).
+For inferred_group_id: if you can confidently match a group from the list, provide its ID. Otherwise null.
+For group_inference_confidence: high (clear match), medium (likely match), low (uncertain).
+''' if user_groups_summary else ''}
 For queries: generate 1-3 focused queries. Always include the original question. Each query should target a distinct information need. Keep queries natural and conversational (these search a memory store, NOT the web).
 
 Return ONLY the JSON, no other text.
@@ -1008,14 +1117,73 @@ Return ONLY the JSON, no other text.
                 queries.insert(0, query)
             queries = queries[:4]
 
-            # Build information_plan from the combined response
+            # Build information_plan from the combined response with extended planning fields
             information_plan = {
+                # Basic fields
                 "question_type": result.get("question_type", "general"),
                 "key_entities": result.get("key_entities", []),
                 "required_info": result.get("required_info", []),
                 "exact_match_terms": result.get("exact_match_terms", []),
                 "use_keyword_boost": result.get("use_keyword_boost", False),
+
+                # Extended planning fields (v2)
+                "temporal_attributes": result.get("temporal_attributes", {
+                    "time_reference": None,
+                    "period": None,
+                    "lookback_days": None,
+                    "recency_bias_level": 0.2
+                }),
+                "summarization_intent": result.get("summarization_intent", {
+                    "use_summaries": False,
+                    "summary_level": None,
+                    "scope": None
+                }),
+                "entity_focus": result.get("entity_focus", {
+                    "primary_entity": None,
+                    "entity_type": None,
+                    "search_scope": None
+                }),
+                "comparison": result.get("comparison", {
+                    "is_comparative": False,
+                    "entity1": None,
+                    "entity2": None,
+                    "aspect": None
+                }),
+                "memory_type_filter": result.get("memory_type_filter"),
+                "question_confidence": result.get("question_confidence", 0.8),
+                "retrieval_depth": result.get("retrieval_depth", "medium"),
+
+                # Group reference resolution fields
+                "references_group": result.get("references_group", False),
+                "group_hints": result.get("group_hints", []),
+                "inferred_group_id": result.get("inferred_group_id"),
+                "group_inference_confidence": result.get("group_inference_confidence", "low"),
             }
+
+            # Log extended plan for debugging
+            print(f"[Planning] Extended plan: question_type={information_plan.get('question_type')}, "
+                  f"confidence={information_plan.get('question_confidence')}, "
+                  f"depth={information_plan.get('retrieval_depth')}")
+
+            if information_plan.get("summarization_intent", {}).get("use_summaries"):
+                print(f"[Planning] Summarization intent detected: level={information_plan['summarization_intent'].get('summary_level')}, "
+                      f"scope={information_plan['summarization_intent'].get('scope')}")
+
+            if information_plan.get("temporal_attributes", {}).get("period"):
+                print(f"[Planning] Temporal attributes: period={information_plan['temporal_attributes'].get('period')}, "
+                      f"lookback_days={information_plan['temporal_attributes'].get('lookback_days')}, "
+                      f"recency_bias={information_plan['temporal_attributes'].get('recency_bias_level')}")
+
+            if information_plan.get("entity_focus", {}).get("primary_entity"):
+                print(f"[Planning] Entity focus: entity={information_plan['entity_focus'].get('primary_entity')}, "
+                      f"type={information_plan['entity_focus'].get('entity_type')}, "
+                      f"scope={information_plan['entity_focus'].get('search_scope')}")
+
+            # Log group reference detection
+            if information_plan.get("references_group"):
+                print(f"[Planning] Detected group reference: hints={information_plan.get('group_hints')}, "
+                      f"inferred={information_plan.get('inferred_group_id')}, "
+                      f"confidence={information_plan.get('group_inference_confidence')}")
 
             return information_plan, queries
 
@@ -1027,7 +1195,295 @@ Return ONLY the JSON, no other text.
                 "required_info": [{"info_type": "general", "description": "relevant information", "priority": "high"}],
                 "exact_match_terms": [],
                 "use_keyword_boost": False,
+                # Extended planning defaults
+                "temporal_attributes": {
+                    "time_reference": None,
+                    "period": None,
+                    "lookback_days": None,
+                    "recency_bias_level": 0.2
+                },
+                "summarization_intent": {
+                    "use_summaries": False,
+                    "summary_level": None,
+                    "scope": None
+                },
+                "entity_focus": {
+                    "primary_entity": None,
+                    "entity_type": None,
+                    "search_scope": None
+                },
+                "comparison": {
+                    "is_comparative": False,
+                    "entity1": None,
+                    "entity2": None,
+                    "aspect": None
+                },
+                "memory_type_filter": None,
+                "question_confidence": 0.8,
+                "retrieval_depth": "medium",
+                # Group reference defaults
+                "references_group": False,
+                "group_hints": [],
+                "inferred_group_id": None,
+                "group_inference_confidence": "low",
             }, [query]
+
+    def _get_user_groups_summary(self, user_id: str) -> str:
+        """
+        Get a formatted summary of all groups the user participates in.
+
+        Used for Group Reference Resolution - provides context to the LLM
+        about which groups the user is in, so it can infer which group
+        they're asking about.
+
+        Args:
+            user_id: User ID (format: platform:user_id)
+
+        Returns:
+            Formatted string with group info for the LLM prompt, e.g.:
+            "- Group: Crypto Trading (-100789), topics: trading, defi, last active: 2h ago
+             - Group: DeFi Builders (-100456), topics: development, solidity, last active: 1d ago"
+        """
+        if not hasattr(self.unified_store, 'user_memories'):
+            return ""
+
+        try:
+            # Get groups from user_memories table
+            groups_data = self.unified_store.user_memories.get_groups_for_user(user_id)
+
+            if not groups_data:
+                print(f"[Group Resolution] No groups found for user {user_id}")
+                return ""
+
+            # Enrich with group profile info (name, topics)
+            lines = []
+            for group_id, group_meta in groups_data.items():
+                group_name = group_id  # Default to ID
+                topics = []
+
+                # Try to get group profile for richer info
+                if self.group_profile_store:
+                    try:
+                        group_profile = self.group_profile_store.get_group_profile(group_id)
+                        if group_profile:
+                            group_name = group_profile.group_name or group_id
+                            topics = group_profile.main_topics or []
+                    except Exception as e:
+                        print(f"[Group Resolution] Failed to get profile for {group_id}: {e}")
+
+                # Format the line
+                topics_str = ", ".join(topics[:5]) if topics else "no topics"
+                memory_count = group_meta.get("memory_count", 0)
+                last_active = group_meta.get("last_active", "unknown")
+
+                # Calculate relative time for last_active
+                if last_active and last_active != "unknown":
+                    try:
+                        from datetime import datetime, timezone
+                        last_dt = datetime.fromisoformat(last_active.replace('Z', '+00:00'))
+                        now = datetime.now(timezone.utc)
+                        delta = now - last_dt
+                        if delta.days > 0:
+                            relative_time = f"{delta.days}d ago"
+                        elif delta.seconds > 3600:
+                            relative_time = f"{delta.seconds // 3600}h ago"
+                        else:
+                            relative_time = f"{delta.seconds // 60}m ago"
+                    except:
+                        relative_time = "unknown"
+                else:
+                    relative_time = "unknown"
+
+                lines.append(f"- Group: {group_name} (ID: {group_id}), topics: [{topics_str}], memories: {memory_count}, last active: {relative_time}")
+
+            summary = "\n".join(lines)
+            print(f"[Group Resolution] User {user_id} groups summary:\n{summary}")
+            return summary
+
+        except Exception as e:
+            print(f"[Group Resolution] Error getting groups summary for {user_id}: {e}")
+            return ""
+
+    def _resolve_group_by_hints(self, user_id: str, hints: List[str], query: str) -> Optional[str]:
+        """
+        Resolve which group the user is referring to based on hints.
+
+        When the LLM can't confidently infer the group but detected hints
+        (keywords like "trading", "dev", etc.), this method tries to match
+        those hints against the user's groups.
+
+        Resolution strategy:
+        1. If user is in only 1 group, return that
+        2. Score groups by keyword match (hints vs group name/topics)
+        3. Score groups by semantic similarity (query vs group summary)
+        4. Return the highest scoring group
+
+        Args:
+            user_id: User ID
+            hints: Keywords extracted from the query (e.g., ["trading", "crypto"])
+            query: The original query for semantic matching
+
+        Returns:
+            group_id if resolved, None otherwise
+        """
+        if not hasattr(self.unified_store, 'user_memories'):
+            return None
+
+        try:
+            # Get groups the user is in
+            groups_data = self.unified_store.user_memories.get_groups_for_user(user_id)
+
+            if not groups_data:
+                return None
+
+            # If only 1 group, return it
+            if len(groups_data) == 1:
+                group_id = list(groups_data.keys())[0]
+                print(f"[Group Resolution] User in only 1 group: {group_id}")
+                return group_id
+
+            # Score each group
+            group_scores = {}
+
+            for group_id in groups_data.keys():
+                score = 0.0
+                group_name = group_id
+                topics = []
+
+                # Get group profile for matching
+                if self.group_profile_store:
+                    try:
+                        group_profile = self.group_profile_store.get_group_profile(group_id)
+                        if group_profile:
+                            group_name = group_profile.group_name or group_id
+                            topics = group_profile.main_topics or []
+                    except:
+                        pass
+
+                # Keyword matching (hints vs group name + topics)
+                searchable_text = f"{group_name} {' '.join(topics)}".lower()
+                for hint in hints:
+                    if hint.lower() in searchable_text:
+                        score += 1.0
+                        print(f"[Group Resolution] Hint '{hint}' matched group {group_id}")
+
+                # Semantic matching (query vs group summary) if we have embeddings
+                if self.group_profile_store and hasattr(self.unified_store, 'embedding_model'):
+                    try:
+                        group_profile = self.group_profile_store.get_group_profile(group_id)
+                        if group_profile and group_profile.summary:
+                            # Encode query and summary
+                            query_vec = self.unified_store.embedding_model.encode_single(query, is_query=True)
+                            summary_vec = self.unified_store.embedding_model.encode_single(group_profile.summary, is_query=False)
+
+                            # Compute cosine similarity
+                            import numpy as np
+                            dot_product = np.dot(query_vec, summary_vec)
+                            norm_q = np.linalg.norm(query_vec)
+                            norm_s = np.linalg.norm(summary_vec)
+                            if norm_q > 0 and norm_s > 0:
+                                similarity = dot_product / (norm_q * norm_s)
+                                score += similarity * 0.5  # Weight semantic less than keyword
+                    except Exception as e:
+                        print(f"[Group Resolution] Semantic scoring failed for {group_id}: {e}")
+
+                # Recency boost (more recent activity = slight boost)
+                last_active = groups_data[group_id].get("last_active", "")
+                if last_active:
+                    try:
+                        from datetime import datetime, timezone
+                        last_dt = datetime.fromisoformat(last_active.replace('Z', '+00:00'))
+                        now = datetime.now(timezone.utc)
+                        days_ago = (now - last_dt).days
+                        if days_ago < 1:
+                            score += 0.3
+                        elif days_ago < 7:
+                            score += 0.1
+                    except:
+                        pass
+
+                group_scores[group_id] = score
+
+            # Find the best match
+            if group_scores:
+                best_group = max(group_scores.items(), key=lambda x: x[1])
+                if best_group[1] > 0:  # Only return if we have some confidence
+                    print(f"[Group Resolution] Best match: {best_group[0]} (score: {best_group[1]:.2f})")
+                    return best_group[0]
+
+            print(f"[Group Resolution] No confident match found, scores: {group_scores}")
+            return None
+
+        except Exception as e:
+            print(f"[Group Resolution] Error resolving group: {e}")
+            return None
+
+    def _resolve_entity_to_user_id(self, entity_name: str, context: Dict[str, Any]) -> Optional[str]:
+        """
+        Resolve an entity name (e.g., "Bob", "@alice") to a user_id.
+
+        Used for entity-focused queries detected by extended planning.
+        Tries multiple resolution strategies:
+        1. Direct @username match (strip @)
+        2. Search user profiles by name
+        3. Search user memories for name mentions
+
+        Args:
+            entity_name: The entity name (e.g., "Bob", "@alice", "Alice")
+            context: Context dict with group_id for scoping
+
+        Returns:
+            user_id if resolved, None otherwise
+        """
+        if not entity_name:
+            return None
+
+        # Clean up entity name
+        clean_name = entity_name.strip().lstrip('@').lower()
+        print(f"[Entity Resolution] Resolving entity: '{entity_name}' -> '{clean_name}'")
+
+        # Try 1: Direct telegram username format
+        if self.user_profile_store:
+            try:
+                # Search by username (exact match)
+                profiles = self.user_profile_store.search_profiles(clean_name, limit=5)
+                for profile in profiles:
+                    # Check if username matches (case-insensitive)
+                    if profile.username and profile.username.lower() == clean_name:
+                        print(f"[Entity Resolution] Matched by username: {profile.universal_id}")
+                        return profile.universal_id
+                    # Check if display name matches
+                    if profile.display_name and clean_name in profile.display_name.lower():
+                        print(f"[Entity Resolution] Matched by display_name: {profile.universal_id}")
+                        return profile.universal_id
+            except Exception as e:
+                print(f"[Entity Resolution] Profile search failed: {e}")
+
+        # Try 2: Search user_memories for mentions of this name in the current group
+        group_id = context.get("group_id")
+        if group_id and hasattr(self.unified_store, 'user_memories'):
+            try:
+                # Search for memories mentioning this name
+                query_vec = self.unified_store.embedding_model.encode_single(entity_name, is_query=True)
+                user_mems = self.unified_store.user_memories.search_in_group(group_id, query_vec, limit=5)
+                for mem in user_mems:
+                    if clean_name in mem.speaker.lower() if mem.speaker else False:
+                        print(f"[Entity Resolution] Matched by user_memory speaker: {mem.user_id}")
+                        return mem.user_id
+            except Exception as e:
+                print(f"[Entity Resolution] User memory search failed: {e}")
+
+        # Try 3: Construct likely user_id from context platform
+        platform = context.get("platform", "telegram")
+        # If the name looks like a username, try to construct user_id
+        if clean_name.isalnum() or '_' in clean_name:
+            # This is a best-guess - might not be accurate
+            guessed_id = f"{platform}:{clean_name}"
+            print(f"[Entity Resolution] Guessing user_id: {guessed_id} (not verified)")
+            return guessed_id
+
+        print(f"[Entity Resolution] Could not resolve entity: {entity_name}")
+        return None
 
     def _retrieve_with_intelligent_reflection(self, query: str, initial_results: List[MemoryEntry], information_plan: Dict[str, Any]) -> List[MemoryEntry]:
         """
@@ -1337,10 +1793,16 @@ Return ONLY JSON.
         limit: int
     ) -> Dict[str, Any]:
         """
-        Context-aware retrieval for DM conversations.
+        Context-aware retrieval for DM conversations with PARALLEL search.
+
+        Extended for Group Reference Resolution:
+        - Detects when user asks about "the group" without specifying which
+        - Infers which group they mean based on context and their group memberships
+        - Automatically searches the inferred group for relevant memories
 
         Access Rules for DM with User X:
-        - SEES: DM history with X, shareable group memories from X, cross-group memories, user facts
+        - SEES: DM history with X, shareable group memories from X, cross-group memories,
+                user facts, agent responses to X, related topics
         - NOT: DMs of other users, non-shareable group memories
 
         Args:
@@ -1350,109 +1812,251 @@ Return ONLY JSON.
             limit: Max results per source
 
         Returns:
-            Dict with dm_memories, shareable_context, cross_group_memories, user_facts, formatted_context
+            Dict with dm_memories, agent_responses, topics, user_facts, formatted_context
         """
         print(f"\n[retrieve_for_context] DM retrieval for user {user_id}: {query}")
 
-        # Step 1: Combined planning + query generation
-        information_plan, search_queries = self._plan_and_generate_queries(query)
+        top_k = self.semantic_top_k
+        universal_id = user_id if ':' in user_id else f"telegram:{user_id}"
+
+        # ============================================================
+        # Step 0: Context Gathering for Enhanced Planning
+        # ============================================================
+        # Get user's groups summary for group reference detection
+        user_groups_summary = self._get_user_groups_summary(universal_id)
+
+        # Get recent topics from DM summaries for planner context
+        recent_topics = []
+        dm_summary_store = getattr(self, 'dm_summary_store', None)
+        if dm_summary_store:
+            dm_key = f"dm_{universal_id}"
+            try:
+                recent_topics = dm_summary_store.get_recent_topics(dm_key, limit=10)
+                if recent_topics:
+                    print(f"[DM Retrieval] Found {len(recent_topics)} recent topics for planner context")
+            except Exception as e:
+                print(f"[DM Retrieval] Failed to get recent topics: {e}")
+
+        # Step 1: Combined planning + query generation (with group reference + topics)
+        information_plan, search_queries = self._plan_and_generate_queries(
+            query,
+            user_id=universal_id,
+            user_groups_summary=user_groups_summary if user_groups_summary else None,
+            recent_topics=recent_topics if recent_topics else None
+        )
         print(f"[DM Retrieval] Generated {len(search_queries)} targeted queries")
 
-        top_k = self.semantic_top_k
+        # ============================================================
+        # Extended Planning: Check for summarization shortcut
+        # ============================================================
+        if information_plan.get("summarization_intent", {}).get("use_summaries"):
+            print(f"[DM Retrieval] Summarization intent detected - using summary shortcut")
+            summary_result = self._retrieve_from_summaries(
+                information_plan,
+                {"user_id": universal_id, "is_dm": True},
+                query=query
+            )
+            # If we got summaries, we can return early (biggest token savings)
+            if summary_result.get("summaries"):
+                print(f"[DM Retrieval] Returning {len(summary_result['summaries'])} summaries (shortcut)")
+                return summary_result
 
-        # Step 2: Batch-encode queries
+        # ============================================================
+        # Extended Planning: Determine dynamic retrieval parameters
+        # ============================================================
+        # Confidence-based depth
+        question_confidence = information_plan.get("question_confidence", 0.8)
+        retrieval_depth = information_plan.get("retrieval_depth", "medium")
+        if question_confidence < 0.7 or retrieval_depth == "deep":
+            top_k = 15  # More results for ambiguous queries
+            print(f"[DM Retrieval] Low confidence ({question_confidence}) - using deep retrieval (top_k={top_k})")
+        elif retrieval_depth == "shallow":
+            top_k = min(5, self.semantic_top_k)
+        else:
+            top_k = self.semantic_top_k
+
+        # Dynamic recency bias from temporal attributes
+        recency_bias = information_plan.get("temporal_attributes", {}).get("recency_bias_level", 0.2)
+
+        # Check for group reference and resolve if needed
+        reference_group_id = context.get('group_id')  # Explicit reference from caller
+        is_cross_context = reference_group_id and context.get('is_dm_with_group_reference')
+
+        # If no explicit reference but planning detected a group reference, try to resolve
+        if not reference_group_id and information_plan.get("references_group"):
+            print(f"[Group Resolution] Query references a group, attempting to resolve...")
+
+            # First try the LLM's inferred group (if confident)
+            inferred_group = information_plan.get("inferred_group_id")
+            confidence = information_plan.get("group_inference_confidence", "low")
+
+            if inferred_group and confidence in ("high", "medium"):
+                reference_group_id = inferred_group
+                print(f"[Group Resolution] Using LLM-inferred group: {reference_group_id} (confidence: {confidence})")
+            else:
+                # Fall back to hint-based resolution
+                hints = information_plan.get("group_hints", [])
+                if hints:
+                    resolved = self._resolve_group_by_hints(universal_id, hints, query)
+                    if resolved:
+                        reference_group_id = resolved
+                        print(f"[Group Resolution] Resolved via hints: {reference_group_id}")
+
+            # If we resolved a group, enable cross-context search
+            if reference_group_id:
+                is_cross_context = True
+                context['group_id'] = reference_group_id
+                context['is_dm_with_group_reference'] = True
+                context['group_resolved_automatically'] = True
+                print(f"[Group Resolution] Enabled cross-context search for group: {reference_group_id}")
+
+        # Step 2: Batch-encode queries (single operation for all queries)
         query_vectors = self.unified_store.embedding_model.encode_query(search_queries)
         query_vector_map = {sq: query_vectors[i] for i, sq in enumerate(search_queries)}
+        # Use first query vector for single-vector searches
+        primary_query_vector = query_vectors[0] if query_vectors is not None and len(query_vectors) > 0 else None
 
-        # Step 3: Search DM memories (from dm_memories table)
+        # ============================================================
+        # Step 3: PARALLEL SEARCH - All independent searches run concurrently
+        # ============================================================
         dm_memories = []
-        try:
-            for sq in search_queries:
-                qv = query_vector_map[sq]
-                results = self.unified_store.search_memories(sq, user_id=user_id, top_k=top_k, query_vector=qv)
-                dm_memories.extend(results)
-            dm_memories = self._deduplicate_by_id(dm_memories, "entry_id")
-            # Apply content-based deduplication to remove near-duplicates
-            # Higher threshold (0.95) because e5-small has high similarity for structurally similar texts
-            dm_memories = self._deduplicate_by_content(dm_memories, "dm_memories", similarity_threshold=0.95)
-            print(f"[DM Retrieval] Found {len(dm_memories)} DM memories")
-        except Exception as e:
-            print(f"[DM Retrieval] DM memories search failed: {e}")
-
-        # Step 4: Search user memories from groups for this user (context from group interactions)
         user_memories_from_groups = []
-        try:
-            if hasattr(self.unified_store, 'user_memories'):
-                for sq in search_queries:
-                    qv = query_vector_map[sq]
-                    # Search user memories where this user participated
-                    results = self.unified_store.user_memories.search_by_user(user_id, qv, top_k)
-                    user_memories_from_groups.extend(results)
-                user_memories_from_groups = self._deduplicate_by_id(user_memories_from_groups, "memory_id")
-                print(f"[DM Retrieval] Found {len(user_memories_from_groups)} user memories from groups")
-        except Exception as e:
-            print(f"[DM Retrieval] User memories search failed: {e}")
-
-        # Step 5: Search cross-group memories for this user
         cross_group_memories = []
-        if user_id:
-            # Use user_id directly if it already has platform prefix, otherwise assume format
-            universal_id = user_id if ':' in user_id else f"telegram:{user_id}"
-            for sq in search_queries:
-                qv = query_vector_map[sq]
-                try:
-                    cg = self.unified_store.search_cross_group(universal_id, sq, limit=top_k, query_vector=qv)
-                    cross_group_memories.extend(cg)
-                except Exception as e:
-                    print(f"[DM Retrieval] Cross-group search failed: {e}")
-
-        cross_group_memories = self._deduplicate_by_id(cross_group_memories, "memory_id")
-
-        # Step 5b: If reference_group_id provided, search in that specific group
         group_memories = []
-        reference_group_id = context.get('group_id')  # This is the reference group for cross-context
-        if reference_group_id and context.get('is_dm_with_group_reference'):
-            print(f"[DM Retrieval] Cross-context: searching in reference group {reference_group_id}")
+        agent_responses = []
+        related_topics = []
+        involved_user_memories = []
+        user_facts = []
+
+        involved_users = context.get('involved_users', [])
+        fact_store = getattr(self, 'fact_store', None) or getattr(self.unified_store, 'fact_store', None)
+
+        # ============================================================
+        # Extended Planning: Entity-focused search
+        # ============================================================
+        # If entity_focus detected a primary entity (e.g., "@Bob"), add to involved_users
+        entity_focus = information_plan.get("entity_focus", {})
+        if entity_focus.get("primary_entity") and entity_focus.get("entity_type") == "person":
+            primary_entity = entity_focus.get("primary_entity")
+            # Try to resolve entity name to user_id
+            entity_user_id = self._resolve_entity_to_user_id(primary_entity, context)
+            if entity_user_id and entity_user_id not in involved_users:
+                involved_users.append(entity_user_id)
+                print(f"[DM Retrieval] Added entity-focused user: {entity_user_id} (from '{primary_entity}')")
+
+        def search_dm_memories():
+            """Search DM memories for this user."""
+            results = []
             try:
                 for sq in search_queries:
                     qv = query_vector_map[sq]
-                    # Search group memories
-                    gm = self.unified_store.search_group_memories(reference_group_id, sq, limit=top_k, query_vector=qv)
-                    group_memories.extend(gm)
-                    # Search user memories in that group
-                    um = self.unified_store.search_user_memories_in_group(reference_group_id, sq, limit=top_k, query_vector=qv)
-                    user_memories_from_groups.extend(um)
-                group_memories = self._deduplicate_by_id(group_memories, "memory_id")
-                user_memories_from_groups = self._deduplicate_by_id(user_memories_from_groups, "memory_id")
-                print(f"[DM Retrieval] Found {len(group_memories)} group memories from reference group")
+                    r = self.unified_store.search_memories(sq, user_id=user_id, top_k=top_k, query_vector=qv)
+                    results.extend(r)
+            except Exception as e:
+                print(f"[DM Retrieval] DM memories search failed: {e}")
+            return results
+
+        def search_user_memories_from_groups():
+            """Search user memories from groups where this user participated."""
+            results = []
+            try:
+                if hasattr(self.unified_store, 'user_memories'):
+                    for sq in search_queries:
+                        qv = query_vector_map[sq]
+                        r = self.unified_store.user_memories.search_by_user(user_id, qv, top_k)
+                        results.extend(r)
+            except Exception as e:
+                print(f"[DM Retrieval] User memories search failed: {e}")
+            return results
+
+        def search_cross_group_memories():
+            """Search cross-group memories for this user."""
+            results = []
+            try:
+                for sq in search_queries:
+                    qv = query_vector_map[sq]
+                    cg = self.unified_store.search_cross_group(universal_id, sq, limit=top_k, query_vector=qv)
+                    results.extend(cg)
+            except Exception as e:
+                print(f"[DM Retrieval] Cross-group search failed: {e}")
+            return results
+
+        def search_agent_responses():
+            """Search what agent has said to this user before (by trigger and response)."""
+            results = []
+            try:
+                if hasattr(self.unified_store, 'search_agent_responses_by_trigger'):
+                    # Search by similar questions (trigger)
+                    similar_qs = self.unified_store.search_agent_responses_by_trigger(
+                        query, user_id=user_id, limit=3
+                    )
+                    results.extend(similar_qs)
+                if hasattr(self.unified_store, 'search_agent_responses_by_response'):
+                    # Search by similar responses
+                    similar_rs = self.unified_store.search_agent_responses_by_response(
+                        query, user_id=user_id, limit=3
+                    )
+                    # Avoid duplicates
+                    existing_ids = {r.get('response_id') for r in results}
+                    for r in similar_rs:
+                        if r.get('response_id') not in existing_ids:
+                            results.append(r)
+            except Exception as e:
+                print(f"[DM Retrieval] Agent responses search failed: {e}")
+            return results
+
+        def search_related_topics():
+            """Search topics related to the query for this user."""
+            results = []
+            try:
+                if hasattr(self.unified_store, 'dm_topics') and primary_query_vector is not None:
+                    # Search topics by semantic similarity
+                    topics = self.unified_store.dm_topics.search_semantic(
+                        user_id=user_id,
+                        query_vector=primary_query_vector,
+                        limit=5
+                    )
+                    results.extend(topics)
+            except Exception as e:
+                print(f"[DM Retrieval] Topics search failed: {e}")
+            return results
+
+        def search_reference_group():
+            """Search in reference group (cross-context DM asking about a group)."""
+            gm, um = [], []
+            if not is_cross_context:
+                return gm, um
+            try:
+                for sq in search_queries:
+                    qv = query_vector_map[sq]
+                    gm.extend(self.unified_store.search_group_memories(reference_group_id, sq, limit=top_k, query_vector=qv))
+                    um.extend(self.unified_store.search_user_memories_in_group(reference_group_id, sq, limit=top_k, query_vector=qv))
             except Exception as e:
                 print(f"[DM Retrieval] Reference group search failed: {e}")
+            return gm, um
 
-        # Step 5c: Search memories about involved/mentioned users
-        involved_user_memories = []
-        involved_users = context.get('involved_users', [])
-        if involved_users:
-            print(f"[DM Retrieval] Searching for involved users: {involved_users}")
-            fact_store = getattr(self, 'fact_store', None) or getattr(self.unified_store, 'fact_store', None)
+        def search_involved_users():
+            """Search memories/facts about mentioned users."""
+            results = []
+            if not involved_users:
+                return results
             for involved_user_id in involved_users:
                 try:
-                    # Get facts about the mentioned user
                     if fact_store:
                         facts = fact_store.get_user_facts(involved_user_id, min_confidence=0.3)
-                        for fact in facts[:5]:  # Limit per user
-                            involved_user_memories.append({
+                        for fact in facts[:5]:
+                            results.append({
                                 "type": "user_fact",
                                 "user_id": involved_user_id,
                                 "content": fact.content,
                                 "fact_type": fact.fact_type.value if hasattr(fact.fact_type, 'value') else fact.fact_type
                             })
-                    # Get user memories from groups
                     if hasattr(self.unified_store, 'user_memories'):
-                        for sq in search_queries[:2]:  # Limit queries
+                        for sq in search_queries[:2]:
                             qv = query_vector_map[sq]
                             um = self.unified_store.user_memories.search_by_user(involved_user_id, qv, 3)
                             for m in um:
-                                involved_user_memories.append({
+                                results.append({
                                     "type": "user_memory",
                                     "user_id": involved_user_id,
                                     "content": m.content,
@@ -1460,17 +2064,68 @@ Return ONLY JSON.
                                 })
                 except Exception as e:
                     print(f"[DM Retrieval] Search for involved user {involved_user_id} failed: {e}")
-            print(f"[DM Retrieval] Found {len(involved_user_memories)} memories about involved users")
+            return results
 
-        # Step 6: Apply temporal scoring to all memory types
+        def get_user_facts():
+            """Get facts about this user."""
+            if not fact_store:
+                return []
+            try:
+                return fact_store.get_user_facts(user_id, min_confidence=0.3)
+            except Exception as e:
+                print(f"[DM Retrieval] Fact store lookup failed: {e}")
+                return []
+
+        # Execute all searches in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            future_dm = executor.submit(search_dm_memories)
+            future_user_mem = executor.submit(search_user_memories_from_groups)
+            future_cross = executor.submit(search_cross_group_memories)
+            future_agent = executor.submit(search_agent_responses)
+            future_topics = executor.submit(search_related_topics)
+            future_ref_group = executor.submit(search_reference_group)
+            future_involved = executor.submit(search_involved_users)
+            future_facts = executor.submit(get_user_facts)
+
+            # Collect results
+            dm_memories = future_dm.result()
+            user_memories_from_groups = future_user_mem.result()
+            cross_group_memories = future_cross.result()
+            agent_responses = future_agent.result()
+            related_topics = future_topics.result()
+            ref_group_result = future_ref_group.result()
+            involved_user_memories = future_involved.result()
+            user_facts = future_facts.result()
+
+            # Merge reference group results
+            if ref_group_result:
+                group_memories, extra_user_mem = ref_group_result
+                user_memories_from_groups.extend(extra_user_mem)
+
+        # ============================================================
+        # Step 4: Deduplicate results
+        # ============================================================
+        dm_memories = self._deduplicate_by_id(dm_memories, "entry_id")
+        dm_memories = self._deduplicate_by_content(dm_memories, "dm_memories", similarity_threshold=0.95)
+        user_memories_from_groups = self._deduplicate_by_id(user_memories_from_groups, "memory_id")
+        cross_group_memories = self._deduplicate_by_id(cross_group_memories, "memory_id")
+        group_memories = self._deduplicate_by_id(group_memories, "memory_id")
+        agent_responses = self._deduplicate_by_id(agent_responses, "response_id")
+
+        # ============================================================
+        # Step 5: Apply temporal scoring with dynamic recency bias
+        # ============================================================
+        # Use recency_bias from extended planning (higher = more emphasis on recent)
         if dm_memories:
-            dm_memories = self._apply_temporal_scoring(dm_memories)
+            dm_memories = self._apply_temporal_scoring(dm_memories, recency_boost=recency_bias)
         if user_memories_from_groups:
-            user_memories_from_groups = self._apply_temporal_scoring(user_memories_from_groups)
+            user_memories_from_groups = self._apply_temporal_scoring(user_memories_from_groups, recency_boost=recency_bias)
         if cross_group_memories:
-            cross_group_memories = self._apply_temporal_scoring(cross_group_memories)
+            cross_group_memories = self._apply_temporal_scoring(cross_group_memories, recency_boost=recency_bias)
 
-        # Step 7: Rerank and limit
+        # ============================================================
+        # Step 6: Rerank with cross-encoder and limit
+        # ============================================================
         if dm_memories:
             dm_memories = self._rerank_with_cross_encoder(query, dm_memories, limit)
         if user_memories_from_groups:
@@ -1478,26 +2133,21 @@ Return ONLY JSON.
         if cross_group_memories:
             cross_group_memories = self._rerank_with_cross_encoder(query, cross_group_memories, limit)
 
-        print(f"[DM Retrieval] Results: dm={len(dm_memories)}, user_from_groups={len(user_memories_from_groups)}, cross_group={len(cross_group_memories)}")
+        print(f"[DM Retrieval] Results: dm={len(dm_memories)}, user_groups={len(user_memories_from_groups)}, "
+              f"cross={len(cross_group_memories)}, agent_resp={len(agent_responses)}, topics={len(related_topics)}")
 
-        # Step 8: Get user facts (if fact store is available)
-        user_facts = []
-        fact_store = getattr(self, 'fact_store', None) or getattr(self.unified_store, 'fact_store', None)
-        if fact_store:
-            try:
-                user_facts = fact_store.get_user_facts(user_id, min_confidence=0.3)
-                print(f"[DM Retrieval] Found {len(user_facts)} user facts")
-            except Exception as e:
-                print(f"[DM Retrieval] Fact store lookup failed: {e}")
-
-        # Step 9: Format results
+        # ============================================================
+        # Step 7: Format results
+        # ============================================================
         raw_results = {
             "dm_memories": dm_memories,
             "group_memories": group_memories,
             "user_memories": user_memories_from_groups,
             "interaction_memories": [],
             "cross_group_memories": cross_group_memories,
-            "involved_user_memories": involved_user_memories
+            "involved_user_memories": involved_user_memories,
+            "agent_responses": agent_responses,
+            "related_topics": related_topics
         }
 
         formatted = self._format_dm_context_with_shareable(raw_results, context, user_facts)
@@ -1613,15 +2263,82 @@ Return ONLY JSON.
         """
         print(f"\n[retrieve_for_context] Intelligent group retrieval for: {query}")
 
-        # Step 1: Combined planning + query generation (single LLM call)
-        information_plan, search_queries = self._plan_and_generate_queries(query)
+        # Step 0.5: Get recent topics from group summaries for planner context
+        recent_topics = []
+        group_summary_store = self.group_summary_store
+        if group_summary_store:
+            try:
+                recent_topics = group_summary_store.get_recent_topics(group_id, limit=10)
+                if recent_topics:
+                    print(f"[Group Retrieval] Found {len(recent_topics)} recent topics for planner context")
+            except Exception as e:
+                print(f"[Group Retrieval] Failed to get recent topics: {e}")
+
+        # Step 1: Combined planning + query generation (with topics context)
+        information_plan, search_queries = self._plan_and_generate_queries(
+            query,
+            recent_topics=recent_topics if recent_topics else None
+        )
         print(f"[retrieve_for_context] Identified {len(information_plan.get('required_info', []))} info requirements")
         print(f"[retrieve_for_context] Generated {len(search_queries)} targeted queries")
 
+        # ============================================================
+        # Extended Planning: Check for summarization shortcut
+        # ============================================================
+        if information_plan.get("summarization_intent", {}).get("use_summaries"):
+            print(f"[Group Retrieval] Summarization intent detected - using summary shortcut")
+            summary_result = self._retrieve_from_summaries(
+                information_plan,
+                {"group_id": group_id, "is_dm": False},
+                query=query
+            )
+            # If we got summaries, we can return early (biggest token savings)
+            if summary_result.get("summaries"):
+                print(f"[Group Retrieval] Returning {len(summary_result['summaries'])} summaries (shortcut)")
+                return {
+                    **summary_result,
+                    "conversation_summary": conversation_summary,
+                    "relevant_profiles": [],
+                    "group_context": None,
+                    "historical_context": "",
+                    "agent_responses": {"similar_questions": [], "said_to_user": [], "said_in_group": []},
+                    "related_topics": []
+                }
+
+        # ============================================================
+        # Extended Planning: Determine dynamic retrieval parameters
+        # ============================================================
         use_keyword_boost = information_plan.get("use_keyword_boost", False)
         exact_match_terms = information_plan.get("exact_match_terms", [])
 
-        top_k = self.semantic_top_k
+        # Confidence-based depth
+        question_confidence = information_plan.get("question_confidence", 0.8)
+        retrieval_depth = information_plan.get("retrieval_depth", "medium")
+        if question_confidence < 0.7 or retrieval_depth == "deep":
+            top_k = 15  # More results for ambiguous queries
+            print(f"[Group Retrieval] Low confidence ({question_confidence}) - using deep retrieval (top_k={top_k})")
+        elif retrieval_depth == "shallow":
+            top_k = min(5, self.semantic_top_k)
+        else:
+            top_k = self.semantic_top_k
+
+        # Dynamic recency bias from temporal attributes
+        recency_bias = information_plan.get("temporal_attributes", {}).get("recency_bias_level", 0.2)
+
+        # ============================================================
+        # Extended Planning: Entity-focused search
+        # ============================================================
+        # If entity_focus detected a primary entity, add to involved_users
+        entity_focus = information_plan.get("entity_focus", {})
+        if entity_focus.get("primary_entity") and entity_focus.get("entity_type") == "person":
+            primary_entity = entity_focus.get("primary_entity")
+            entity_user_id = self._resolve_entity_to_user_id(primary_entity, context)
+            if entity_user_id:
+                if involved_users is None:
+                    involved_users = []
+                if entity_user_id not in involved_users:
+                    involved_users.append(entity_user_id)
+                    print(f"[Group Retrieval] Added entity-focused user: {entity_user_id} (from '{primary_entity}')")
 
         # Step 2: Batch-encode ALL queries at once (1 API call instead of N*4)
         query_vectors = self.unified_store.embedding_model.encode_query(search_queries)
@@ -1649,12 +2366,89 @@ Return ONLY JSON.
                 dm = self._search_shareable_dm_memories(sq, user_id, qv, top_k)
             return gm, um, im, cg, dm
 
+        def _search_agent_responses():
+            """Search agent responses for this group (parallel-safe)."""
+            agent_ctx = {"similar_questions": [], "said_to_user": [], "said_in_group": []}
+            try:
+                if hasattr(self.unified_store, 'search_agent_responses_by_trigger'):
+                    agent_ctx["similar_questions"] = self.unified_store.search_agent_responses_by_trigger(
+                        query, group_id=group_id, limit=3
+                    )
+                if hasattr(self.unified_store, 'search_agent_responses_by_response'):
+                    if user_id:
+                        agent_ctx["said_to_user"] = self.unified_store.search_agent_responses_by_response(
+                            query, user_id=user_id, limit=3
+                        )
+                    if group_id:
+                        agent_ctx["said_in_group"] = self.unified_store.search_agent_responses_by_response(
+                            query, group_id=group_id, limit=3
+                        )
+            except Exception as e:
+                print(f"[retrieve_for_context] agent_responses search failed: {e}")
+            return agent_ctx
+
+        def _search_group_topics():
+            """Search topics related to the query for this group."""
+            results = []
+            try:
+                if hasattr(self.unified_store, 'group_topics'):
+                    primary_qv = query_vectors[0] if query_vectors is not None and len(query_vectors) > 0 else None
+                    if primary_qv is not None:
+                        results = self.unified_store.group_topics.search_semantic(
+                            group_id=group_id, query_vector=primary_qv, limit=5
+                        )
+            except Exception as e:
+                print(f"[retrieve_for_context] group_topics search failed: {e}")
+            return results
+
+        def _get_profiles_and_context():
+            """Get user profiles and group context (parallel-safe)."""
+            profiles = []
+            grp_ctx = None
+            hist_ctx = ""
+            try:
+                if self.user_profile_store:
+                    if involved_users:
+                        for uid in involved_users:
+                            try:
+                                profile = self.user_profile_store.get_profile_by_universal_id(uid)
+                                if profile:
+                                    profiles.append(profile)
+                            except:
+                                pass
+                    else:
+                        profiles = self.user_profile_store.get_relevant_profiles(query=query, group_id=group_id, top_k=5)
+                if self.group_profile_store and group_id:
+                    grp_ctx = self.group_profile_store.get_group_context(group_id)
+                if self.group_summary_store and group_id:
+                    summaries = self.group_summary_store.get_context_summaries(
+                        group_id=group_id, limit_daily=3, limit_weekly=2, limit_monthly=1
+                    )
+                    hist_ctx = self._build_summary_context(summaries)
+            except Exception as e:
+                print(f"[retrieve_for_context] profiles/context lookup failed: {e}")
+            return profiles, grp_ctx, hist_ctx
+
+        # Pre-declare results for agent_responses, topics, profiles
+        agent_context = {"similar_questions": [], "said_to_user": [], "said_in_group": []}
+        related_topics = []
+        relevant_profiles = []
+        group_context = None
+        historical_context = ""
+
         if self.enable_parallel_retrieval and len(search_queries) > 1:
-            print(f"[retrieve_for_context] Parallel fan-out: {len(search_queries)} queries x 4 tables (vectors pre-computed)")
+            print(f"[retrieve_for_context] Parallel fan-out: {len(search_queries)} queries x 5 tables + agent_responses + topics (vectors pre-computed)")
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_retrieval_workers) as executor:
-                    futures = {executor.submit(_search_group_for_query, sq): sq for sq in search_queries}
-                    for future in concurrent.futures.as_completed(futures):
+                    # Submit memory queries
+                    memory_futures = {executor.submit(_search_group_for_query, sq): sq for sq in search_queries}
+                    # Submit agent_responses, topics, and profiles searches in parallel
+                    future_agent = executor.submit(_search_agent_responses)
+                    future_topics = executor.submit(_search_group_topics)
+                    future_profiles = executor.submit(_get_profiles_and_context)
+
+                    # Collect memory results
+                    for future in concurrent.futures.as_completed(memory_futures):
                         try:
                             gm, um, im, cg, dm = future.result()
                             all_group_memories.extend(gm)
@@ -1664,6 +2458,11 @@ Return ONLY JSON.
                             all_speaker_dm_memories.extend(dm)
                         except Exception as e:
                             print(f"[retrieve_for_context] Query failed: {e}")
+
+                    # Collect agent_responses, topics, profiles results
+                    agent_context = future_agent.result()
+                    related_topics = future_topics.result()
+                    relevant_profiles, group_context, historical_context = future_profiles.result()
             except Exception as e:
                 print(f"[retrieve_for_context] Parallel execution failed, falling back to sequential: {e}")
                 for sq in search_queries:
@@ -1673,6 +2472,9 @@ Return ONLY JSON.
                     all_interaction_memories.extend(im)
                     all_cross_group_memories.extend(cg)
                     all_speaker_dm_memories.extend(dm)
+                agent_context = _search_agent_responses()
+                related_topics = _search_group_topics()
+                relevant_profiles, group_context, historical_context = _get_profiles_and_context()
         else:
             for sq in search_queries:
                 print(f"[retrieve_for_context] Searching: {sq}")
@@ -1682,6 +2484,9 @@ Return ONLY JSON.
                 all_interaction_memories.extend(im)
                 all_cross_group_memories.extend(cg)
                 all_speaker_dm_memories.extend(dm)
+            agent_context = _search_agent_responses()
+            related_topics = _search_group_topics()
+            relevant_profiles, group_context, historical_context = _get_profiles_and_context()
 
         # Step 3: BM25 keyword boost for group tables
         if use_keyword_boost and exact_match_terms:
@@ -1726,18 +2531,19 @@ Return ONLY JSON.
         print(f"[retrieve_for_context] Results (pre-temporal): group={len(all_group_memories)}, user={len(all_user_memories)}, "
               f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}, speaker_dm={len(all_speaker_dm_memories)}")
 
-        # Step 4.6: Apply temporal scoring (recency boost + decay)
+        # Step 4.6: Apply temporal scoring with dynamic recency bias (recency boost + decay)
         # This is done BEFORE reranking so the cross-encoder sees temporally-adjusted scores
+        # Use recency_bias from extended planning (higher = more emphasis on recent)
         if all_group_memories:
-            all_group_memories = self._apply_temporal_scoring(all_group_memories)
+            all_group_memories = self._apply_temporal_scoring(all_group_memories, recency_boost=recency_bias)
         if all_user_memories:
-            all_user_memories = self._apply_temporal_scoring(all_user_memories)
+            all_user_memories = self._apply_temporal_scoring(all_user_memories, recency_boost=recency_bias)
         if all_interaction_memories:
-            all_interaction_memories = self._apply_temporal_scoring(all_interaction_memories)
+            all_interaction_memories = self._apply_temporal_scoring(all_interaction_memories, recency_boost=recency_bias)
         if all_cross_group_memories:
-            all_cross_group_memories = self._apply_temporal_scoring(all_cross_group_memories)
+            all_cross_group_memories = self._apply_temporal_scoring(all_cross_group_memories, recency_boost=recency_bias)
         if all_speaker_dm_memories:
-            all_speaker_dm_memories = self._apply_temporal_scoring(all_speaker_dm_memories)
+            all_speaker_dm_memories = self._apply_temporal_scoring(all_speaker_dm_memories, recency_boost=recency_bias)
 
         print(f"[retrieve_for_context] Results (pre-rerank): group={len(all_group_memories)}, user={len(all_user_memories)}, "
               f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}, speaker_dm={len(all_speaker_dm_memories)}")
@@ -1755,6 +2561,22 @@ Return ONLY JSON.
         print(f"[retrieve_for_context] Results (post-rerank): group={len(all_group_memories)}, user={len(all_user_memories)}, "
               f"interaction={len(all_interaction_memories)}, cross_group={len(all_cross_group_memories)}, speaker_dm={len(all_speaker_dm_memories)}")
 
+        # Log parallel search results
+        if agent_context.get("similar_questions"):
+            print(f"[retrieve_for_context] Found {len(agent_context['similar_questions'])} similar questions asked before")
+        if agent_context.get("said_to_user"):
+            print(f"[retrieve_for_context] Found {len(agent_context['said_to_user'])} responses said to this user")
+        if agent_context.get("said_in_group"):
+            print(f"[retrieve_for_context] Found {len(agent_context['said_in_group'])} responses said in this group")
+        if related_topics:
+            print(f"[retrieve_for_context] Found {len(related_topics)} related topics")
+        if relevant_profiles:
+            print(f"[retrieve_for_context] Found {len(relevant_profiles)} relevant profiles")
+        if group_context:
+            print(f"[retrieve_for_context] Retrieved group context for {group_id}")
+        if historical_context:
+            print(f"[retrieve_for_context] Retrieved hierarchical summaries for {group_id}")
+
         # Step 5: Format using existing method
         raw_results = {
             "dm_memories": [],
@@ -1762,110 +2584,9 @@ Return ONLY JSON.
             "user_memories": all_user_memories,
             "interaction_memories": all_interaction_memories,
             "cross_group_memories": all_cross_group_memories,
-            "speaker_dm_memories": all_speaker_dm_memories  # Speaker's shareable DM memories
+            "speaker_dm_memories": all_speaker_dm_memories,
+            "related_topics": related_topics
         }
-
-        # Step 6: Fetch relevant profiles and group context (lightweight entity system)
-        relevant_profiles = []
-        group_context = None
-
-        # Step 6.5: Search agent responses (dual-vector search)
-        agent_context = {
-            "similar_questions": [],
-            "said_to_user": [],
-            "said_in_group": []
-        }
-
-        if hasattr(self.unified_store, 'search_agent_responses_by_trigger'):
-            try:
-                # Search by trigger (similar questions asked before)
-                similar_qs = self.unified_store.search_agent_responses_by_trigger(
-                    query,
-                    group_id=group_id,
-                    limit=3
-                )
-                agent_context["similar_questions"] = similar_qs
-                if similar_qs:
-                    print(f"[retrieve_for_context] Found {len(similar_qs)} similar questions asked before")
-            except Exception as e:
-                print(f"[retrieve_for_context] search_agent_responses_by_trigger failed: {e}")
-
-        if hasattr(self.unified_store, 'search_agent_responses_by_response'):
-            # Search by response (what I said to this user)
-            if user_id:
-                try:
-                    said_to_user = self.unified_store.search_agent_responses_by_response(
-                        query,
-                        user_id=user_id,
-                        limit=3
-                    )
-                    agent_context["said_to_user"] = said_to_user
-                    if said_to_user:
-                        print(f"[retrieve_for_context] Found {len(said_to_user)} responses said to this user")
-                except Exception as e:
-                    print(f"[retrieve_for_context] search_agent_responses_by_response (user) failed: {e}")
-
-            # Search by response (what I said in this group)
-            if group_id:
-                try:
-                    said_in_group = self.unified_store.search_agent_responses_by_response(
-                        query,
-                        group_id=group_id,
-                        limit=3
-                    )
-                    agent_context["said_in_group"] = said_in_group
-                    if said_in_group:
-                        print(f"[retrieve_for_context] Found {len(said_in_group)} responses said in this group")
-                except Exception as e:
-                    print(f"[retrieve_for_context] search_agent_responses_by_response (group) failed: {e}")
-
-        if self.user_profile_store:
-            try:
-                # Use involved_users if provided, otherwise fall back to query-based lookup
-                if involved_users:
-                    # Lookup profiles for specific users (no embedding needed)
-                    for uid in involved_users:
-                        try:
-                            profile = self.user_profile_store.get_profile_by_universal_id(uid)
-                            if profile:
-                                relevant_profiles.append(profile)
-                        except Exception as e:
-                            print(f"[retrieve_for_context] Profile lookup failed for {uid}: {e}")
-                    print(f"[retrieve_for_context] Loaded {len(relevant_profiles)} profiles for involved_users")
-                else:
-                    # Fall back to semantic profile search
-                    relevant_profiles = self.user_profile_store.get_relevant_profiles(
-                        query=query,
-                        group_id=group_id,
-                        top_k=5
-                    )
-                    if relevant_profiles:
-                        print(f"[retrieve_for_context] Found {len(relevant_profiles)} relevant user profiles")
-            except Exception as e:
-                print(f"[retrieve_for_context] Profile lookup failed: {e}")
-
-        if self.group_profile_store and group_id:
-            try:
-                group_context = self.group_profile_store.get_group_context(group_id)
-                print(f"[retrieve_for_context] Retrieved group context for {group_id}")
-            except Exception as e:
-                print(f"[retrieve_for_context] Group context lookup failed: {e}")
-
-        # Get hierarchical summaries for context
-        historical_context = ""
-        if self.group_summary_store and group_id:
-            try:
-                summaries = self.group_summary_store.get_context_summaries(
-                    group_id=group_id,
-                    limit_daily=3,   # Last 3 days
-                    limit_weekly=2,  # Last 2 weeks
-                    limit_monthly=1  # Last month
-                )
-                historical_context = self._build_summary_context(summaries)
-                if historical_context:
-                    print(f"[retrieve_for_context] Retrieved hierarchical summaries for {group_id}")
-            except Exception as e:
-                print(f"[retrieve_for_context] Summary lookup failed: {e}")
 
         formatted = self._format_multi_table_context(raw_results, context)
 
@@ -1876,7 +2597,150 @@ Return ONLY JSON.
             "relevant_profiles": relevant_profiles,
             "group_context": group_context,
             "historical_context": historical_context,
-            "agent_responses": agent_context
+            "agent_responses": agent_context,
+            "related_topics": related_topics
+        }
+
+    def _retrieve_from_summaries(
+        self,
+        plan: dict,
+        context: dict,
+        query: str = None
+    ) -> Dict[str, Any]:
+        """
+        Direct retrieval from summary tables when summarization_intent is detected.
+        Skips raw memory search for efficiency - uses pre-computed summaries instead.
+
+        This is a SHORTCUT for summarization queries like:
+        - "Resume the conversation"
+        - "What happened while I was away?"
+        - "Summarize last week's discussion"
+
+        Enhanced with temporal filtering:
+        - Uses lookback_days from temporal_attributes for time-based filtering
+        - Scope (today, weekly, monthly) maps to lookback_days
+
+        Args:
+            plan: Extended planning dict with summarization_intent + temporal_attributes
+            context: Context dict with group_id or user_id
+            query: Optional query for semantic search within summaries
+
+        Returns:
+            Dict with summaries and formatted context
+        """
+        summarization_intent = plan.get("summarization_intent", {})
+        temporal_attrs = plan.get("temporal_attributes", {})
+        summary_level = summarization_intent.get("summary_level", "micro")
+        scope = summarization_intent.get("scope")  # today, weekly, monthly
+
+        # Determine lookback_days from temporal_attributes or scope
+        lookback_days = temporal_attrs.get("lookback_days")
+        if not lookback_days and scope:
+            scope_to_days = {"today": 1, "weekly": 7, "monthly": 30}
+            lookback_days = scope_to_days.get(scope)
+
+        if lookback_days:
+            print(f"[Summaries] Using temporal filter: lookback_days={lookback_days}")
+
+        # Determine context type
+        group_id = context.get("group_id")
+        user_id = context.get("user_id")
+        is_dm = context.get("is_dm", not bool(group_id))
+
+        summaries = []
+        formatted_context = ""
+
+        try:
+            if is_dm and user_id:
+                # DM summaries
+                dm_summary_store = getattr(self, 'dm_summary_store', None)
+                if not dm_summary_store and hasattr(self.unified_store, 'dm_summary_store'):
+                    dm_summary_store = self.unified_store.dm_summary_store
+
+                if dm_summary_store:
+                    # Convert user_id to dm_key format (dm_{user_id})
+                    dm_key = f"dm_{user_id}"
+
+                    if query:
+                        # Semantic search within summaries with optional temporal filter
+                        levels = [summary_level] if summary_level else None
+                        summaries = dm_summary_store.search_summaries(
+                            dm_key, query,
+                            levels=levels,
+                            limit=10,
+                            lookback_days=lookback_days
+                        )
+                    else:
+                        # Get recent summaries by level
+                        summary_dict = dm_summary_store.get_context_summaries(
+                            dm_key,
+                            limit_micro=5 if summary_level in (None, "micro") else 0,
+                            limit_chunk=3 if summary_level in (None, "chunk") else 0,
+                            limit_block=2 if summary_level in (None, "block") else 0
+                        )
+                        for level_name, level_summaries in summary_dict.items():
+                            summaries.extend(level_summaries)
+
+                    print(f"[Summaries] Retrieved {len(summaries)} DM summaries for {dm_key}")
+
+            elif group_id:
+                # Group summaries
+                group_summary_store = self.group_summary_store
+                if not group_summary_store and hasattr(self.unified_store, 'group_summary_store'):
+                    group_summary_store = self.unified_store.group_summary_store
+
+                if group_summary_store:
+                    if query:
+                        # Semantic search within summaries with optional temporal filter
+                        levels = [summary_level] if summary_level else None
+                        summaries = group_summary_store.search_summaries(
+                            group_id, query,
+                            levels=levels,
+                            limit=10,
+                            lookback_days=lookback_days
+                        )
+                    else:
+                        # Get recent summaries by level
+                        summary_dict = group_summary_store.get_context_summaries(
+                            group_id,
+                            limit_micro=5 if summary_level in (None, "micro") else 0,
+                            limit_chunk=3 if summary_level in (None, "chunk") else 0,
+                            limit_block=2 if summary_level in (None, "block") else 0
+                        )
+                        for level_name, level_summaries in summary_dict.items():
+                            summaries.extend(level_summaries)
+
+                    print(f"[Summaries] Retrieved {len(summaries)} group summaries for {group_id}")
+
+            # Format summaries into context string
+            if summaries:
+                formatted_lines = []
+                for summary in summaries:
+                    level = summary.level.value if hasattr(summary.level, 'value') else summary.level
+                    time_range = f"{summary.time_start[:10]} to {summary.time_end[:10]}" if summary.time_start and summary.time_end else "unknown time"
+                    formatted_lines.append(
+                        f"[{level.upper()} Summary ({time_range})]: {summary.summary}"
+                    )
+                    if summary.topics:
+                        formatted_lines.append(f"  Topics: {', '.join(summary.topics[:5])}")
+                    if summary.highlights:
+                        formatted_lines.append(f"  Highlights: {'; '.join(summary.highlights[:3])}")
+
+                formatted_context = "\n".join(formatted_lines)
+
+        except Exception as e:
+            print(f"[Summaries] Error retrieving summaries: {e}")
+
+        return {
+            "summaries": summaries,
+            "formatted_context": formatted_context,
+            "summary_level": summary_level,
+            "scope": scope,
+            "dm_memories": [],
+            "group_memories": [],
+            "user_memories": [],
+            "interaction_memories": [],
+            "cross_group_memories": [],
         }
 
     def _apply_group_keyword_boost(
@@ -1942,12 +2806,19 @@ Return ONLY JSON.
             return semantic_items
 
     def _deduplicate_by_id(self, items: list, id_attr: str = "memory_id") -> list:
-        """Deduplicate a list of items by their ID attribute."""
+        """Deduplicate a list of items by their ID attribute.
+
+        Handles both objects (with getattr) and dicts (with .get()).
+        """
         seen = set()
         deduped = []
         for item in items:
-            item_id = getattr(item, id_attr)
-            if item_id not in seen:
+            # Handle both objects and dicts
+            if isinstance(item, dict):
+                item_id = item.get(id_attr)
+            else:
+                item_id = getattr(item, id_attr, None)
+            if item_id is not None and item_id not in seen:
                 seen.add(item_id)
                 deduped.append(item)
         return deduped

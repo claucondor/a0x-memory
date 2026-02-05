@@ -241,6 +241,9 @@ class SimpleMemSystem:
         self.hybrid_retriever.user_profile_store = self.user_profile_store
         self.hybrid_retriever.group_profile_store = self.group_profile_store
         self.hybrid_retriever.fact_store = self.user_fact_store
+        # Pass summary stores for topics-aware planning and summary retrieval
+        self.hybrid_retriever.dm_summary_store = self.dm_summary_store
+        self.hybrid_retriever.group_summary_store = self.group_summary_store
 
         print("\nSystem initialization complete!")
         print("=" * 60)
