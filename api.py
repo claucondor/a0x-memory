@@ -2144,6 +2144,407 @@ async def reset_agent_data(agent_id: str, confirm: bool = False):
 
 
 # ============================================================================
+# Admin/Debug Endpoints
+# ============================================================================
+
+@app.get("/v1/admin/messages/{agent_id}")
+async def get_recent_messages_admin(
+    agent_id: str,
+    since_days: int = 7,
+    limit: int = 200,
+    source: str = "legacy"
+):
+    """
+    Get recent messages for an agent (admin/debug endpoint).
+
+    Returns messages from Firestore.
+
+    Args:
+        agent_id: Agent ID (e.g., 71f6f657-6800-0892-875f-f26e8c213756)
+        since_days: Only return messages from last N days (default 7)
+        limit: Max messages to return (default 200)
+        source: Data source - "legacy" (telegram_recent_messages) or "a0x" (agents/.../groups)
+
+    Returns:
+        List of messages with metadata
+    """
+    from datetime import datetime, timedelta, timezone
+    from services.firestore_window import get_firestore_store
+
+    firestore = get_firestore_store()
+    if not firestore or not firestore._enabled:
+        raise HTTPException(status_code=501, detail="Firestore not available")
+
+    db = firestore.db
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=since_days)
+
+    messages = []
+    chats_seen = set()
+    users_seen = set()
+
+    try:
+        if source == "legacy":
+            # Legacy system: telegram_recent_messages collection
+            # Doc ID format: {agentId}--{chatId}
+            # Each doc has 'messages' array with all messages for that chat
+            msgs_ref = db.collection("telegram_recent_messages")
+            query = msgs_ref.order_by("lastUpdated", direction="DESCENDING").limit(100)
+
+            for doc in query.stream():
+                data = doc.to_dict()
+                doc_agent_id = data.get("agentId")
+
+                # Only process our agent
+                if doc_agent_id != agent_id:
+                    continue
+
+                chat_id = str(data.get("chatId", "unknown"))
+                is_dm = not chat_id.startswith("-")  # Negative chat IDs are groups in Telegram
+                chats_seen.add(chat_id)
+
+                msg_list = data.get("messages", [])
+                for msg in msg_list:
+                    msg_ts = msg.get("timestamp")
+
+                    # Parse timestamp (legacy uses Unix ms as int)
+                    ts_datetime = None
+                    ts_str = ""
+                    if msg_ts:
+                        if isinstance(msg_ts, (int, float)):
+                            # Unix timestamp in milliseconds
+                            if msg_ts > 10000000000:  # ms timestamp
+                                ts_datetime = datetime.fromtimestamp(msg_ts / 1000)
+                            else:  # seconds timestamp
+                                ts_datetime = datetime.fromtimestamp(msg_ts)
+                            ts_str = ts_datetime.isoformat()
+                        elif hasattr(msg_ts, 'timestamp'):
+                            ts_datetime = datetime.fromtimestamp(msg_ts.timestamp())
+                            ts_str = ts_datetime.isoformat()
+                        elif isinstance(msg_ts, str):
+                            try:
+                                ts_datetime = datetime.fromisoformat(msg_ts.replace('Z', '+00:00'))
+                                ts_str = msg_ts
+                            except:
+                                ts_str = msg_ts
+
+                    # Filter by date
+                    if ts_datetime and ts_datetime < cutoff_date:
+                        continue
+
+                    # Get username from various locations
+                    username = msg.get("username")
+                    if not username:
+                        metadata = msg.get("metadata") or {}
+                        username = metadata.get("username") or metadata.get("name", "unknown")
+                    users_seen.add(username)
+
+                    role = msg.get("role", "user")
+                    is_agent = role in ("assistant", "system")
+
+                    messages.append({
+                        "id": f"{chat_id}_{len(messages)}",
+                        "chat_id": chat_id,
+                        "is_dm": is_dm,
+                        "username": username,
+                        "content": msg.get("content", ""),
+                        "timestamp": ts_str,
+                        "role": role,
+                        "is_agent": is_agent,
+                        "platform": "telegram"
+                    })
+
+        else:
+            # a0x-memory system: use collection_group to find all recent_messages subcollections
+            # Path: agents/{agentId}/groups/{groupId}/recent_messages/{msgId}
+            all_docs = db.collection_group("recent_messages").stream()
+
+            for msg_doc in all_docs:
+                # Filter by agent_id in path
+                path = msg_doc.reference.path
+                if agent_id not in path:
+                    continue
+
+                # Extract group_id from path
+                # Path: agents/{agentId}/groups/{groupId}/recent_messages/{docId}
+                parts = path.split("/")
+                group_id = parts[3] if len(parts) >= 5 else "unknown"
+                chats_seen.add(group_id)
+
+                msg_data = msg_doc.to_dict()
+                msg_ts = msg_data.get("timestamp")
+
+                ts_datetime = None
+                ts_str = ""
+                if msg_ts:
+                    if isinstance(msg_ts, str):
+                        try:
+                            ts_datetime = datetime.fromisoformat(msg_ts.replace('Z', '+00:00'))
+                            ts_str = msg_ts
+                        except:
+                            ts_str = msg_ts
+                    elif hasattr(msg_ts, 'timestamp'):
+                        ts_datetime = datetime.fromtimestamp(msg_ts.timestamp(), tz=timezone.utc)
+                        ts_str = ts_datetime.isoformat()
+                    elif hasattr(msg_ts, 'isoformat'):
+                        ts_datetime = msg_ts
+                        ts_str = msg_ts.isoformat()
+
+                # Make cutoff comparison timezone-aware
+                if ts_datetime:
+                    if ts_datetime.tzinfo is None:
+                        ts_datetime = ts_datetime.replace(tzinfo=timezone.utc)
+                    if ts_datetime < cutoff_date:
+                        continue
+
+                username = msg_data.get("username", "unknown")
+                user_id = msg_data.get("user_id")
+                if not user_id:
+                    pi = msg_data.get("platform_identity", {})
+                    user_id = pi.get("user_id")
+                if username:
+                    users_seen.add(username)
+
+                is_dm = group_id.startswith("dm_")
+                role = msg_data.get("role", "user")
+                metadata = msg_data.get("metadata") or {}
+                is_agent = role == "assistant" or metadata.get("is_agent_response", False)
+
+                platform = msg_data.get("platform")
+                if not platform:
+                    pi = msg_data.get("platform_identity", {})
+                    platform = pi.get("platform", "unknown")
+
+                messages.append({
+                    "id": msg_doc.id,
+                    "chat_id": group_id,
+                    "is_dm": is_dm,
+                    "username": username,
+                    "user_id": user_id,
+                    "content": msg_data.get("content", ""),
+                    "timestamp": ts_str,
+                    "role": role,
+                    "is_agent": is_agent,
+                    "processed": msg_data.get("processed", False),
+                    "platform": platform
+                })
+
+        # Sort all messages by timestamp descending
+        messages.sort(key=lambda x: x["timestamp"], reverse=True)
+        messages = messages[:limit]
+
+        return {
+            "agent_id": agent_id,
+            "source": source,
+            "since_days": since_days,
+            "total_messages": len(messages),
+            "chats_count": len(chats_seen),
+            "users_count": len(users_seen),
+            "chats": list(chats_seen),
+            "messages": messages
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/admin/activity/{agent_id}")
+async def get_activity_summary(
+    agent_id: str,
+    since_days: int = 7,
+    source: str = "legacy"
+):
+    """
+    Get activity summary for an agent.
+
+    Returns aggregate stats without individual messages.
+
+    Args:
+        agent_id: Agent ID
+        since_days: Period to analyze (default 7 days)
+        source: Data source - "legacy" (telegram_recent_messages) or "a0x" (agents/.../groups)
+    """
+    from datetime import datetime, timedelta, timezone
+    from collections import defaultdict
+    from services.firestore_window import get_firestore_store
+
+    firestore = get_firestore_store()
+    if not firestore or not firestore._enabled:
+        raise HTTPException(status_code=501, detail="Firestore not available")
+
+    db = firestore.db
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=since_days)
+
+    stats = {
+        "total_messages": 0,
+        "user_messages": 0,
+        "agent_responses": 0,
+        "dm_messages": 0,
+        "group_messages": 0,
+        "by_platform": defaultdict(int),
+        "by_user": defaultdict(int),
+        "by_chat": defaultdict(int),
+        "active_users": set(),
+        "active_chats": set()
+    }
+
+    try:
+        if source == "legacy":
+            # Legacy system: telegram_recent_messages collection
+            msgs_ref = db.collection("telegram_recent_messages")
+            query = msgs_ref.order_by("lastUpdated", direction="DESCENDING").limit(200)
+
+            for doc in query.stream():
+                data = doc.to_dict()
+                doc_agent_id = data.get("agentId")
+
+                if doc_agent_id != agent_id:
+                    continue
+
+                chat_id = str(data.get("chatId", "unknown"))
+                is_dm = not chat_id.startswith("-")
+                stats["active_chats"].add(chat_id)
+
+                msg_list = data.get("messages", [])
+                for msg in msg_list:
+                    msg_ts = msg.get("timestamp")
+
+                    ts_datetime = None
+                    if msg_ts:
+                        if isinstance(msg_ts, (int, float)):
+                            # Unix timestamp in milliseconds
+                            if msg_ts > 10000000000:
+                                ts_datetime = datetime.fromtimestamp(msg_ts / 1000)
+                            else:
+                                ts_datetime = datetime.fromtimestamp(msg_ts)
+                        elif hasattr(msg_ts, 'timestamp'):
+                            ts_datetime = datetime.fromtimestamp(msg_ts.timestamp())
+                        elif isinstance(msg_ts, str):
+                            try:
+                                ts_datetime = datetime.fromisoformat(msg_ts.replace('Z', '+00:00'))
+                            except:
+                                pass
+
+                    if ts_datetime and ts_datetime < cutoff_date:
+                        continue
+
+                    stats["total_messages"] += 1
+
+                    role = msg.get("role", "user")
+                    is_agent = role in ("assistant", "system")
+
+                    if is_agent:
+                        stats["agent_responses"] += 1
+                    else:
+                        stats["user_messages"] += 1
+
+                    if is_dm:
+                        stats["dm_messages"] += 1
+                    else:
+                        stats["group_messages"] += 1
+
+                    stats["by_platform"]["telegram"] += 1
+
+                    if not is_agent:
+                        username = msg.get("username")
+                        if not username:
+                            metadata = msg.get("metadata") or {}
+                            username = metadata.get("username", "unknown")
+                        stats["by_user"][username] += 1
+                        stats["active_users"].add(username)
+
+                    stats["by_chat"][chat_id] += 1
+
+        else:
+            # a0x-memory system: use collection_group to find all recent_messages
+            all_docs = db.collection_group("recent_messages").stream()
+
+            for msg_doc in all_docs:
+                # Filter by agent_id in path
+                path = msg_doc.reference.path
+                if agent_id not in path:
+                    continue
+
+                # Extract group_id from path
+                parts = path.split("/")
+                group_id = parts[3] if len(parts) >= 5 else "unknown"
+
+                msg_data = msg_doc.to_dict()
+                msg_ts = msg_data.get("timestamp")
+
+                ts_datetime = None
+                if msg_ts:
+                    if isinstance(msg_ts, str):
+                        try:
+                            ts_datetime = datetime.fromisoformat(msg_ts.replace('Z', '+00:00'))
+                        except:
+                            pass
+                    elif hasattr(msg_ts, 'timestamp'):
+                        ts_datetime = datetime.fromtimestamp(msg_ts.timestamp(), tz=timezone.utc)
+                    elif hasattr(msg_ts, 'isoformat'):
+                        ts_datetime = msg_ts
+
+                # Make cutoff comparison timezone-aware
+                if ts_datetime:
+                    if ts_datetime.tzinfo is None:
+                        ts_datetime = ts_datetime.replace(tzinfo=timezone.utc)
+                    if ts_datetime < cutoff_date:
+                        continue
+
+                stats["total_messages"] += 1
+                stats["active_chats"].add(group_id)
+
+                role = msg_data.get("role", "user")
+                metadata = msg_data.get("metadata") or {}
+                is_agent = role == "assistant" or metadata.get("is_agent_response", False)
+
+                if is_agent:
+                    stats["agent_responses"] += 1
+                else:
+                    stats["user_messages"] += 1
+
+                is_dm = group_id.startswith("dm_")
+                if is_dm:
+                    stats["dm_messages"] += 1
+                else:
+                    stats["group_messages"] += 1
+
+                platform = msg_data.get("platform")
+                if not platform:
+                    pi = msg_data.get("platform_identity", {})
+                    platform = pi.get("platform", "unknown")
+                stats["by_platform"][platform] += 1
+
+                if not is_agent:
+                    username = msg_data.get("username", "unknown")
+                    stats["by_user"][username] += 1
+                    stats["active_users"].add(username)
+
+                stats["by_chat"][group_id] += 1
+
+        return {
+            "agent_id": agent_id,
+            "source": source,
+            "period_days": since_days,
+            "total_messages": stats["total_messages"],
+            "user_messages": stats["user_messages"],
+            "agent_responses": stats["agent_responses"],
+            "dm_messages": stats["dm_messages"],
+            "group_messages": stats["group_messages"],
+            "by_platform": dict(stats["by_platform"]),
+            "top_users": dict(sorted(stats["by_user"].items(), key=lambda x: -x[1])[:20]),
+            "active_users_count": len(stats["active_users"]),
+            "active_chats_count": len(stats["active_chats"])
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
 # Spam Admin Endpoints
 # ============================================================================
 
