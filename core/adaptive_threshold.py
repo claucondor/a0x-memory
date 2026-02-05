@@ -60,10 +60,12 @@ class ThresholdConfig:
     default_window_size: int = 15          # Default window size
 
     # Spam detection settings
-    spam_similarity_threshold: float = 0.92  # Similarity > this = likely spam
+    # Note: e5-small (384 dims) produces high similarity for topically similar messages
+    # 0.97 threshold catches near-duplicates while allowing normal conversation
+    spam_similarity_threshold: float = 0.97  # Similarity > this = likely spam
     spam_check_window: int = 5               # Compare with last N messages from same user
     spam_score_decay: float = 0.9            # Decay factor for spam score over time
-    spam_block_threshold: float = 3.0        # Block user if spam_score exceeds this
+    spam_block_threshold: float = 5.0        # Block user if spam_score exceeds this (was 3.0)
 
 
 # ============================================================

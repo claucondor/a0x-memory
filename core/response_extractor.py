@@ -65,7 +65,7 @@ Return ONLY valid JSON, no markdown:
         )
 
         try:
-            response = self.llm_client.call(
+            response = self.llm_client.chat_completion(
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=300
