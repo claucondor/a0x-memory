@@ -798,8 +798,14 @@ Your task is to extract all valuable information from the following dialogues an
 1. **Complete Coverage**: Generate enough memory entries to ensure ALL information in the dialogues is captured
 2. **Force Disambiguation**: Absolutely PROHIBIT using pronouns (he, she, it, they, this, that) and relative time (yesterday, today, last week, tomorrow)
 3. **Lossless Information**: Each entry's lossless_restatement must be a complete, independent, understandable sentence
-4. **Precise Extraction**:
-   - keywords: Core keywords (names, places, entities, topic words)
+4. **PRESERVE SPECIFICS** (CRITICAL):
+   - ALL numbers, percentages, amounts (e.g., "30%", "1 billion tokens", "score of 20")
+   - ALL configurations and parameters (e.g., "4 year vesting with 1 year cliff")
+   - ALL technical decisions (e.g., "using Gitcoin Passport for sybil prevention")
+   - ALL formulas or calculations (e.g., "1 point per dollar traded")
+   - DO NOT summarize these into vague statements like "discussed tokenomics" - keep the exact values
+5. **Precise Extraction**:
+   - keywords: Core keywords (names, places, entities, topic words, AND specific numbers/configs)
    - timestamp: Absolute time in ISO 8601 format (if explicit time mentioned in dialogue)
    - location: Specific location name (if mentioned)
    - persons: All person names mentioned
@@ -808,7 +814,7 @@ Your task is to extract all valuable information from the following dialogues an
 {classification_section}
 {output_format}
 
-[Example]
+[Example 1 - Meeting]
 Dialogues:
 [2025-11-15T14:30:00] Alice: Bob, let's meet at Starbucks tomorrow at 2pm to discuss the new product
 [2025-11-15T14:31:00] Bob: Okay, I'll prepare the materials
@@ -833,6 +839,35 @@ Output:
     "persons": ["Bob"],
     "entities": [],
     "topic": "Meeting preparation confirmation"{group_example_suffix2}
+  }}
+]
+```
+
+[Example 2 - Technical Details (PRESERVE ALL NUMBERS)]
+Dialogues:
+[2025-11-20T10:00:00] Pablo: The tokenomics will be 30% for team with 4 year vesting and 1 year cliff, 20% for liquidity
+[2025-11-20T10:01:00] Pablo: For sybil prevention we'll use Gitcoin Passport with minimum score of 20
+
+Output:
+```json
+[
+  {{
+    "lossless_restatement": "Pablo decided the tokenomics allocation: 30% for team with 4-year vesting and 1-year cliff, and 20% for liquidity pool.",
+    "keywords": ["Pablo", "tokenomics", "30%", "team", "4-year vesting", "1-year cliff", "20%", "liquidity"],
+    "timestamp": "2025-11-20T10:00:00",
+    "location": null,
+    "persons": ["Pablo"],
+    "entities": ["tokenomics"],
+    "topic": "Token allocation and vesting schedule"{group_example_suffix1}
+  }},
+  {{
+    "lossless_restatement": "Pablo chose Gitcoin Passport with a minimum score of 20 for sybil prevention.",
+    "keywords": ["Pablo", "Gitcoin Passport", "score 20", "sybil prevention"],
+    "timestamp": "2025-11-20T10:01:00",
+    "location": null,
+    "persons": ["Pablo"],
+    "entities": ["Gitcoin Passport"],
+    "topic": "Sybil prevention mechanism"{group_example_suffix2}
   }}
 ]
 ```

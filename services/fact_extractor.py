@@ -23,24 +23,39 @@ Messages:
 {messages}
 
 Extract any facts about the user including:
-- Preferences (communication style, content preferences)
-- Expertise (skills, knowledge areas)
-- Personal info (job, location, projects)
-- Interests (topics they engage with)
-- Behaviors (patterns, habits)
-- Communication (how they express themselves)
+- Preferences (communication style, content preferences, tool choices)
+- Expertise (skills, knowledge areas, technical proficiency)
+- Personal info (job, location, projects they're building)
+- Interests (topics they engage with, what they want to learn)
+- Behaviors (patterns, habits, decision-making style)
+- Communication (how they express themselves, language preference)
+
+IMPORTANT - Preserve Specific Details:
+- Include ALL numbers, percentages, and configurations (e.g., "30% allocation", "4-year vesting")
+- Include ALL technical decisions and their parameters (e.g., "using Gitcoin Passport with score 20")
+- Include project names and specific features being built
+- Do NOT generalize into vague statements - keep specifics
 
 Return JSON:
 {{
   "facts": [
     {{
-      "content": "Clear statement about the user",
+      "content": "Clear, specific statement about the user WITH exact numbers/configs if mentioned",
       "fact_type": "preference|expertise|personal|interest|behavior|communication",
-      "keywords": ["keyword1", "keyword2"],
+      "keywords": ["keyword1", "keyword2", "include_numbers_too"],
       "confidence": 0.5-0.9
     }}
   ]
 }}
+
+Examples of GOOD facts (specific):
+- "User is building Baseswap DEX with 30% team allocation and 4-year vesting"
+- "User plans to use Gitcoin Passport with minimum score of 20 for sybil prevention"
+- "User prefers permissionless protocols without KYC"
+
+Examples of BAD facts (too vague):
+- "User is interested in tokenomics" (missing specifics)
+- "User is concerned about security" (missing what they're doing about it)
 
 Only include facts you're confident about. Skip if uncertain."""
 
