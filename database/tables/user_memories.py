@@ -2,7 +2,7 @@
 UserMemories table operations.
 Extracted from unified_store.py.
 """
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime, timezone
 
 import pyarrow as pa
@@ -410,6 +410,74 @@ class UserMemoriesTable:
     def count(self) -> int:
         """Count all rows."""
         return self.table.count_rows()
+
+    def get_groups_for_user(self, user_id: str) -> Dict[str, Dict]:
+        """
+        Get all groups where this user has memories.
+
+        Used for Group Reference Resolution - when a user in DM asks about
+        "the group" without specifying which one, we need to know their groups.
+
+        Args:
+            user_id: User ID (format: platform:user_id)
+
+        Returns:
+            Dict mapping group_id to metadata:
+            {
+                group_id: {
+                    "last_active": ISO timestamp of most recent memory,
+                    "memory_count": int,
+                    "first_seen": ISO timestamp of earliest memory
+                }
+            }
+        """
+        if self.table.count_rows() == 0:
+            return {}
+
+        try:
+            # Query all memories for this user
+            results = (
+                self.table.search()
+                .where(f"user_id = '{user_id}'", prefilter=True)
+                .select(["group_id", "last_seen", "first_seen"])
+                .limit(1000)  # Reasonable limit for aggregation
+                .to_list()
+            )
+
+            if not results:
+                return {}
+
+            # Aggregate by group_id
+            groups: Dict[str, Dict] = {}
+            for row in results:
+                group_id = row.get("group_id")
+                if not group_id:
+                    continue
+
+                last_seen = row.get("last_seen", "")
+                first_seen = row.get("first_seen", "")
+
+                if group_id not in groups:
+                    groups[group_id] = {
+                        "last_active": last_seen,
+                        "memory_count": 1,
+                        "first_seen": first_seen
+                    }
+                else:
+                    groups[group_id]["memory_count"] += 1
+                    # Update last_active if this is more recent
+                    if last_seen > groups[group_id]["last_active"]:
+                        groups[group_id]["last_active"] = last_seen
+                    # Update first_seen if this is earlier
+                    if first_seen and (not groups[group_id]["first_seen"] or first_seen < groups[group_id]["first_seen"]):
+                        groups[group_id]["first_seen"] = first_seen
+
+            print(f"[{self.agent_id}] User {user_id} has memories in {len(groups)} groups")
+            return groups
+
+        except Exception as e:
+            print(f"[{self.agent_id}] Error getting groups for user {user_id}: {e}")
+            return {}
 
     def optimize(self):
         """Compact the table."""

@@ -219,15 +219,23 @@ class MemoryStore:
         query: str,
         scope: str = None,
         group_id: str = None,
+        user_id: str = None,
         limit: int = 5
     ) -> List[dict]:
         """
         Search for similar questions asked before.
 
         Uses trigger_vector to find what users asked previously.
+
+        Args:
+            query: The search query
+            scope: Filter by scope ("global" | "user" | "group")
+            group_id: Filter by group (for group context)
+            user_id: Filter by user (for DM context)
+            limit: Max results
         """
         query_vector = self.embedding_model.encode_single(query, is_query=True)
-        return self.agent_responses.search_by_trigger(query_vector, scope, group_id, limit)
+        return self.agent_responses.search_by_trigger(query_vector, scope, group_id, user_id, limit)
 
     def search_agent_responses_by_response(
         self,

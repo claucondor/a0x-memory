@@ -192,6 +192,7 @@ class AgentResponsesTable:
         query_vector,
         scope: str = None,
         group_id: str = None,
+        user_id: str = None,
         limit: int = 5
     ) -> List[dict]:
         """
@@ -202,7 +203,8 @@ class AgentResponsesTable:
         Args:
             query_vector: Pre-computed query vector
             scope: Filter by scope ("global" | "user" | "group")
-            group_id: Include global + this group's responses
+            group_id: Include global + this group's responses (for group context)
+            user_id: Filter by user (for DM context)
             limit: Max results
 
         Returns:
@@ -216,7 +218,10 @@ class AgentResponsesTable:
         conditions = [f"agent_id = '{self.agent_id}'"]
         if scope:
             conditions.append(f"scope = '{scope}'")
-        if group_id:
+        # For DMs: filter by user_id; For groups: filter by group_id
+        if user_id:
+            conditions.append(f"(scope = 'global' OR user_id = '{user_id}')")
+        elif group_id:
             conditions.append(f"(scope = 'global' OR group_id = '{group_id}')")
 
         where_clause = " AND ".join(conditions)

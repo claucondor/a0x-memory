@@ -146,7 +146,7 @@ class InMemoryWindowStore:
         group_id: str,
         limit: int = 10
     ) -> List[Dict[str, Any]]:
-        """Get recent messages."""
+        """Get recent messages with full metadata."""
         messages = self._get_messages(agent_id, group_id)
         # Return oldest first (for context)
         return [
@@ -154,7 +154,9 @@ class InMemoryWindowStore:
                 'content': m['content'],
                 'username': m['username'],
                 'timestamp': m['timestamp'],
-                'message_id': m['doc_id']
+                'message_id': m['doc_id'],
+                'metadata': m.get('metadata', {}),
+                'platform_identity': m.get('platform_identity', {})
             }
             for m in messages[-limit:]
         ]
@@ -510,7 +512,9 @@ class FirestoreWindowStore:
                     'content': data.get('content', ''),
                     'username': data.get('username', ''),
                     'timestamp': data.get('timestamp', ''),
-                    'message_id': m.id
+                    'message_id': m.id,
+                    'metadata': data.get('metadata', {}),
+                    'platform_identity': data.get('platform_identity', {})
                 })
             return results
 

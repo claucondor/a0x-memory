@@ -380,9 +380,23 @@ class GroupSummaryStore:
         group_id: str,
         query: str,
         levels: List[str] = None,
-        limit: int = 10
+        limit: int = 10,
+        lookback_days: int = None,
+        time_start: str = None,
+        time_end: str = None
     ) -> List[GroupSummary]:
-        """Semantic search across summaries."""
+        """
+        Semantic search across summaries with optional temporal filtering.
+
+        Args:
+            group_id: Group or DM ID
+            query: Search query for semantic matching
+            levels: Filter by summary levels (micro, chunk, block)
+            limit: Max results
+            lookback_days: Only include summaries from last N days
+            time_start: ISO timestamp - only include summaries after this time
+            time_end: ISO timestamp - only include summaries before this time
+        """
         query_vector = self.embedding_model.encode_single(query, is_query=True)
 
         where_clause = f"group_id = '{group_id}'"
@@ -393,11 +407,69 @@ class GroupSummaryStore:
         results = (
             self.table.search(query_vector.tolist())
             .where(where_clause, prefilter=True)
-            .limit(limit)
+            .limit(limit * 3 if lookback_days or time_start else limit)  # Fetch more if filtering
             .to_list()
         )
 
-        return [self._row_to_summary(r) for r in results]
+        summaries = [self._row_to_summary(r) for r in results]
+
+        # Apply temporal filtering post-search (LanceDB string comparison is limited)
+        if lookback_days or time_start or time_end:
+            from datetime import datetime, timedelta, timezone
+            now = datetime.now(timezone.utc)
+
+            if lookback_days:
+                cutoff = now - timedelta(days=lookback_days)
+                cutoff_str = cutoff.isoformat()
+            else:
+                cutoff_str = time_start
+
+            filtered = []
+            for s in summaries:
+                # Check time_start filter
+                if cutoff_str and s.time_end < cutoff_str:
+                    continue
+                # Check time_end filter
+                if time_end and s.time_start > time_end:
+                    continue
+                filtered.append(s)
+
+            summaries = filtered[:limit]
+            print(f"[SummarySearch] Temporal filter: {len(results)} -> {len(summaries)} (lookback={lookback_days}d)")
+
+        return summaries
+
+    def get_recent_topics(self, group_id: str, limit: int = 10) -> List[str]:
+        """
+        Get unique topics from recent summaries for planner context.
+
+        Returns a flat list of topic strings, deduplicated.
+        Very lightweight - just topics, not full summaries.
+        """
+        # Get most recent chunk or block (most compressed)
+        summaries = self.get_summaries_by_level(group_id, "chunk")
+        if not summaries:
+            summaries = self.get_summaries_by_level(group_id, "micro")
+
+        if not summaries:
+            return []
+
+        # Sort by recency
+        summaries.sort(key=lambda s: s.message_end, reverse=True)
+
+        # Collect unique topics from top summaries
+        seen = set()
+        topics = []
+        for s in summaries[:3]:  # Top 3 summaries
+            for topic in (s.topics or []):
+                topic_lower = topic.lower().strip()
+                if topic_lower and topic_lower not in seen:
+                    seen.add(topic_lower)
+                    topics.append(topic)
+                    if len(topics) >= limit:
+                        return topics
+
+        return topics
 
     def get_summary_by_id(self, summary_id: str) -> Optional[GroupSummary]:
         """Get a specific summary by ID."""
