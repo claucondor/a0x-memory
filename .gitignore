@@ -86,10 +86,9 @@ CLAUDE_*.md
 CLAUDE.md
 ROADMAP.md
 
-# Plan files (internal)
+# Plan files and internal docs
 PLAN_*.md
-docs/AGENT_RESPONSE_MEMORY_PLAN.md
-docs/VM_OPTIMIZATION_PLAN.md
+docs/
 
 # Test/dev files
 test_prompt.py
